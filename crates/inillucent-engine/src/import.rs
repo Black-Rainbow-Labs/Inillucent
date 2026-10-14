@@ -474,6 +474,12 @@ pub(crate) fn reopen_and_verify(
 fn unreadable(error: inillucent_base::DbError, name: &[u8]) -> inillucent_base::DbError {
     let said = error.detail().unwrap_or_default().to_string();
     let named = String::from_utf8_lossy(name).into_owned();
+    // A table this engine has not built storage for says why in its own words. Calling it
+    // unreadable sent a person looking for damage in a source file that was whole.
+    if error.unsupported().is_some() {
+        let reason = error.message().to_string();
+        return error.with_message(format!("the rows of {named} cannot be stored: {reason}"));
+    }
     error
         .with_message(format!(
             "the rows of {named} could not be read from the source database"

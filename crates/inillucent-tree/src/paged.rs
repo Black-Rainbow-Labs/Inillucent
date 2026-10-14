@@ -65,7 +65,7 @@ pub(crate) use copies::Copies;
 
 use std::cell::RefCell;
 
-use inillucent_base::error::{corrupt, misuse};
+use inillucent_base::error::corrupt;
 use inillucent_base::DbResult;
 use inillucent_pool::extent::ExtentRef;
 use inillucent_pool::interior::{InteriorBuilder, InteriorRef};

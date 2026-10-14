@@ -152,6 +152,43 @@ fn the_current_build_reads_what_an_earlier_release_wrote() {
     }
 }
 
+/// `VACUUM` of a database an earlier release wrote leaves every recorded answer the same
+/// (bug hunt 10).
+///
+/// **The shadow tables of an FTS5 table changed layout between releases.** Release 0.1.1 wrote
+/// `note_fts_idx(segid, term, pgno)` where this build creates `(segid, term, doclist)`. The
+/// module reads the third column by position, so every query worked, but `VACUUM` copied the
+/// rows by the column names of the old table into a table that has the new ones and stopped
+/// with `table note_fts_idx has no column named pgno`. The quick form vacuums the oldest and the
+/// newest fixture, and `INILLUCENT_SCENARIO=full` vacuums every one. Each is then read with the
+/// same questions `the_current_build_reads_what_an_earlier_release_wrote` asks, which include
+/// an FTS5 `MATCH` over the table that was rebuilt.
+#[test]
+fn vacuum_keeps_every_answer_of_a_database_an_earlier_release_wrote() {
+    let versions = interop::versions();
+    let chosen: Vec<String> = match Scale::from_env() {
+        Scale::Quick => versions
+            .first()
+            .into_iter()
+            .chain(versions.last())
+            .cloned()
+            .collect(),
+        Scale::Full => versions.clone(),
+    };
+    assert!(!chosen.is_empty(), "no fixture was chosen to vacuum");
+    for version in chosen {
+        let area = scratch(&format!("vacuum-{version}"));
+        let database = interop::stage(&version, &area);
+        {
+            let arm = default_arm();
+            let handle = open(&arm, &database);
+            let connection = handle.session();
+            run(&connection, "VACUUM");
+        }
+        read_everything(&version, &database);
+    }
+}
+
 /// Opening a format 2 fixture, reading it and checkpointing it leaves it at format 2.
 ///
 /// **The number moves only when a file first stores a key out of line.** A file

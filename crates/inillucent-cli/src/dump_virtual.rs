@@ -225,7 +225,7 @@ fn write_rows(shell: &mut Shell, name: &str, with_vector: bool) {
 ///
 /// @param shell - the shell to ask
 /// @param table - the table's name
-fn visible_columns(shell: &mut Shell, table: &str) -> Vec<String> {
+pub(crate) fn visible_columns(shell: &Shell, table: &str) -> Vec<String> {
     let literal = format!("'{}'", table.replace('\'', "''"));
     let Ok((_, rows)) = shell.collect(&format!("SELECT name FROM pragma_table_info({literal})"))
     else {
@@ -287,7 +287,7 @@ pub(crate) fn index_statement(name: &str, kind: &Kind) -> Option<String> {
 /// Returns an identifier quoted only when it has to be.
 ///
 /// @param name - the identifier
-fn quoted(name: &str) -> String {
+pub(crate) fn quoted(name: &str) -> String {
     let plain = !name.is_empty()
         && name
             .chars()

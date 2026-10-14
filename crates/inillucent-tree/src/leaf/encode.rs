@@ -13,6 +13,8 @@ use crate::types::{ColumnSpec, PhysicalType, ValueClass};
 use super::layout::*;
 use super::*;
 
+mod oversize;
+
 /// Builds one leaf page from a set of rows.
 ///
 /// This is the only writer of the layout above: bulk build, compaction and
@@ -544,6 +546,39 @@ impl LeafBuilder {
         fill: f64,
         spilling: bool,
     ) -> (usize, Layout) {
+        let (placed, layout) = self.fit_columnar(rows, at, fill, spilling);
+        if placed > 0 || at >= rows.len() || !spilling {
+            return (placed, layout);
+        }
+        // **The first row does not fit the columnar region at this fill.** Two things can still
+        // hold it, tried in order: the same region at a full page, which is what a split already
+        // falls back to, and the delta area of an otherwise empty leaf (bug hunt 10).
+        if fill < 1.0 {
+            let (full, full_layout) = self.fit_columnar(rows, at, 1.0, spilling);
+            if full > 0 {
+                return (full, full_layout);
+            }
+        }
+        if self.fits_in_delta_area_alone(rows, at) {
+            return (1, Layout::default());
+        }
+        (0, layout)
+    }
+
+    /// The sizing pass over the columnar region only, with no fallback for a row that does not
+    /// fit it.
+    ///
+    /// @param rows - the rows, sorted by key
+    /// @param at - the first row to place
+    /// @param fill - the fraction of the page to fill, 0.0..=1.0
+    /// @param spilling - whether the real pass will have a spiller
+    fn fit_columnar<'d>(
+        &self,
+        rows: &dyn Rows<'d>,
+        at: usize,
+        fill: f64,
+        spilling: bool,
+    ) -> (usize, Layout) {
         let budget = ((self.page_size as f64) * fill.clamp(0.05, 1.0)) as usize;
         let mut heap = 0usize;
         let mut placed = 0usize;
@@ -927,6 +962,9 @@ impl LeafBuilder {
         if count > u16::MAX as usize {
             return Err(misuse("a leaf cannot hold more than 65535 rows"));
         }
+        if let Some(page) = self.encode_oversize_row(rows, at, count, spill.is_some(), layout)? {
+            return Ok(page);
+        }
         let mut page = vec![0u8; self.page_size];
         page::write_common(&mut page, PageKind::Leaf, 0, self.tree)?;
         // **One pass for the widths, then the layout** - unless the caller
@@ -1161,8 +1199,8 @@ impl LeafBuilder {
 /// @param page_size - the page size, in bytes
 fn too_wide(columns: usize, page_size: usize) -> inillucent_base::DbError {
     let said = format!(
-        "a row of {columns} columns does not fit one page of {page_size} bytes; a larger \
-         page size holds it"
+        "a row of {columns} columns does not fit one page of {page_size} bytes; fewer \
+         columns, or a database created with a larger page size, holds it"
     );
     misuse(said.clone())
         .with_message(said)

@@ -789,8 +789,14 @@ an indexed column and a primary key included. A row whose values are each under 
 together more than half a page moves its longest values that are not key columns out of line,
 longest first, until half a page or less is left inline, so seventeen text columns of 2,000 bytes
 fit as they do in SQLite. `wide_row_threshold` in `crates/inillucent-tree/src/leaf/layout.rs` holds
-the rule, and the write path and the leaf builder both use it. A row of thousands of numbers can
+the rule, and the write path and the leaf builder both use it. A row of many numbers can
 still be larger than a page, because a number is shorter than the reference that would replace it.
+A leaf spends a directory entry, a class array and an aligned slot array on every column, about 24
+to 32 bytes, so a row of more than about a thousand columns does not fit the sorted part of a
+32 KiB leaf. Such a row is kept alone in the delta area of its own leaf, which costs the directory
+entry and the row's tagged values (`crates/inillucent-tree/src/leaf/encode/oversize.rs`). That holds
+a row of about 1,900 numbers. A row of more values than that fails with `a row of N columns does
+not fit one page`.
 The first time a transaction writes one, it moves the
 file to format 3 in memory and writes one log record, `Format` (kind 19), before the first page of the
 value. That record belongs to no transaction, so recovery replays it whether or not the transaction

@@ -53,10 +53,10 @@ pub(super) fn plan_leaves<'d>(
         if placed == 0 {
             // Every oversized text and blob would have gone out of line, so what is
             // left is keys, fixed-width slots and sixteen bytes per reference. A row
-            // that still does not fit is one whose *key* is most of a page.
-            return Err(misuse(
-                "a row's keys and fixed-width columns alone are larger than a page",
-            ));
+            // that still does not fit the columnar region at a full page, or the delta
+            // area of an empty leaf, is one with too many columns for the page or a key
+            // that is most of a page.
+            return Err(builder.too_wide_refusal());
         }
         let separator = leaf_separator(
             &mut head,

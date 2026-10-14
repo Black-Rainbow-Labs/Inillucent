@@ -245,7 +245,16 @@ fn copy_rows(
         true => "INSERT OR REPLACE INTO",
         false => "INSERT INTO",
     };
-    let insert = format!("{verb} {name} ({names}) VALUES ({placeholders})");
+    // **A shadow table is filled by position, not by column name.** A module reads its own
+    // shadow tables by position, and the layout can change between releases: an FTS5 table
+    // written by release 0.1.1 has `note_fts_idx(segid, term, pgno)` where this build creates
+    // `(segid, term, doclist)`, so `SELECT *` named `pgno` and the insert into the fresh table
+    // failed with `table note_fts_idx has no column named pgno`. The third column holds the
+    // value the module resolves either way (bug hunt 10).
+    let insert = match shadow {
+        true => format!("{verb} {name} VALUES ({placeholders})"),
+        false => format!("{verb} {name} ({names}) VALUES ({placeholders})"),
+    };
     let statement = fresh.prepare_statement(&insert)?;
     let at_once = fresh.runs_rows_at_once(&statement)?;
     let mut rows = rows.into_iter().peekable();

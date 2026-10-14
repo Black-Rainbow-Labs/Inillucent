@@ -300,6 +300,12 @@ pub struct Shell {
     /// Which line of input is being run, counted up by each one, so a held
     /// statement knows whether the line it came from has ended.
     chunk_number: u64,
+    /// How far the session has got into a dump header; see `dump_header`.
+    header_stage: crate::dump_header::Stage,
+    /// Whether the dump header turned defensive mode off, so the `COMMIT` turns it on again.
+    header_lifted: bool,
+    /// The FTS5 tables of a SQLite dump this session is restoring; see `sqlite_dump`.
+    restoring: crate::sqlite_dump::Restoring,
 }
 
 impl Drop for Shell {
@@ -577,6 +583,9 @@ impl Shell {
             line: 1,
             deferred: None,
             chunk_number: 0,
+            header_stage: crate::dump_header::Stage::Start,
+            header_lifted: false,
+            restoring: crate::sqlite_dump::Restoring::default(),
         }
     }
 
@@ -1115,6 +1124,27 @@ impl Shell {
     /// the `deferred` module for when and why the output is the same.
     pub fn run(&mut self, sql: &str) {
         self.statement_ran = true;
+        self.watch_dump_header(sql);
+        let mut restoring = std::mem::take(&mut self.restoring);
+        let rewrite = restoring.rewrite(self, sql);
+        self.restoring = restoring;
+        match rewrite {
+            crate::sqlite_dump::Rewrite::Keep => self.run_one(sql),
+            crate::sqlite_dump::Rewrite::Replace(statements) => {
+                for statement in statements {
+                    self.run_one(&statement);
+                    if self.done || self.chunk_stop || (self.bail && self.failed) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs one statement the shell has settled on, holding it if it can join the ones held.
+    ///
+    /// @param sql - the statement
+    fn run_one(&mut self, sql: &str) {
         if self.hold_if_it_joins(sql) {
             return;
         }
@@ -1126,6 +1156,41 @@ impl Shell {
             return;
         }
         self.run_as_written(sql);
+    }
+
+    /// Reports whether the open database holds no tables, indexes, views or triggers yet.
+    ///
+    /// The reference's shell lifts defensive mode for a dump header only when it loads into an
+    /// empty database; measured on 3.53.4, the same header into a database that holds one table
+    /// leaves `CREATE TABLE IF NOT EXISTS sqlite_sequence` refused.
+    fn schema_is_empty(&self) -> bool {
+        self.collect("SELECT 1 FROM sqlite_schema LIMIT 1")
+            .is_ok_and(|(_, rows)| rows.is_empty())
+    }
+
+    /// Lifts defensive mode for the transaction a dump opens, as the reference's shell does.
+    ///
+    /// Called before a statement is held or run, so a held `INSERT` still counts as a statement
+    /// and ends the chance of a header.
+    ///
+    /// @param sql - the statement that is about to run
+    fn watch_dump_header(&mut self, sql: &str) {
+        use crate::dump_header::{advance, Change};
+        let (stage, change) = advance(self.header_stage, sql);
+        self.header_stage = stage;
+        match change {
+            Change::Lift if self.defensive && self.schema_is_empty() => {
+                self.header_lifted = true;
+                self.defensive = false;
+                self.set_defensive(false);
+            }
+            Change::Restore if self.header_lifted => {
+                self.header_lifted = false;
+                self.defensive = true;
+                self.set_defensive(true);
+            }
+            _ => {}
+        }
     }
 
     /// Runs one complete statement now and prints whatever it produced.

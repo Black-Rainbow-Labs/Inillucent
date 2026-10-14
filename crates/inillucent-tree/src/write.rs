@@ -114,9 +114,7 @@ fn rows_for_the_left_half<'d, R: AsRef<[Datum<'d>]>>(
         Packed::Filled { rows: packed, .. } => Ok(packed.max(1).min(most)),
         Packed::RowTooLarge => match builder.pack_with(rows, 1.0, Some(&mut Measuring))? {
             Packed::Filled { .. } => Ok(1.min(most)),
-            Packed::RowTooLarge => Err(misuse(
-                "a row's keys and fixed-width columns alone are larger than a page",
-            )),
+            Packed::RowTooLarge => Err(builder.too_wide_refusal()),
         },
     }
 }
@@ -181,7 +179,7 @@ enum Fit {
 /// values too short to be worth a reference: thousands of numbers.
 fn row_larger_than_a_page() -> inillucent_base::error::DbError {
     inillucent_base::error::statement_refusal(
-        "this row is larger than a page even with its large values stored outside it; a row of thousands of numbers has to be split across tables",
+        "this row is larger than a page even with its large values stored outside it; a row of more than about 1,900 numbers at the default page size has to be split across tables",
     )
 }
 

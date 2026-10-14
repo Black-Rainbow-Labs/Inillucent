@@ -962,3 +962,152 @@ CREATE INDEX ex_doubled ON ex(b * 2, a);\n";
          can use: {plan}"
     );
 }
+
+/// Writes the script for a table of `columns` untyped columns holding `rows` rows of the
+/// numbers 0 to `columns - 1`.
+///
+/// @param columns - how many columns the table has
+/// @param rows - how many identical rows to insert
+fn wide_table_script(columns: usize, rows: usize) -> String {
+    let names: Vec<String> = (0..columns).map(|at| format!("c{at}")).collect();
+    let values: Vec<String> = (0..columns).map(|at| at.to_string()).collect();
+    let mut script = format!("CREATE TABLE wide({});\n", names.join(","));
+    for _ in 0..rows {
+        script.push_str(&format!("INSERT INTO wide VALUES({});\n", values.join(",")));
+    }
+    script
+}
+
+/// A table of 1,000 and more columns with rows in it migrates, and a table too wide for a page
+/// is refused as a table that cannot be stored (bug hunt 10).
+///
+/// **The bulk build sized a leaf at a fraction of the page and refused a row that did not fit
+/// it.** A table of 920 columns with one row failed with `database disk image is malformed`,
+/// because the migration wrapped every failure of the build in the error for a damaged file.
+/// A row too wide for the columnar region is now kept alone in the delta area of its leaf, which
+/// holds about 1,900 numbers. Three rows are inserted so the bulk build has to place more than
+/// one wide row, each in a leaf of its own. A table of 2,000 columns of numbers holds more than
+/// a 32 KiB page does and is refused with its real reason, not as a malformed file.
+#[test]
+fn a_table_of_a_thousand_columns_migrates_and_one_too_wide_for_a_page_is_refused_by_name() {
+    let Some(shell) = reference() else {
+        inillucent_compat::differential::skipping("the pinned SQLite shell is missing");
+        return;
+    };
+    let area = scratch("wide-rows");
+    for columns in [920usize, 1200, 1500] {
+        let source = area.join(format!("source-{columns}.db"));
+        if !build_with_shell(&shell, &source, &wide_table_script(columns, 3)) {
+            inillucent_compat::differential::skipping("the reference shell could not be run");
+            return;
+        }
+        let destination = area.join(format!("migrated-{columns}.rdb"));
+        let report = sqlite::migrate(&source, &destination)
+            .unwrap_or_else(|error| panic!("{columns} columns: {error:?}"));
+        assert!(
+            report.passed(),
+            "{columns} columns did not verify: {:?}",
+            report
+                .checks
+                .iter()
+                .filter(|check| !check.passed)
+                .collect::<Vec<_>>()
+        );
+        let database =
+            inillucent_engine::connect::Database::open(&destination).expect("the migration opens");
+        let connection = database.session();
+        let last = columns - 1;
+        let question = format!("SELECT count(*), sum(c0), sum(c{last}) FROM wide");
+        let rows = connection
+            .query(&question)
+            .expect("the migrated rows are read");
+        assert_eq!(
+            quote_rows(&rows),
+            vec![format!("3,0,{}", 3 * last)],
+            "{columns} columns"
+        );
+    }
+
+    let source = area.join("source-2000.db");
+    if !build_with_shell(&shell, &source, &wide_table_script(2000, 1)) {
+        inillucent_compat::differential::skipping("the reference shell could not be run");
+        return;
+    }
+    let destination = area.join("migrated-2000.rdb");
+    let error = sqlite::migrate(&source, &destination)
+        .expect_err("a row of 2,000 numbers does not fit a 32 KiB page");
+    assert_ne!(
+        error.code(),
+        inillucent_base::PrimaryCode::Corrupt,
+        "a source that SQLite reads whole was reported as damaged: {}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("cannot be stored") && error.message().contains("columns"),
+        "the refusal does not say what is wrong: {}",
+        error.message()
+    );
+    assert!(
+        !destination.is_file(),
+        "the refused migration published a database"
+    );
+}
+
+/// An FTS5 table with an `UNINDEXED` column, and a `prefix` option that holds a comma, migrate
+/// and answer `MATCH` with the rows the pinned SQLite answers (bug hunt 10).
+///
+/// **The column list was read by splitting the declaration at every comma and taking each part
+/// whole.** `a UNINDEXED` became a column named `a UNINDEXED`, and the migration stopped at
+/// `table f3 has no column named a UNINDEXED`. `prefix='2,3'` was split into `prefix='2` and
+/// `3'`, which left a column named `3`. Both declarations are in one source so one run grades
+/// the column list and the options.
+#[test]
+fn an_fts5_table_with_unindexed_columns_and_comma_options_migrates() {
+    let Some(shell) = reference() else {
+        inillucent_compat::differential::skipping("the pinned SQLite shell is missing");
+        return;
+    };
+    let area = scratch("fts5-unindexed");
+    let source = area.join("source.db");
+    let script = "\
+CREATE VIRTUAL TABLE f3 USING fts5(a UNINDEXED, b);\n\
+INSERT INTO f3(rowid, a, b) VALUES(1, 'left one', 'alpha beta'),(2, 'left two', 'beta gamma');\n\
+CREATE VIRTUAL TABLE f4 USING fts5(\"x y\" UNINDEXED, z, prefix='2,3');\n\
+INSERT INTO f4(rowid, \"x y\", z) VALUES(5, 'spaced', 'delta epsilon');\n";
+    if !build_with_shell(&shell, &source, script) {
+        inillucent_compat::differential::skipping("the reference shell could not be run");
+        return;
+    }
+    let destination = area.join("migrated.rdb");
+    let report = sqlite::migrate(&source, &destination).expect("the migration runs");
+    assert!(
+        report.passed(),
+        "the migration did not verify: {:?}",
+        report
+            .checks
+            .iter()
+            .filter(|check| !check.passed)
+            .collect::<Vec<_>>()
+    );
+    let database =
+        inillucent_engine::connect::Database::open(&destination).expect("the migration opens");
+    let connection = database.session();
+    for question in [
+        "SELECT rowid, a, b FROM f3 WHERE f3 MATCH 'beta' ORDER BY rowid",
+        "SELECT rowid, a, b FROM f3 WHERE f3 MATCH 'b:alpha' ORDER BY rowid",
+        "SELECT rowid, \"x y\", z FROM f4 WHERE f4 MATCH 'delt*' ORDER BY rowid",
+    ] {
+        let theirs = shell_answers(&shell, &source, question);
+        assert!(
+            !theirs.is_empty(),
+            "the reference answered {question} with no rows, so this question grades nothing"
+        );
+        let ours: Vec<String> = connection
+            .query(question)
+            .unwrap_or_else(|error| panic!("{question}: {error:?}"))
+            .iter()
+            .map(|row| row.iter().map(list_cell).collect::<Vec<String>>().join("|"))
+            .collect();
+        assert_eq!(theirs, ours, "{question}");
+    }
+}

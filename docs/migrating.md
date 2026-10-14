@@ -137,7 +137,8 @@ What comes across:
 |---|---|
 | tables, indexes, views, triggers | copied |
 | `PRAGMA application_id`, `PRAGMA user_version` | copied, and checked by `pragma.application_id` and `pragma.user_version` |
-| FTS5 tables | rebuilt. The text is read from the SQLite table's `<name>_content` table and indexed again by inillucent's FTS5. The row ids stay the same |
+| FTS5 tables | rebuilt. The text is read from the SQLite table's `<name>_content` table and indexed again by inillucent's FTS5. The row ids stay the same. Columns declared `UNINDEXED` are kept and options such as `prefix='2,3'` are read |
+| a table of 1,000 or more columns | copied, up to the 1,900 or so numbers per row that fit one 32 KiB page. A table with a wider row fails with the status `unsupported` and the message `a row of N columns does not fit one page` |
 | an FTS5 table with `content=''` or `content='other'` | the migration fails. SQLite keeps no copy of the text in that table, so there is nothing to rebuild from |
 | a virtual table using any other module, such as `rtree` | the migration fails, and the check `carried.<name>` names the module |
 

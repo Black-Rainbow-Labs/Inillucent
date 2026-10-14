@@ -253,7 +253,11 @@ fn say_definition(shell: &mut Shell, name: &str, sql: &str, writable: &mut bool,
     if data_only && !is_reserved(name) {
         return;
     }
-    if name.len() >= 7 && name[..7].eq_ignore_ascii_case("sqlite_") {
+    if name
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"sqlite_"))
+    {
         make_writable(shell, writable);
         if let Some(rest) = sql.get(CREATE_TABLE..) {
             shell.say(&format!("CREATE TABLE IF NOT EXISTS {rest};"));
@@ -272,15 +276,15 @@ fn say_definition(shell: &mut Shell, name: &str, sql: &str, writable: &mut bool,
         ));
         return;
     }
-    let quoted_name = sql.len() > CREATE_TABLE
-        && sql[..CREATE_TABLE].eq_ignore_ascii_case("CREATE TABLE ")
-        && sql[CREATE_TABLE..].starts_with(['"', '\'']);
-    if quoted_name {
-        shell.say(&format!(
-            "CREATE TABLE IF NOT EXISTS {};",
-            &sql[CREATE_TABLE..]
-        ));
-        return;
+    let has_create_table = sql
+        .as_bytes()
+        .get(..CREATE_TABLE)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"CREATE TABLE "));
+    if let (true, Some(rest)) = (has_create_table, sql.get(CREATE_TABLE..)) {
+        if rest.starts_with(['"', '\'']) {
+            shell.say(&format!("CREATE TABLE IF NOT EXISTS {rest};"));
+            return;
+        }
     }
     shell.say(&format!("{sql};"));
 }
@@ -304,7 +308,11 @@ fn make_writable(shell: &mut Shell, writable: &mut bool) {
 ///
 /// @param name - the table's name
 fn is_statistics_table(name: &str) -> bool {
-    name.len() == 12 && name[..11].eq_ignore_ascii_case("sqlite_stat")
+    name.len() == 12
+        && name
+            .as_bytes()
+            .get(..11)
+            .is_some_and(|head| head.eq_ignore_ascii_case(b"sqlite_stat"))
 }
 
 /// Returns the columns a dump writes values for, in declaration order.

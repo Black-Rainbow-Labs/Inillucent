@@ -440,6 +440,14 @@ pub fn migrate(source: &Path, destination: &Path) -> DbResult<Report> {
     let mut built =
         ImportedDatabase::import_into(source.to_path_buf(), staged.clone(), PAGE_SIZE, FRAMES)
             .map_err(|error| {
+                // **Only a damaged source is reported as damaged.** Every failure here used to
+                // be wrapped in `corrupt`, whose message is the fixed text "database disk image
+                // is malformed", so a table with 2,000 columns that no page could hold was
+                // reported as a malformed file (bug hunt 10). A refusal keeps its own code and
+                // its own words.
+                if error.unsupported().is_some() {
+                    return error;
+                }
                 corrupt(format!(
                     "{} could not be built from {}: {}",
                     staged.display(),
@@ -1132,7 +1140,10 @@ fn virtual_module(sql: &str) -> Option<String> {
 /// Returns the column names an `fts5(...)` declaration indexes.
 ///
 /// The arguments that are *not* options: `tokenize=`, `content=`, `prefix=` and
-/// the rest carry an `=` and name a setting rather than a column.
+/// the rest carry an `=` and name a setting rather than a column. A column may
+/// be followed by FTS5's per column option, `UNINDEXED`, so the name is the
+/// first word of the argument and not the whole argument. The arguments are
+/// split at commas outside quotes, because `prefix='2,3'` holds one.
 ///
 /// @param sql - the declaration as the schema stored it
 fn fts5_columns(sql: &str) -> Vec<String> {
@@ -1145,16 +1156,70 @@ fn fts5_columns(sql: &str) -> Vec<String> {
     let Some(inside) = sql.get(open.saturating_add(1)..close) else {
         return Vec::new();
     };
-    inside
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty() && !part.contains('='))
-        .map(|part| {
-            part.trim_matches(|byte| byte == '"' || byte == '\'' || byte == '`')
-                .to_string()
-        })
-        .filter(|part| !part.is_empty())
+    split_outside_quotes(inside)
+        .iter()
+        .filter(|part| !has_equals_outside_quotes(part))
+        .filter_map(|part| fts5_column_name(part))
         .collect()
+}
+
+/// Splits text at the commas that are not inside a quoted string or name.
+///
+/// @param text - the text between an `fts5(` and its closing parenthesis
+fn split_outside_quotes(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for character in text.chars() {
+        match (quote, character) {
+            (Some(open), found) if found == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'' | '`') => quote = Some(character),
+            (None, ',') => {
+                parts.push(core::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(character);
+    }
+    parts.push(current);
+    parts
+}
+
+/// Reports whether an argument has an `=` that is not inside quotes.
+///
+/// @param argument - one argument of an `fts5(...)` declaration
+fn has_equals_outside_quotes(argument: &str) -> bool {
+    let mut quote: Option<char> = None;
+    for character in argument.chars() {
+        match (quote, character) {
+            (Some(open), found) if found == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'' | '`') => quote = Some(character),
+            (None, '=') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Returns the column an `fts5` argument names, without its quotes or its options.
+///
+/// `a UNINDEXED` names `a`. A quoted name may hold spaces, so a quote at the start
+/// is read to its closing quote and the rest is the options.
+///
+/// @param argument - one argument of an `fts5(...)` declaration that is not a setting
+fn fts5_column_name(argument: &str) -> Option<String> {
+    let text = argument.trim();
+    let first = text.chars().next()?;
+    let name = if matches!(first, '"' | '\'' | '`') {
+        let body = text.get(first.len_utf8()..)?;
+        body.split(first).next().unwrap_or("").to_string()
+    } else {
+        text.split_whitespace().next().unwrap_or("").to_string()
+    };
+    (!name.is_empty()).then_some(name)
 }
 
 /// Renders one value as the SQL literal an `INSERT` can carry.
@@ -1188,6 +1253,23 @@ mod tests {
 
     /// The rowid the reader hands back for a row it read out of a table page.
     const ROWID: i64 = 7;
+
+    /// A column keeps its name when `UNINDEXED` follows it, and a comma inside an option's quotes
+    /// does not start a column (bug hunt 10).
+    #[test]
+    fn fts5_columns_are_read_without_their_options() {
+        assert_eq!(
+            fts5_columns("CREATE VIRTUAL TABLE f3 USING fts5(a UNINDEXED, b)"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            fts5_columns(
+                "CREATE VIRTUAL TABLE f USING fts5(\"x y\" UNINDEXED, 'z', `w` unindexed, \
+                 prefix='2,3', tokenize = \"porter unicode61\", content=t)"
+            ),
+            vec!["x y".to_string(), "z".to_string(), "w".to_string()]
+        );
+    }
 
     /// Every declared type maps to the affinity SQLite's substring rules give.
     ///

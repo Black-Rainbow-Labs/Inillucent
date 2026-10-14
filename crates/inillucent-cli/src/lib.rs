@@ -123,9 +123,11 @@ pub mod dbconfig;
 pub mod diagnose;
 pub mod dot;
 pub mod dump;
+mod dump_header;
 mod dump_virtual;
 pub mod help;
 pub mod import;
+mod sqlite_dump;
 // The one module allowed the word, and only for the two calls that install a
 // console control handler. See its own header.
 #[allow(unsafe_code)]

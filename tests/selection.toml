@@ -3485,6 +3485,18 @@ tier = "e2e"
 # order on one pipe, a program waiting for each answer, and a long output.
 covers = ["inillucent-cli"]
 
+# Loading a dump into the shell: the FTS5 tables of a dump SQLite wrote (graded against the
+# pinned sqlite3), and a dump of tables with multibyte names written by the shell and by
+# `inillucent dump`.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "sqlite_dump_load"
+tier = "e2e"
+covers = ["inillucent-cli", "inillucent-engine"]
+requires = ["shell"]
+
 # `--root` against the file system rather than against path text.
 # It drives the two shipped front ends, because the defect it guards was not in
 # the check's arithmetic - it was in which file operations reached the check.
