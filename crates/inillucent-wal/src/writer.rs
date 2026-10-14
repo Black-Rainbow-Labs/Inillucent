@@ -1692,6 +1692,55 @@ pub fn tail_on_disk(
     }
 }
 
+/// How many segments below the sequence asked for [`hold_segments_from`] also opens.
+const HOLD_BEHIND: u64 = 2;
+
+/// How many sequences above the one asked for [`hold_segments_from`] looks at before it stops at
+/// the first one with no file.
+const HOLD_AHEAD: u64 = 8;
+
+/// Opens the log segments a reader in another process may hold the oplock on, and returns the
+/// handles, so the caller keeps them open for as long as it needs those readers to stay broken.
+///
+/// **Opening a segment is what tells a reader on Windows that something happened to the
+/// database** (`inillucent_vfs::os::windows_log`). A process that changes the meta record
+/// without writing the log has to open the segments first and keep them open until it is done;
+/// see `inillucent_pool::journal::replay_hot_journal_holding`. The reader's segment is the one
+/// it last read, which is at or a little below the sequence the meta record now names, so this
+/// opens from [`HOLD_BEHIND`] below `from` through every segment that exists above it.
+///
+/// A segment that cannot be opened is skipped: it was deleted between the look and the open,
+/// and a deleted segment is one no reader can hold the oplock on any longer.
+///
+/// @param vfs - the file system the segments live on
+/// @param base - the database file the segments are named after
+/// @param from - the sequence the meta record names, or zero when none is known
+pub fn hold_segments_from(
+    vfs: &dyn Vfs,
+    base: &DbPath,
+    from: u64,
+) -> DbResult<Vec<Box<dyn inillucent_vfs::VfsFile>>> {
+    let name = base.as_path().to_string_lossy().to_string();
+    let directory = base.as_path().parent().map(std::path::Path::to_path_buf);
+    let mut held = Vec::new();
+    let mut sequence = from.saturating_sub(HOLD_BEHIND).max(1);
+    let looked_to = from.saturating_add(HOLD_AHEAD);
+    loop {
+        let path = segment_path(&name, directory.as_deref(), sequence);
+        let there = vfs
+            .access(&path, inillucent_vfs::AccessMode::Exists)
+            .unwrap_or(false);
+        if there {
+            if let Ok(file) = vfs.open(&path, OpenOptions::of_kind(FileKind::Wal).existing()) {
+                held.push(file);
+            }
+        } else if sequence >= looked_to {
+            return Ok(held);
+        }
+        sequence = sequence.saturating_add(1);
+    }
+}
+
 /// Reports whether a segment file's header reads cleanly and names another
 /// database or another sequence, so the file is left over from something else.
 ///

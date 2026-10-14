@@ -632,7 +632,8 @@ impl ImportedDatabase {
             ));
         }
         held.database.end_access()?;
-        let replayed = inillucent_pool::journal::replay_hot_journal(held.vfs.as_ref(), &db_path);
+        let replayed =
+            crate::recovery::replay_hot_journal_holding_the_log(held.vfs.as_ref(), &db_path);
         let retaken = match writing {
             true => held.database.begin_write_within(true),
             false => held.database.begin_read(),
@@ -848,8 +849,10 @@ impl ImportedDatabase {
             ));
         }
         self.storage.database.end_access()?;
-        let replayed =
-            inillucent_pool::journal::replay_hot_journal(self.storage.vfs.as_ref(), &db_path);
+        let replayed = crate::recovery::replay_hot_journal_holding_the_log(
+            self.storage.vfs.as_ref(),
+            &db_path,
+        );
         let retaken = match writing {
             true => self.storage.database.begin_write_within(true),
             false => self.storage.database.begin_read(),

@@ -73,7 +73,8 @@ pub use recover::{
 pub use segment::{first_lsn_of, sequence_of_segment_name};
 pub use segment::{SegmentHeader, SEGMENT_BYTES};
 pub use writer::{
-    tail_on_disk, with_segment_bytes, LogTail, Synchronous, Wal, WalOptions, WalStats, FIRST_LSN,
+    hold_segments_from, tail_on_disk, with_segment_bytes, LogTail, Synchronous, Wal, WalOptions,
+    WalStats, FIRST_LSN,
 };
 
 /// The implementation phase that filled this crate in, as named by the TDD.

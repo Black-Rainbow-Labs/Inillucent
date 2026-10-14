@@ -24,8 +24,13 @@ use inillucent_compat::storm::{run, Storm};
 use inillucent_compat::workspace_root;
 
 /// Returns `inillucent-chaos`, which cargo builds for this package's tests.
+///
+/// `STORM_CHAOS` names a copy of it instead, so a long reproduction can keep
+/// running from a snapshot while the build directory is rebuilt.
 fn chaos() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_inillucent-chaos"))
+    std::env::var_os("STORM_CHAOS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_inillucent-chaos")))
 }
 
 /// Runs one long storm and fails the case with the run's own words.
@@ -35,9 +40,12 @@ fn chaos() -> PathBuf {
 /// @param settings - what the workload includes
 /// @param kill_all_at_end - whether the run ends with every process killed at once
 fn long_storm(name: &str, seed: u64, settings: Settings, kill_all_at_end: bool) {
-    let directory = workspace_root()
-        .join("_agent_output/storm-nightly")
-        .join(name);
+    // `STORM_DIR` names another parent directory, so several copies of one case can run
+    // side by side; see `process_storm.rs`.
+    let parent = std::env::var_os("STORM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("_agent_output/storm-nightly"));
+    let directory = parent.join(name);
     let _ = std::fs::remove_dir_all(&directory);
     let _ = std::fs::create_dir_all(&directory);
     let storm = Storm {
