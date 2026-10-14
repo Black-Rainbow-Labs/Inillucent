@@ -392,3 +392,58 @@ fn a_trigger_another_process_creates_fires_on_this_processes_write() {
         "the insert ran the plan compiled before the other process created the trigger"
     );
 }
+
+/// Runs one statement in another process through `exec`, the way a second
+/// program reaches the file, and fails the case if it fails.
+///
+/// @param database - the file
+/// @param sql - the statement
+fn other_process_exec_one(database: &Path, sql: &str) {
+    let ran = run(
+        &program("inillucent"),
+        &["--db", &database.to_string_lossy(), "exec", sql],
+    );
+    assert_eq!(
+        ran.code,
+        0,
+        "the other process failed on {sql}:\n{}",
+        ran.said()
+    );
+}
+
+/// A table another process creates is found by a process whose last statement
+/// was its own `CREATE TABLE`, with and without bound parameters.
+///
+/// **The steps a Python program reported.** The first process creates `a` and
+/// runs nothing else. A second process runs `exec "CREATE TABLE b (y)"`. Every
+/// statement naming `b` in the first process then failed with `no such table:
+/// b`, for as long as the connection stayed open.
+#[test]
+fn a_table_another_process_creates_after_this_process_created_one_is_found() {
+    let directory = area("created-after-create");
+    let database = directory.join("shared.rdb");
+    let ours = this_process(&database);
+    let session = ours.session();
+    session
+        .execute_batch("CREATE TABLE a (x)")
+        .unwrap_or_else(|error| panic!("the first table was not created: {error:?}"));
+
+    other_process_exec_one(&database, "CREATE TABLE b (y)");
+
+    let counted = session
+        .query_all("SELECT count(*) FROM b", &[])
+        .unwrap_or_else(|error| panic!("SELECT count(*) FROM b: {error:?}"));
+    assert_eq!(shown(&counted), expect(&["count(*)"], &[&["0"]]));
+    session
+        .execute("INSERT INTO b VALUES (?1)", &[Value::Integer(5)])
+        .unwrap_or_else(|error| panic!("INSERT INTO b VALUES (?1): {error:?}"));
+    let filtered = session
+        .query_all("SELECT count(*) FROM b WHERE y = ?1", &[Value::Integer(5)])
+        .unwrap_or_else(|error| panic!("SELECT count(*) FROM b WHERE y = ?1: {error:?}"));
+    assert_eq!(shown(&filtered), expect(&["count(*)"], &[&["1"]]));
+    drop(ours);
+    assert_eq!(
+        other_process_rows(&database, "SELECT y FROM b"),
+        vec![vec!["5".to_string()]]
+    );
+}
