@@ -129,12 +129,15 @@ impl ImportedDatabase {
         // Read before any check by name, so a break that lands during the checks gives a token
         // that differs from this one. See `quiet_since_checked`.
         let quiet = self.storage.wal.quiet_token();
+        // A transaction that holds no lock has read nothing and written
+        // nothing, so it has nothing the replaced file could contradict.
+        let untouched = inside && held_before == inillucent_vfs::FileLock::None;
         if self.replaced_since_open(taking, writing, held_before) {
-            return self.reopen_the_replaced_file(writing, inside);
+            return self.reopen_the_replaced_file(writing, inside, untouched);
         }
         let reloaded = self.take_the_lock(writing, may_release)?;
         if self.replaced_since_open(taking, writing, held_before) {
-            return self.reopen_the_replaced_file(writing, inside);
+            return self.reopen_the_replaced_file(writing, inside, untouched);
         }
         if writing && inside && held_before == inillucent_vfs::FileLock::Shared && reserved {
             self.refuse_a_write_on_a_stale_read()?;
@@ -357,14 +360,28 @@ impl ImportedDatabase {
     /// nothing yet is refused instead: reopening throws away the writer state that says a
     /// transaction is open, and the caller rolls back and runs it again, as after any `busy`.
     ///
+    /// **A transaction that has read and written nothing reopens and carries on**, as SQLite's
+    /// does: its `BEGIN` took no lock, so it has seen nothing of the old file. Refusing it with
+    /// `busy` left it unable to end, because `ROLLBACK` met the same refusal, and every later
+    /// statement on the connection failed until it was closed.
+    ///
     /// @param writing - whether the statement changes the database
     /// @param inside - whether a transaction is open
-    fn reopen_the_replaced_file(&mut self, writing: bool, inside: bool) -> DbResult<()> {
+    /// @param untouched - whether that transaction holds no lock, so has read and written nothing
+    fn reopen_the_replaced_file(
+        &mut self,
+        writing: bool,
+        inside: bool,
+        untouched: bool,
+    ) -> DbResult<()> {
         let _ = self
             .storage
             .database
             .pool()
             .unlock(inillucent_vfs::FileLock::None);
+        if inside && untouched && self.writing.undo().borrow().is_empty() {
+            return self.reopen_keeping_the_transaction(writing);
+        }
         if inside {
             return Err(
                 inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::Busy)
@@ -376,6 +393,39 @@ impl ImportedDatabase {
         let running = self.writing.running();
         let generation = self.schema_generation();
         crate::rebuild::reopen_in_place(self)?;
+        self.writing.set_running(running);
+        self.schema.catalog_generation = self
+            .schema
+            .catalog_generation
+            .max(generation)
+            .saturating_add(1);
+        self.enter_within(writing)
+    }
+
+    /// Reopens the replaced file under a transaction that has touched nothing, and keeps the
+    /// transaction open.
+    ///
+    /// The reopen takes the fresh connection's writer state, which has no transaction, so the
+    /// open transaction's number, savepoints and implicit flag are put back after it. The
+    /// statement then runs as the transaction's first, against the new file, and is compiled
+    /// again because the generation moved.
+    ///
+    /// @param writing - whether the statement changes the database
+    fn reopen_keeping_the_transaction(&mut self, writing: bool) -> DbResult<()> {
+        let batch = self.writing.batch();
+        let marks = self.writing.marks().take();
+        let implicit = self.writing.implicit_transaction();
+        let running = self.writing.running();
+        let generation = self.schema_generation();
+        crate::rebuild::reopen_in_place(self)?;
+        if let Some(fresh) = batch {
+            // A number past every one the new file's log has used.
+            let txn = self.writing.next_txn().max(fresh);
+            self.writing.set_next_txn(txn.saturating_add(1));
+            self.writing.set_batch(Some(txn));
+        }
+        self.writing.marks().replace(marks);
+        self.writing.set_implicit_transaction(implicit);
         self.writing.set_running(running);
         self.schema.catalog_generation = self
             .schema
@@ -895,7 +945,7 @@ impl ImportedDatabase {
     /// Shared by [`ImportedDatabase::leave`] and by the failure path of
     /// [`ImportedDatabase::enter`], because a statement that could not start
     /// has to leave the file exactly as one that finished does.
-    fn release_if_idle(&mut self) -> DbResult<()> {
+    pub(crate) fn release_if_idle(&mut self) -> DbResult<()> {
         if self.writing.running() > 0
             || self.pragmas.locking_exclusive()
             || self.writing.batch().is_some()
@@ -1047,7 +1097,7 @@ impl ImportedDatabase {
     /// connection holds: a lock above SHARED, a dirty page or a hot journal, on
     /// `main` or on an attached file. See `release_if_idle` for why every file
     /// is asked and not only `main`.
-    fn wrote_anything(&self) -> bool {
+    pub(crate) fn wrote_anything(&self) -> bool {
         self.storage.database.lock_level() > inillucent_vfs::FileLock::Shared
             || self.storage.database.pool().dirty_pages() > 0
             || self.storage.database.pool().journal_is_hot()

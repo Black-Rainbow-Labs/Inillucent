@@ -193,9 +193,27 @@ impl crate::ImportedDatabase {
         // and the checks for another process's commit, seven system calls on
         // Windows, for a statement that never looks at a page. SQLite takes
         // no lock for them either. See `lockless`.
-        let lockless = self.writing.batch().is_none()
+        let opens_nothing = self.writing.batch().is_none()
             && self.writing.running() == 0
             && (begins_without_a_lock(cached) || super::lockless::reads_no_file(cached));
+        // **Nor does ending a transaction, or setting this connection's own
+        // settings.** A transaction that wrote already holds the write lock,
+        // and undoing needs nothing more; one that wrote nothing has nothing to
+        // make durable. So `ROLLBACK`, and a `COMMIT` of a transaction that
+        // wrote nothing, take no lock, as in SQLite. They used to ask for the
+        // read lock and fail `busy` while another connection held the file to
+        // write it, which left the transaction open: the next statements ran
+        // inside it, reported success, and were lost when the connection
+        // closed. `PRAGMA busy_timeout` failed the same way, at exactly the
+        // moment a program needs to raise it.
+        let ends_or_configures = self.writing.running() == 0
+            && match needs_no_lock(cached) {
+                NoLock::Rollback => self.writing.batch().is_some(),
+                NoLock::Commit => self.writing.batch().is_some() && !self.wrote_anything(),
+                NoLock::ConnectionPragma => true,
+                NoLock::No => false,
+            };
+        let lockless = opens_nothing || ends_or_configures;
         // **And it ends a lease the statement before it left.** A statement that
         // only read keeps SHARED for a moment after it ends, and a transaction
         // that began inside that moment looked like one that had read: its first
@@ -241,6 +259,10 @@ impl crate::ImportedDatabase {
         }
         if !lockless {
             self.leave()?;
+        } else if ends_or_configures && self.writing.batch().is_none() {
+            // The transaction is over, so the locks it held are let go here,
+            // as `leave` lets them go after a statement that took one.
+            self.release_if_idle()?;
         }
         let outcome = outcome?;
         // **The cyclic half of a foreign key's action happens here**, after the
@@ -1812,6 +1834,47 @@ fn push_value_columns<'v>(
 /// opens one when none is open.
 ///
 /// @param cached - the compiled statement
+/// What a statement that may run without taking a lock is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoLock {
+    /// A plain `ROLLBACK`, which ends the transaction.
+    Rollback,
+    /// `COMMIT` or `END`.
+    Commit,
+    /// A `PRAGMA` that reads or sets a setting of this connection only.
+    ConnectionPragma,
+    /// Anything else.
+    No,
+}
+
+/// Classifies a statement that needs no lock to end a transaction or set the connection.
+///
+/// `ROLLBACK TO` is not one: it ends nothing, and the statements after it in
+/// the transaction take their own locks.
+///
+/// @param cached - the compiled statement
+fn needs_no_lock(cached: &Cached) -> NoLock {
+    let Cached::Ddl(sql) = cached else {
+        return NoLock::No;
+    };
+    let text = sql.trim_start().to_ascii_lowercase();
+    let mut words = text
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|word| !word.is_empty());
+    match words.next() {
+        Some("rollback") => {
+            if words.any(|word| word == "to") {
+                NoLock::No
+            } else {
+                NoLock::Rollback
+            }
+        }
+        Some("commit") | Some("end") => NoLock::Commit,
+        Some("pragma") if takes_no_write_lock(cached) => NoLock::ConnectionPragma,
+        _ => NoLock::No,
+    }
+}
+
 fn begins_without_a_lock(cached: &Cached) -> bool {
     let Cached::Ddl(sql) = cached else {
         return false;

@@ -2312,6 +2312,17 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "two_connections_end_a_transaction"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-driver", "inillucent-pool"]
+# ROLLBACK, a COMMIT that wrote nothing and a connection PRAGMA take no lock, and
+# a transaction that touched nothing goes on after another connection's VACUUM.
+# Each was refused busy and could leave a transaction open (task-2264).
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "read_only_connection"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-driver", "inillucent-pool", "inillucent-wal"]

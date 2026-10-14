@@ -58,5 +58,6 @@ mod reused_key_extent;
 mod search_crash;
 mod storage_failure;
 mod story_nikaya_crash;
+mod two_connections_end_a_transaction;
 mod vacuum_crash;
 mod wal_crash;
