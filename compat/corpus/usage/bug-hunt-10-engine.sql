@@ -708,3 +708,18 @@ ATTACH ':memory:' AS m;
 ALTER TABLE m.nosuch RENAME TO other;
 ALTER TABLE main.nosuch ADD COLUMN x;
 ALTER TABLE nosuch DROP COLUMN x;
+-- case: bug-hunt-10/engine/rollback-to-ends-later-savepoints
+CREATE TABLE t(a);
+BEGIN;
+SAVEPOINT s0;
+SAVEPOINT s1;
+ROLLBACK TO s0;
+RELEASE s1;
+SAVEPOINT s2;
+INSERT INTO t VALUES(1);
+SAVEPOINT s3;
+ROLLBACK TO s2;
+RELEASE s3;
+RELEASE s0;
+COMMIT;
+SELECT count(*) FROM t;

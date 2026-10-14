@@ -71,6 +71,8 @@ impl crate::ImportedDatabase {
     ///
     /// @param to - the savepoint to stop at, or `None` for the whole transaction
     pub(crate) fn undo_to(&mut self, to: Option<&[u8]>) -> DbResult<()> {
+        // Where the named savepoint sits in the list, so the ones after it go.
+        let mut kept = None;
         let to = match to {
             Some(name) => {
                 let folded = name.to_ascii_lowercase();
@@ -81,7 +83,10 @@ impl crate::ImportedDatabase {
                     marks
                         .iter()
                         .rposition(|(held, _)| *held == folded)
-                        .and_then(|index| marks.get(index).map(|(_, mark)| *mark))
+                        .and_then(|index| {
+                            kept = Some(index.saturating_add(1));
+                            marks.get(index).map(|(_, mark)| *mark)
+                        })
                 };
                 let Some(mark) = found else {
                     // `SQLITE_ERROR` (1), as SQLite answers; `refusal` answered 21.
@@ -99,7 +104,16 @@ impl crate::ImportedDatabase {
                 meta: 0,
             },
         };
-        self.undo_to_floor(to, true, self.current_txn())
+        self.undo_to_floor(to, true, self.current_txn())?;
+        // **`ROLLBACK TO s0` ends every savepoint opened after `s0`**, which
+        // `undo_to_floor` decides by undo position alone. A savepoint opened
+        // when nothing had been undoable since `s0` has the same position, so
+        // it was kept, and a later `RELEASE s1` succeeded where SQLite answers
+        // "no such savepoint: s1" (bug hunt 10).
+        if let Some(count) = kept {
+            self.writing.marks().borrow_mut().truncate(count);
+        }
+        Ok(())
     }
 
     /// Undoes back to a position in the undo buffer, newest first.
