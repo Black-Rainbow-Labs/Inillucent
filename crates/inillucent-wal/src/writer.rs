@@ -333,9 +333,48 @@ impl Default for WalOptions {
     fn default() -> WalOptions {
         WalOptions {
             synchronous: Synchronous::Full,
-            segment_bytes: segment::SEGMENT_BYTES,
+            segment_bytes: default_segment_bytes(),
         }
     }
+}
+
+thread_local! {
+    /// The segment size [`WalOptions::default`] answers on this thread, when a test has set one.
+    static SEGMENT_BYTES_ON_THIS_THREAD: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Returns the segment size a log opened with the default options rolls at.
+///
+/// The 64 MiB of [`segment::SEGMENT_BYTES`], unless [`with_segment_bytes`] is running on this
+/// thread.
+fn default_segment_bytes() -> u64 {
+    SEGMENT_BYTES_ON_THIS_THREAD
+        .with(std::cell::Cell::get)
+        .unwrap_or(segment::SEGMENT_BYTES)
+}
+
+/// Runs `body` with every log this thread opens by default rolling at `bytes`, and puts the
+/// previous size back afterwards, also when `body` panics.
+///
+/// **Why this exists.** A roll at 64 MiB cannot be reached by a test that writes through the
+/// engine, and the engine opens its logs with `WalOptions::default()` in several places (open,
+/// recovery, a resynchronisation, a reattach). A test that needs two connections on one file to
+/// roll their segments after a few kilobytes sets the size here for the whole body, and nothing
+/// else in the process is affected because the setting is per thread. The engine is single
+/// threaded per connection, so every log a connection opens on the test's thread sees it.
+///
+/// @param bytes - the size a segment grows to before the log rolls
+/// @param body - what runs with that size
+pub fn with_segment_bytes<R>(bytes: u64, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SEGMENT_BYTES_ON_THIS_THREAD.with(|held| held.set(self.0));
+        }
+    }
+    let _restore = Restore(SEGMENT_BYTES_ON_THIS_THREAD.with(|held| held.replace(Some(bytes))));
+    body()
 }
 
 impl Wal {
@@ -1194,6 +1233,14 @@ impl Wal {
         // recovery would find truncated for no reason.
         self.drive(next, self.synchronous() != Synchronous::Off)?;
         let mut segment = self.io_lock()?;
+        // **Before the next segment exists, so no reader can see the roll while its token still
+        // says nothing happened.** Rolling writes nothing to the segment being left when all of it
+        // was written already, and the file system's token only moves for a change from outside
+        // the process, so a second connection in this process would skip the check for the next
+        // segment and read without the commits that land in it.
+        if let Some(left) = segment.file.as_ref() {
+            left.end_quiet();
+        }
         let sequence = segment.sequence.saturating_add(1);
         let opened = open_segment(
             self.shared.vfs.as_ref(),

@@ -244,6 +244,14 @@ it replays, as an open does. When several processes find such a journal at once,
 and the others wait, holding no lock, until it is gone. An open that went ahead read pages the
 journal had not been put back over yet.
 
+The log is a chain of segment files, and it moves on to the next segment when the open one reaches
+64 MiB. That move writes no meta record, and it writes nothing to the segment it leaves when
+everything for that segment was already written. So the connection also asks whether the segment
+after its open one exists, for `main` and for every attached file, and replays the log when it does.
+Two connections in one process share one file object for each segment, and the check that skips the
+question for a quiet segment on Windows cannot see one of them move the log on, so the log ends that
+quiet when it moves to a new segment.
+
 A schema another process changed is the schema a statement runs against. A statement is compiled
 before it takes the lock, so when taking the lock rereads the catalog, the statement is compiled
 again and run, as `sqlite3_step` does after `SQLITE_SCHEMA`. A statement that fails to compile, for
@@ -594,6 +602,12 @@ recovered the log: 3 records scanned, 2 applied, 1 transactions committed, 1 dis
 ```
 
 With `--output json`, both cases carry the same `recovered` member with the five counts.
+
+A connection that can write folds the log when it closes after an open that discarded a transaction.
+The fold moves the recovery point past the discarded records, so the next open scans nothing and
+prints nothing. Before this, a session that only read left the discarded records below the recovery
+point, and every later open printed the same `recovered the log` line until a session wrote. A read
+only connection cannot fold, so it recovers again at each open.
 
 **A log that belongs to an older copy of the file is set aside.** A segment names its database by
 uuid and its place in the chain by sequence number, and a copy of the file has both. An older copy
