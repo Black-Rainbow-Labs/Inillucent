@@ -74,9 +74,28 @@ impl crate::ImportedDatabase {
         // Planning copies every table, so it is skipped when no table has a key to plan and
         // none holds a plan from an earlier schema.
         if self.any_foreign_key() {
-            inillucent_sql::foreign_key::plan_schema(
+            let mut databases: Vec<usize> = self
+                .schema
+                .tables
+                .iter()
+                .map(|table| table.database)
+                .collect();
+            databases.sort_unstable();
+            databases.dedup();
+            let names: Vec<(usize, Vec<u8>)> = databases
+                .into_iter()
+                .map(|database| (database, self.schema_label(database)))
+                .collect();
+            let name_of = |database: usize| {
+                names
+                    .iter()
+                    .find(|(at, _)| *at == database)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| b"main".to_vec())
+            };
+            inillucent_sql::foreign_key::plan_databases(
                 &mut self.schema.tables,
-                b"main",
+                &name_of,
                 &inillucent_base::limits::Limits::default(),
             );
         }

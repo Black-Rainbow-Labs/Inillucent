@@ -543,8 +543,9 @@ pub fn tables_from_entries(
             continue;
         }
         let folded = entry.table.to_ascii_lowercase();
-        let trigger = crate::load::trigger_from_create_sql(&entry.sql)
+        let mut trigger = crate::load::trigger_from_create_sql(&entry.sql)
             .map_err(|error| error.with_detail(format!("in trigger {}", name_of(entry))))?;
+        trigger.temporary = database == inillucent_storage::TEMP_DATABASE;
         // A temporary trigger written `ON main.t` belongs to `main`'s table
         // even when a temporary table of the same name exists, so it is left
         // for the caller that sees every database to attach.

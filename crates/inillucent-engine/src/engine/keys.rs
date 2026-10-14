@@ -44,20 +44,19 @@ impl ImportedDatabase {
             if child.kind != inillucent_sql::catalog_view::TableKind::Table {
                 continue;
             }
+            let database_name = self.schema_label(child.database);
             for key in &child.foreign_keys {
                 if !key.cyclic {
                     continue;
                 }
-                let Some(parent) = self
-                    .schema
-                    .tables
-                    .iter()
-                    .find(|candidate| candidate.folded == key.parent_folded)
-                else {
+                // The parent is in the child's own database, as SQLite resolves it.
+                let Some(parent) = self.schema.tables.iter().find(|candidate| {
+                    candidate.folded == key.parent_folded && candidate.database == child.database
+                }) else {
                     continue;
                 };
                 if let Some(sql) =
-                    inillucent_sql::foreign_key::sweep_statement(child, parent, key, b"main")
+                    inillucent_sql::foreign_key::sweep_statement(child, parent, key, &database_name)
                 {
                     statements.push(sql);
                 }
@@ -101,7 +100,9 @@ impl ImportedDatabase {
         // `PRAGMA defer_foreign_keys` defers every key, so every key is the
         // commit's to check while it is on.
         let every_key = self.pragmas.defer_foreign_keys();
-        for query in self.schema.violation_queries(None)? {
+        let name_of = |database: usize| self.schema_label(database);
+        let queries = self.schema.violation_queries(None, &name_of)?;
+        for query in queries {
             if !query.deferred && !every_key {
                 continue;
             }
@@ -134,7 +135,9 @@ impl ImportedDatabase {
                 continue;
             };
             let child = String::from_utf8_lossy(&child).into_owned();
-            for query in self.schema.violation_queries(Some(&child))? {
+            let name_of = |database: usize| self.schema_label(database);
+            let queries = self.schema.violation_queries(Some(&child), &name_of)?;
+            for query in queries {
                 if query.key != key || self.query_internally(&query.sql)?.is_empty() {
                     continue;
                 }

@@ -412,6 +412,7 @@ pub fn trigger_from_create_sql(sql: &[u8]) -> DbResult<TriggerInfo> {
         body: body.clone(),
         table_database: table_database.map(|id| parsed.ast.folded(id).to_vec()),
         ast: parsed.ast,
+        temporary: false,
     })
 }
 

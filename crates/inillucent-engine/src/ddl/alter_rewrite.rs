@@ -168,8 +168,9 @@ impl crate::ImportedDatabase {
             return Ok(());
         };
         let quote = |name: &[u8]| String::from_utf8_lossy(name).replace('\'', "''");
+        let database = String::from_utf8_lossy(&self.schema_label(at)).replace('"', "\"\"");
         let sql = format!(
-            "UPDATE sqlite_sequence SET name = '{}' WHERE name = '{}'",
+            "UPDATE \"{database}\".sqlite_sequence SET name = '{}' WHERE name = '{}'",
             quote(to),
             quote(&old)
         );

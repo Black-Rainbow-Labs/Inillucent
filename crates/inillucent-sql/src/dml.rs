@@ -817,9 +817,13 @@ impl<'a> Binder<'a> {
             .bind_foreign_keys(&table, TriggerEventInfo::Insert, &[])?
             .around(triggers);
         let replace_triggers = self.bind_replace_triggers(&table, insert.on_conflict)?;
+        // The counter is in the table's own database: an unqualified lookup
+        // found the first `sqlite_sequence` in the search order, so two
+        // databases with `AUTOINCREMENT` tables shared one counter.
         let sequence_root = if table.autoincrement {
+            let home = self.catalog.database_name(table.database).to_vec();
             self.catalog
-                .find_table(None, b"sqlite_sequence")
+                .find_table(Some(&home), b"sqlite_sequence")
                 .map_or(0, |sequence| sequence.root)
         } else {
             0
@@ -1446,6 +1450,41 @@ impl<'a> Binder<'a> {
         trigger: &TriggerInfo,
         table: &TableInfo,
     ) -> Result<BoundTrigger, ParseError> {
+        // **A trigger that is not temporary reads and writes its own database.**
+        // SQLite binds an unqualified table name in such a body in the database
+        // the trigger is in, so a trigger in `aux` writing `log` writes
+        // `aux.log` even when `main` has a `log` too. It is the rule a view's
+        // body follows, and it uses the same field.
+        let home = self
+            .catalog
+            .database_name(table.database)
+            .to_ascii_lowercase();
+        let saved_home = self.view_database.take();
+        if !trigger.temporary && home.as_slice() != b"temp" {
+            self.view_database = Some(home);
+        }
+        let bound = self.bind_trigger_guard_and_statements(trigger);
+        self.view_database = saved_home;
+        let (when, body) = bound?;
+        Ok(BoundTrigger {
+            name: trigger.name.clone(),
+            table: table.folded.clone(),
+            time: trigger.time,
+            when,
+            body,
+            foreign_key: false,
+            self_referencing: false,
+            event: trigger.event.clone(),
+        })
+    }
+
+    /// Binds a trigger's `WHEN` guard and its body statements, in the database the caller chose.
+    ///
+    /// @param trigger - the trigger whose guard and body are bound
+    fn bind_trigger_guard_and_statements(
+        &mut self,
+        trigger: &TriggerInfo,
+    ) -> Result<(Option<BoundExpr>, Vec<BoundTriggerStatement>), ParseError> {
         let when = match trigger.when {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
@@ -1460,16 +1499,7 @@ impl<'a> Binder<'a> {
             self.scopes = saved;
             body.push(one?);
         }
-        Ok(BoundTrigger {
-            name: trigger.name.clone(),
-            table: table.folded.clone(),
-            time: trigger.time,
-            when,
-            body,
-            foreign_key: false,
-            self_referencing: false,
-            event: trigger.event.clone(),
-        })
+        Ok((when, body))
     }
 
     /// Binds one statement of a trigger body.
@@ -1529,7 +1559,11 @@ impl<'a> Binder<'a> {
         span: Span,
         event: &TriggerEventInfo,
     ) -> Result<std::rc::Rc<TableInfo>, ParseError> {
-        let qualifier = database.map(|id| self.ast.folded(id).to_vec());
+        // An unqualified target inside a trigger body that is not temporary is
+        // in the trigger's own database (see `bind_trigger_body`).
+        let qualifier = database
+            .map(|id| self.ast.folded(id).to_vec())
+            .or_else(|| self.view_database.clone());
         let folded = self.ast.folded(name).to_vec();
         // Shared with the catalog rather than cloned. A clone of a `TableInfo`
         // copies every column, index and the `CREATE` text, and an `INSERT` took

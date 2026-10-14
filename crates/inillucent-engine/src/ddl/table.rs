@@ -85,20 +85,31 @@ impl crate::ImportedDatabase {
     /// @param name - the table's name as written
     fn table_is_autoincrement(&self, name: &[u8]) -> bool {
         let folded = name.to_ascii_lowercase();
+        let at = self.schema.ddl_schema;
         self.schema
             .tables
             .iter()
-            .any(|held| held.folded == folded && held.autoincrement)
+            .any(|held| held.database == at && held.folded == folded && held.autoincrement)
     }
-    /// Creates `sqlite_sequence` if the schema has not got one.
+    /// Creates `sqlite_sequence` if the database being changed has not got one.
     ///
     /// The same shape `ANALYZE` uses for `sqlite_stat1`: a reserved-prefix table
     /// cannot go through the statement path, because `sqlite_` is a name the
     /// binder refuses, and a schema-writing statement that has to defeat the
     /// binder's own rule to run is a rule with a hole in it.
+    ///
+    /// **Each database has its own.** An `AUTOINCREMENT` table in `main`
+    /// created after one in an attached database found the attached
+    /// database's `sqlite_sequence`, made none, and kept its counter there.
     fn ensure_sequence_table(&mut self) -> DbResult<()> {
         let folded = inillucent_exec::sequence::SEQUENCE_TABLE.to_ascii_lowercase();
-        if self.schema.tables.iter().any(|held| held.folded == folded) {
+        let at = self.schema.ddl_schema;
+        if self
+            .schema
+            .tables
+            .iter()
+            .any(|held| held.database == at && held.folded == folded)
+        {
             return Ok(());
         }
         self.define_table(
@@ -110,14 +121,15 @@ impl crate::ImportedDatabase {
     }
     /// Removes a table's `sqlite_sequence` row, which is what `DROP` does to it.
     ///
+    /// @param at - the database the table was in, whose `sqlite_sequence` holds its row
     /// @param name - the dropped table's name, as `sqlite_sequence` stores it
-    pub(crate) fn forget_sequence(&mut self, name: &[u8]) -> DbResult<()> {
+    pub(crate) fn forget_sequence(&mut self, at: usize, name: &[u8]) -> DbResult<()> {
         let folded = inillucent_exec::sequence::SEQUENCE_TABLE.to_ascii_lowercase();
         let Some(root) = self
             .schema
             .tables
             .iter()
-            .find(|held| held.folded == folded)
+            .find(|held| held.database == at && held.folded == folded)
             .map(|held| held.root)
         else {
             return Ok(());
@@ -154,14 +166,31 @@ impl crate::ImportedDatabase {
             txn,
             schema: at,
             wrote: false,
-            undo: None,
+            // A before-image, as every catalog write of the same `DROP` takes:
+            // with none, `BEGIN; DROP TABLE t; ROLLBACK` put the table back
+            // without its high water mark, so it handed out keys it had
+            // handed out before.
+            undo: Some(self.writing.undo()),
             uncommitted: self.uncommitted_handle_of(at),
         };
+        // **The file the tree is in.** This wrote through `main`'s file
+        // whatever database the table was dropped from, so dropping an
+        // `AUTOINCREMENT` table in an attached database left its row and
+        // broke the attached `sqlite_sequence`: the next read of it failed
+        // with "read 0 of 32768 bytes".
+        let session = self.session_state.session.get();
+        let database = crate::file_of(
+            &mut self.storage.database,
+            &mut self.session_state.attached,
+            &mut self.session_state.temps,
+            session,
+            at,
+        )?;
         let Some(tree) = self.schema.trees.get_mut(&root) else {
             return Ok(());
         };
         for rowid in doomed {
-            tree.delete(&mut self.storage.database, &mut log, &[Datum::Int(rowid)])?;
+            tree.delete(database, &mut log, &[Datum::Int(rowid)])?;
         }
         Ok(())
     }

@@ -236,7 +236,7 @@ impl crate::ImportedDatabase {
         // behaviour and the reason the mark is a row rather than a
         // header field.
         if owner.autoincrement {
-            self.forget_sequence(&owner.name)?;
+            self.forget_sequence(at, &owner.name)?;
         }
         let _ = position;
         Ok(())
@@ -598,9 +598,10 @@ impl crate::ImportedDatabase {
             .map(|row| (row.entry.table.to_ascii_lowercase(), row.entry.sql.clone()))
             .collect();
         for (folded, sql) in temp_triggers {
-            let Ok(trigger) = inillucent_catalog::load::trigger_from_create_sql(&sql) else {
+            let Ok(mut trigger) = inillucent_catalog::load::trigger_from_create_sql(&sql) else {
                 continue;
             };
+            trigger.temporary = true;
             let named = match trigger.table_database.as_deref() {
                 Some(b"temp") | None => None,
                 Some(name) => match self.schema_named(name) {

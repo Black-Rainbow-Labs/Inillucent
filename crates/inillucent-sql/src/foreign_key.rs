@@ -264,6 +264,7 @@ fn build(sql: &str, name: Vec<u8>, limits: &Limits) -> Option<TriggerInfo> {
         body: body.clone(),
         ast: parsed.ast,
         table_database: None,
+        temporary: false,
     })
 }
 
@@ -451,6 +452,51 @@ fn column_list(columns: &[Vec<u8>]) -> String {
 /// columns that are not a key of the parent - produces an entry with no trigger
 /// and the message to report. That is SQLite's timing: the schema loads, and
 /// the first write that needs the constraint is what fails.
+/// Plans the keys of a connection that may hold several databases, each against its own tables.
+///
+/// **A key's parent is a table of the child's own database.** SQLite resolves
+/// `REFERENCES p` in the database the child table is in, and the triggers that
+/// enforce it name that database. Planning every table of a connection as one
+/// schema under `main` sent a key in an attached or temporary database to
+/// `main.p`: every write to the child failed with `no such table: main.p`, and
+/// when `main` had a table of the same name the key was checked against it.
+///
+/// @param tables - every table the connection holds, each tagged with its database
+/// @param name_of - the name a database's triggers qualify their tables with, by number
+/// @param limits - the limits the generated trigger text is parsed under
+pub fn plan_databases(
+    tables: &mut [TableInfo],
+    name_of: &dyn Fn(usize) -> Vec<u8>,
+    limits: &Limits,
+) {
+    let mut databases: Vec<usize> = tables.iter().map(|table| table.database).collect();
+    databases.sort_unstable();
+    databases.dedup();
+    if let [only] = databases.as_slice() {
+        plan_schema(tables, &name_of(*only), limits);
+        return;
+    }
+    for database in databases {
+        let mut group: Vec<TableInfo> = tables
+            .iter()
+            .filter(|table| table.database == database)
+            .cloned()
+            .collect();
+        plan_schema(&mut group, &name_of(database), limits);
+        let mut planned = group.into_iter();
+        for table in tables.iter_mut().filter(|table| table.database == database) {
+            if let Some(done) = planned.next() {
+                *table = done;
+            }
+        }
+    }
+}
+
+/// Plans the keys of one database's tables, every one of which is in that database.
+///
+/// @param tables - the tables of one database
+/// @param database - the database's name, which the generated triggers qualify with
+/// @param limits - the limits the generated trigger text is parsed under
 pub fn plan_schema(tables: &mut [TableInfo], database: &[u8], limits: &Limits) {
     mark_cycles(tables);
     let snapshot: Vec<TableInfo> = tables.to_vec();

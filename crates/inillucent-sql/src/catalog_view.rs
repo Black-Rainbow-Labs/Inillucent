@@ -311,6 +311,13 @@ pub struct TriggerInfo {
     /// The folded database the `ON` clause named, as in `ON main.t`, when it
     /// named one.
     pub table_database: Option<Vec<u8>>,
+    /// Whether the trigger's row is in the temporary database.
+    ///
+    /// SQLite binds an unqualified table name in the body of a trigger that is
+    /// not temporary in the trigger's own database, and a temporary trigger's
+    /// body by the usual search. The stored `CREATE TRIGGER` text has the
+    /// database name removed, so the loader that read the row sets this.
+    pub temporary: bool,
 }
 
 impl ColumnInfo {

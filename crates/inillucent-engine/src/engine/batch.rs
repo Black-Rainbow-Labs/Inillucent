@@ -339,6 +339,11 @@ impl crate::ImportedDatabase {
                 *held = reloaded;
             }
         }
+        // **A virtual table whose `DROP` was undone is in the catalog again and
+        // has no connection.** Connected before `rebuild_tables`, because a
+        // virtual table's columns come from its connection, and before the
+        // catalog refresh below, because a vector index is published from it.
+        self.connect_missing()?;
         self.rebuild_tables()?;
         // **A rolled back `CREATE VIRTUAL TABLE` leaves its module connected,
         // and the connection outlives the rows it was made from (task-2043).**

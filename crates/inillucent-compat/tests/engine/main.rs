@@ -72,6 +72,7 @@ mod put_stages;
 mod readonly_pragmas;
 mod reentrant_connection;
 mod reindex_without_rowid;
+mod rollback_restores_modules;
 mod rowid_after_tail_delete;
 mod schema_function_policy;
 mod scratch_memory_flat;

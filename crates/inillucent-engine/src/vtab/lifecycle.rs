@@ -40,7 +40,20 @@ impl crate::ImportedDatabase {
         // Every declaration is connected again, so an error recorded by an
         // earlier pass is an error about a catalog that may have changed.
         self.session_state.unconnected.clear();
-        self.connect_declared(false)
+        self.connect_declared(ConnectWhich::Every)
+    }
+
+    /// Connects every declared virtual table this connection holds no connection for.
+    ///
+    /// **A rolled back `DROP` puts the catalog row back but not the
+    /// connection.** `BEGIN; DROP TABLE f; ROLLBACK` left an FTS5 table that
+    /// every statement refused with "no module is connected", and a table with
+    /// a vector index lost the index from this connection: rows written after
+    /// the rollback never reached it, so after a reopen the index answered
+    /// without them. A table that is still connected is left alone, because
+    /// its module may hold the open transaction's state.
+    pub(crate) fn connect_missing(&mut self) -> DbResult<()> {
+        self.connect_declared(ConnectWhich::NotConnected)
     }
 
     /// Connects the virtual tables that could not be connected before, and
@@ -57,14 +70,14 @@ impl crate::ImportedDatabase {
             return Ok(false);
         }
         let before = self.session_state.virtual_tables.len();
-        self.connect_declared(true)?;
+        self.connect_declared(ConnectWhich::Unconnected)?;
         Ok(self.session_state.virtual_tables.len() > before)
     }
 
     /// Connects the virtual tables the catalog declares.
     ///
-    /// @param only_unconnected - true to try only the tables in `unconnected`
-    fn connect_declared(&mut self, only_unconnected: bool) -> DbResult<()> {
+    /// @param which - every table, only those in `unconnected`, or only those with no connection
+    fn connect_declared(&mut self, which: ConnectWhich) -> DbResult<()> {
         let declarations: Vec<Vec<u8>> = self
             .schema
             .entries
@@ -98,13 +111,17 @@ impl crate::ImportedDatabase {
                 continue;
             };
             let name = parsed.ast.text(*name).to_vec();
-            if only_unconnected
-                && self
-                    .session_state
-                    .unconnected
-                    .remove(&name.to_ascii_lowercase())
-                    .is_none()
-            {
+            let folded = name.to_ascii_lowercase();
+            let skip = match which {
+                ConnectWhich::Every => false,
+                ConnectWhich::Unconnected => {
+                    self.session_state.unconnected.remove(&folded).is_none()
+                }
+                ConnectWhich::NotConnected => {
+                    self.session_state.virtual_tables.contains_key(&folded)
+                }
+            };
+            if skip {
                 continue;
             }
             let module = parsed.ast.text(*module).to_vec();
@@ -1172,4 +1189,15 @@ fn module_replaces(
 fn names_virtual(sql: &[u8]) -> bool {
     sql.windows(b"virtual".len())
         .any(|window| window.eq_ignore_ascii_case(b"virtual"))
+}
+
+/// Which declared virtual tables `connect_declared` connects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectWhich {
+    /// Every one, as an open does.
+    Every,
+    /// Only those an earlier attempt could not connect, as a module registered after the open needs.
+    Unconnected,
+    /// Only those this connection holds no connection for, as a rollback that restored a `DROP` needs.
+    NotConnected,
 }

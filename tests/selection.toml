@@ -2897,6 +2897,17 @@ covers = ["inillucent-exec", "inillucent-tree", "inillucent-engine"]
 # plus one. It took rowid 1 when the rightmost leaf held no live row, and
 # failed with a UNIQUE constraint on the rowid (task-2150).
 
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "rollback_restores_modules"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-search"]
+# A rolled back DROP of an FTS5 table or of a table with a vector index gives
+# the connection its module back. The FTS5 table refused every statement, and
+# rows written after the rollback never reached the vector index (task-2264).
+
 # One writer, four readers and a checkpoint under them (task-2036). Nothing in
 # the tree ran a reader *while* a writer was working, and a checkpoint under a
 # reader is the second cause task-1987 had.

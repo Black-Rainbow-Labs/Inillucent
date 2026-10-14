@@ -1324,7 +1324,18 @@ impl Schema {
     /// The child and parent names and the key's own id are carried alongside
     /// the SQL because `PRAGMA foreign_key_check` reports all three and the
     /// query itself only produces a rowid.
-    pub(crate) fn violation_queries(&self, only: Option<&str>) -> DbResult<Vec<ViolationQuery>> {
+    ///
+    /// A key's parent is looked for in the child's own database, and the query
+    /// is qualified with that database's name, which is where SQLite resolves
+    /// `REFERENCES p` for a table in an attached or temporary database.
+    ///
+    /// @param only - the folded name of the one table to check, or none for all
+    /// @param name_of - the name a database is qualified with, by number
+    pub(crate) fn violation_queries(
+        &self,
+        only: Option<&str>,
+        name_of: &dyn Fn(usize) -> Vec<u8>,
+    ) -> DbResult<Vec<ViolationQuery>> {
         let mut queries = Vec::new();
         for child in &self.tables {
             if child.kind != inillucent_sql::catalog_view::TableKind::Table
@@ -1335,17 +1346,19 @@ impl Schema {
             if only.is_some_and(|name| child.folded != name.as_bytes()) {
                 continue;
             }
+            let database_name = name_of(child.database);
             for key in &child.foreign_keys {
-                let Some(parent) = self
-                    .tables
-                    .iter()
-                    .find(|candidate| candidate.folded == key.parent_folded)
-                else {
+                let Some(parent) = self.tables.iter().find(|candidate| {
+                    candidate.folded == key.parent_folded && candidate.database == child.database
+                }) else {
                     continue;
                 };
-                let Some(sql) =
-                    inillucent_sql::foreign_key::violation_query(child, parent, key, b"main")
-                else {
+                let Some(sql) = inillucent_sql::foreign_key::violation_query(
+                    child,
+                    parent,
+                    key,
+                    &database_name,
+                ) else {
                     continue;
                 };
                 queries.push(ViolationQuery {
