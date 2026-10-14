@@ -55,6 +55,13 @@ fn transcript(shell: &Path, sql: &str) -> (String, String) {
 /// Every script whose transcript is compared, with the number of rows SQLite
 /// prints before the error, or `None` when SQLite prints no error.
 fn scripts() -> Vec<(&'static str, String, Option<usize>)> {
+    let mut all = scripts_over_one_select();
+    all.extend(scripts_over_compounds_and_windows());
+    all
+}
+
+/// The scripts whose failure is in the projection or the filter of one `SELECT`.
+fn scripts_over_one_select() -> Vec<(&'static str, String, Option<usize>)> {
     let t = |text: &str| format!("{FILL} {text}");
     vec![
         (
@@ -76,8 +83,10 @@ fn scripts() -> Vec<(&'static str, String, Option<usize>)> {
         ),
         (
             "two columns fail on different rows and the earlier row wins",
-            t("SELECT a, abs(CASE WHEN a=100 THEN -9223372036854775808 ELSE a END), \
-               json(CASE WHEN a=50 THEN 'x' ELSE '1' END) FROM t;"),
+            t(
+                "SELECT a, abs(CASE WHEN a=100 THEN -9223372036854775808 ELSE a END), \
+               json(CASE WHEN a=50 THEN 'x' ELSE '1' END) FROM t;",
+            ),
             Some(49),
         ),
         (
@@ -112,9 +121,36 @@ fn scripts() -> Vec<(&'static str, String, Option<usize>)> {
         ),
         (
             "a view streams",
-            t(&format!("CREATE VIEW v AS SELECT a, {BAD} AS b FROM t; SELECT * FROM v;")),
+            t(&format!(
+                "CREATE VIEW v AS SELECT a, {BAD} AS b FROM t; SELECT * FROM v;"
+            )),
             Some(2999),
         ),
+        (
+            "a constant right operand of AND in a result column is evaluated before the first row",
+            "CREATE TABLE k(a); INSERT INTO k VALUES (0),(1),(NULL);              SELECT a, a AND abs(-9223372036854775808) FROM k;"
+                .to_string(),
+            Some(0),
+        ),
+        (
+            "a constant right operand of AND that is a JSON function",
+            "CREATE TABLE k(a); INSERT INTO k VALUES (0),(1),(NULL);              SELECT a, a AND json('{') FROM k;"
+                .to_string(),
+            Some(0),
+        ),
+        (
+            "a constant right operand in a WHERE clause is evaluated when a row needs it",
+            "CREATE TABLE k(a); INSERT INTO k VALUES (1),(0),(NULL);              SELECT a FROM k WHERE (a = 1) OR abs(-9223372036854775808);"
+                .to_string(),
+            Some(1),
+        ),
+    ]
+}
+
+/// The scripts whose failure is in a compound query, a `DISTINCT`, a window pass or a subquery.
+fn scripts_over_compounds_and_windows() -> Vec<(&'static str, String, Option<usize>)> {
+    let t = |text: &str| format!("{FILL} {text}");
+    vec![
         (
             "a failure in the second arm of a UNION ALL follows every row of the first",
             t(&format!("SELECT a FROM t UNION ALL SELECT {BAD} FROM t;")),

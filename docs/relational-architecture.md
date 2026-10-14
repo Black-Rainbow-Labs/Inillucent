@@ -99,7 +99,9 @@ A `LIMIT` that is satisfied by those rows ends the statement without the error, 
 because the failing row is never reached. A compound query made only of `UNION ALL` arms with no
 `ORDER BY` hands out each arm's rows as it goes. `UNION`, `EXCEPT`, `INTERSECT`, a sort and an
 aggregate build their whole answer first, so no row comes out before the error in those. The rows are
-kept beside the error. `Statement::step` returns them and then the error, `inillucent-shell` prints them
+kept beside the error. A constant right operand of `AND` or `OR` in a result column, such as
+`abs(-9223372036854775808)`, is evaluated before the first row of the result is projected, because SQLite
+evaluates it once up front and fails before it returns anything. `Statement::step` returns them and then the error, `inillucent-shell` prints them
 before the error line, the driver puts them in `Error::partial`, and `inillucent query` and the MCP
 server put them in the failure's `rows` member.
 

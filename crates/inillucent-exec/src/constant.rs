@@ -177,6 +177,71 @@ fn constant_call(expr: &Expr) -> bool {
     }
 }
 
+/// Collects the constant right operands of `AND` and `OR` in an expression.
+///
+/// These are the constants SQLite evaluates before it returns a row, whether or
+/// not the left operand makes the right one unnecessary. A `CASE` branch and a
+/// function's arguments are not looked into, because SQLite evaluates a
+/// constant there only when the branch or the call is reached. An operand that
+/// is a plain literal cannot fail, and one holding a subquery is answered
+/// elsewhere, so neither is collected.
+///
+/// @param expr - the expression to search
+/// @param found - where each operand is added
+pub(crate) fn hoisted_operands(expr: &BoundExpr, found: &mut Vec<BoundExpr>) {
+    match expr {
+        BoundExpr::And(left, right) | BoundExpr::Or(left, right) => {
+            hoisted_operands(left, found);
+            let calls = !right.children().is_empty();
+            if calls
+                && reads_no_row(right)
+                && !inillucent_sql::plan::expression_holds_subquery(right)
+            {
+                found.push((**right).clone());
+            } else {
+                hoisted_operands(right, found);
+            }
+        }
+        BoundExpr::Case { .. } | BoundExpr::Function { .. } => {}
+        other => {
+            for child in other.children() {
+                hoisted_operands(child, found);
+            }
+        }
+    }
+}
+
+/// Wraps a chain so the constant operands of `AND` and `OR` in some terms run first.
+///
+/// Returns the chain unchanged when the terms have none, which is nearly always.
+///
+/// @param chain - the operator the terms are evaluated in
+/// @param terms - the bound expressions that operator evaluates
+/// @param space - the column space the terms are translated against
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param types - the static type of each column the operator reads
+pub(crate) fn hoist_constants<'t>(
+    chain: Box<dyn crate::ops::Sink>,
+    terms: impl IntoIterator<Item = &'t BoundExpr>,
+    space: &Space<'_>,
+    params: &Params,
+    types: &[crate::expr::StaticType],
+) -> DbResult<Box<dyn crate::ops::Sink>> {
+    let mut found = Vec::new();
+    for term in terms {
+        hoisted_operands(term, &mut found);
+    }
+    if found.is_empty() {
+        return Ok(chain);
+    }
+    let mut guards = Vec::with_capacity(found.len());
+    for operand in &found {
+        let translated = translate_scan(operand, space, params)?;
+        guards.push(compile(&translated, types)?);
+    }
+    Ok(Box::new(crate::ops::Hoisted::new(guards, chain)))
+}
+
 /// Reports whether a bound expression can be evaluated without a row.
 ///
 /// `false` for anything that reads the row being scanned or a value that only

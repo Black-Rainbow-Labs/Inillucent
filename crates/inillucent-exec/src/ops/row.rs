@@ -126,6 +126,60 @@ impl Sink for Filter {
         self.downstream.reset()
     }
 }
+/// Evaluates the constant operands of `AND` and `OR` once, before the first row goes on.
+///
+/// **SQLite evaluates a constant once, the first time a row reaches it, and not
+/// once per row.** `SELECT a, a AND abs(-9223372036854775808) FROM t` fails
+/// before it returns any row, even when the first row's `a` is 0 and the `AND`
+/// would not look at its right side. Evaluating the operand per row, with the
+/// short circuit, raised the error on the first row that needed it, and now that
+/// the rows before a failing one are returned, the rows before that one came out
+/// first. The guards are compiled from the operands and run on the first batch
+/// that reaches this operator.
+///
+/// **Only the result columns are guarded.** A `WHERE` term is different in
+/// SQLite: `SELECT a FROM t WHERE (a = 1) OR abs(-9223372036854775808)` returns
+/// the first row when its `a` is 1 and fails on the next, so the constant there
+/// is evaluated when a row first needs it and the filters are left as they are.
+pub struct Hoisted {
+    guards: Vec<Box<dyn Eval>>,
+    ran: bool,
+    downstream: Box<dyn Sink>,
+}
+impl Hoisted {
+    /// Returns an operator that runs guards before its first batch.
+    ///
+    /// @param guards - the compiled constant operands, which read no column
+    /// @param downstream - what to push each batch into afterwards
+    pub fn new(guards: Vec<Box<dyn Eval>>, downstream: Box<dyn Sink>) -> Hoisted {
+        Hoisted {
+            guards,
+            ran: false,
+            downstream,
+        }
+    }
+}
+impl Sink for Hoisted {
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if !self.ran && batch.live() > 0 {
+            self.ran = true;
+            for guard in &self.guards {
+                guard.value(batch, 0)?;
+            }
+        }
+        self.downstream.push(batch)
+    }
+
+    fn finish(&mut self) -> DbResult<()> {
+        self.downstream.finish()
+    }
+
+    /// Returns this operator and everything below it to its pre-input state.
+    fn reset(&mut self) -> DbResult<()> {
+        self.ran = false;
+        self.downstream.reset()
+    }
+}
 /// Evaluates a list of expressions into a new batch.
 pub struct Project {
     expressions: Vec<Box<dyn Eval>>,
