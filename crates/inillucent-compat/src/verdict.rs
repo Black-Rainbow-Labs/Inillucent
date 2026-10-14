@@ -29,18 +29,13 @@
 //! | a summary with no failures | non-zero | [`Undetermined::DiedAfterTestsPassed`] |
 //! | no summary at all | non-zero | [`Undetermined::NoSummary`] |
 //!
-//! ## Its retry, and why only here
+//! ## No retry
 //!
-//! A target the runner could not read is run once more, on its own, at the end of
-//! the pass, and the second answer stands. That is a determination rather than a
-//! rounding: a process that dies at teardown one time in nine passes its retry,
-//! and one that dies every time keeps failing the run and is named as having died
-//! *after* its tests passed - a different sentence from "a test failed", pointing
-//! at a different bug.
-//!
-//! The retry fires only on an absence of information. A target that failed a test
-//! is never re-run, because a runner that re-runs failures until they pass has
-//! stopped being a gate.
+//! A target the runner could not read is not run again. It fails the run and is
+//! named as having died *after* its tests passed - a different sentence from "a
+//! test failed", pointing at a different bug. A process that dies at teardown one
+//! time in nine would pass a retry and stay unfixed, so the runner does not retry
+//! it, and a target that failed a test is not re-run either.
 //!
 //! ## Why not match on the exit code
 //!
@@ -87,9 +82,8 @@ pub enum Undetermined {
     /// Not a failure: nothing was graded, and the tests it had run before it was
     /// stopped are not evidence that the rest would have passed. Not a pass
     /// either, for the same reason. It is the third answer, which is what this
-    /// enum is for - and it is the one reason here that must never be retried,
-    /// because a second attempt costs the same budget again and cannot produce
-    /// information the first one withheld.
+    /// enum is for. A second attempt would cost the same budget again and cannot
+    /// produce information the first one withheld.
     TimedOut,
 }
 

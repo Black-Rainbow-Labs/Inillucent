@@ -112,7 +112,6 @@ mod real {
             .unwrap_or(0);
         let began = Instant::now();
         let report = embed_all(&connection, &plan, &embedders, max_tokens, total);
-        park(&session_key(&plan), embedders);
         Ok(outcome(&plan, &report?, began.elapsed(), loaded))
     }
 
@@ -164,70 +163,6 @@ mod real {
         }
     }
 
-    /// The sessions an earlier call left behind, so a long lived process does not open them again.
-    ///
-    /// **A finished run parks its sessions here and never drops them.** Dropping an ONNX Runtime
-    /// session and then exiting the process ended it with `STATUS_STACK_BUFFER_OVERRUN` in about one
-    /// run in six on this machine, after the command had printed its result and committed every row,
-    /// so a script saw a failure for a run that had worked. A session that is never dropped does not
-    /// do it: 0 failures in 30 runs, against 5 in 30. `embed()` has the same property, because its
-    /// embedder is a static that is never dropped. Parked sessions are reused by the next call with
-    /// the same settings, so the MCP server, which calls this command many times in one process,
-    /// holds one set of sessions and not one per call.
-    static PARKED: std::sync::Mutex<Vec<(String, OnnxEmbedder)>> =
-        std::sync::Mutex::new(Vec::new());
-
-    /// Returns the key two runs share sessions under: the device, the thread count and the batch size.
-    ///
-    /// @param plan - what was asked for
-    fn session_key(plan: &Plan) -> String {
-        format!(
-            "{}|{:?}|{}",
-            plan.device.label(),
-            plan.threads,
-            plan.batch_size
-        )
-    }
-
-    /// Takes every parked session that was opened under a key.
-    ///
-    /// @param key - the settings the sessions were opened with
-    fn take_parked(key: &str) -> Vec<OnnxEmbedder> {
-        let Ok(mut parked) = PARKED.lock() else {
-            return Vec::new();
-        };
-        let (mine, others): (Vec<_>, Vec<_>) = parked.drain(..).partition(|(held, _)| held == key);
-        *parked = others;
-        mine.into_iter().map(|(_, embedder)| embedder).collect()
-    }
-
-    /// Parks sessions for the next call, and forgets them when the lock is not available.
-    ///
-    /// @param key - the settings the sessions were opened with
-    /// @param embedders - the sessions to keep
-    fn park(key: &str, embedders: Vec<OnnxEmbedder>) {
-        // A parked session lives in a static until the process exits, and a
-        // session still loaded when ONNX Runtime's own destructors run aborts
-        // the process on macOS. `exit_hook` drops them first. Registered here,
-        // after a session opened, so the handler runs before those destructors.
-        static EXIT_REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        EXIT_REGISTERED.get_or_init(|| {
-            inillucent_core::exit_hook::register(Box::new(|| {
-                if let Ok(mut parked) = PARKED.try_lock() {
-                    parked.clear();
-                }
-            }));
-        });
-        match PARKED.lock() {
-            Ok(mut parked) => parked.extend(
-                embedders
-                    .into_iter()
-                    .map(|embedder| (key.to_string(), embedder)),
-            ),
-            Err(_) => embedders.into_iter().for_each(std::mem::forget),
-        }
-    }
-
     /// Opens one session per `--sessions` on the device, from the installed model.
     ///
     /// A device that will not start fails here, with the message that names
@@ -245,11 +180,7 @@ mod real {
         let manifest = ModelManifest::read(&dir).unwrap_or_else(|_| ModelManifest::nomic_v1_5());
         let mut options = OnnxOptions::for_model_on(&manifest, plan.batch_size, plan.device);
         options.intra_threads = plan.threads;
-        let key = session_key(plan);
-        let mut opened = take_parked(&key);
-        if opened.len() > plan.sessions {
-            park(&key, opened.split_off(plan.sessions));
-        }
+        let mut opened = Vec::with_capacity(plan.sessions);
         while opened.len() < plan.sessions {
             let embedder = OnnxEmbedder::open_model(&dir, &manifest.model_file, options.clone())
                 .map_err(|reason| Failed::misuse(format!("embed: {reason:#}")))?;

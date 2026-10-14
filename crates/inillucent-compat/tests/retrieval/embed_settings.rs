@@ -18,6 +18,7 @@ use inillucent_compat::cliproc::program;
 /// What one run of the program produced.
 struct Ran {
     ok: bool,
+    code: Option<i32>,
     stdout: String,
     said: String,
 }
@@ -41,6 +42,7 @@ fn ask(binary: &PathBuf, sql: &str, variables: &[(&str, &str)]) -> Ran {
         .unwrap_or_else(|error| panic!("inillucent did not start: {error}"));
     Ran {
         ok: output.status.success(),
+        code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         said: format!(
             "{}{}",
@@ -164,4 +166,66 @@ fn a_thread_count_is_applied_and_the_vector_keeps_its_width() {
     );
     assert!(ran.ok, "{}", ran.said);
     assert_eq!(integer_of(&ran, 0), 3072, "{}", ran.said);
+}
+
+/// A card that is not there ends the process with the refusal's exit code every time, and never
+/// with a crash after the message was printed.
+///
+/// A CUDA execution provider that fails to start still creates ONNX Runtime's environment, and the
+/// `ort` crate released that environment as its last reference while the process exited. That read
+/// freed memory and ended about 30 of 100 runs with `STATUS_ACCESS_VIOLATION` or
+/// `STATUS_STACK_BUFFER_OVERRUN` on Windows, after the refusal had been printed, so a script saw a
+/// crash code and not exit code 1. Twenty runs make the chance of missing a 30 percent crash under
+/// one in a thousand.
+#[test]
+fn a_cuda_device_that_will_not_start_exits_with_the_refusal_code_on_every_run() {
+    let Some(binary) = embedder_or_skip() else {
+        return;
+    };
+    for run in 0..20 {
+        let ran = ask(
+            &binary,
+            "SELECT length(embed('a word'))",
+            &[("INILLUCENT_EMBED_DEVICE", "cuda:99")],
+        );
+        assert_eq!(
+            ran.code,
+            Some(1),
+            "run {run} of 20 ended with {:?} instead of the refusal's exit code 1: {}",
+            ran.code,
+            ran.said
+        );
+        assert!(
+            ran.said.contains("setup-embeddings runtime --gpu"),
+            "run {run}: {}",
+            ran.said
+        );
+    }
+}
+
+/// A process that loaded a model, dropped it and exited ends with exit code 0 on every run.
+///
+/// Dropping an ONNX Runtime session and then exiting ended about one run in six with
+/// `STATUS_STACK_BUFFER_OVERRUN` on Windows. `on-demand` drops the session before the call
+/// returns, which is the drop this checks, and thirty runs make the chance of missing a one in six
+/// crash under one in two hundred.
+#[test]
+fn a_process_that_dropped_its_session_exits_with_code_zero_on_every_run() {
+    let Some(binary) = embedder_or_skip() else {
+        return;
+    };
+    for run in 0..30 {
+        let ran = ask(
+            &binary,
+            "SELECT length(embed('a word'))",
+            &[("INILLUCENT_EMBED_RESIDENCY", "on-demand")],
+        );
+        assert_eq!(
+            ran.code,
+            Some(0),
+            "run {run} of 30 ended with {:?}: {}",
+            ran.code,
+            ran.said
+        );
+    }
 }
