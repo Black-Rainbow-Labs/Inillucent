@@ -128,19 +128,19 @@ fn scripts_over_one_select() -> Vec<(&'static str, String, Option<usize>)> {
         ),
         (
             "a constant right operand of AND in a result column is evaluated before the first row",
-            "CREATE TABLE k(a); INSERT INTO k VALUES (0),(1),(NULL);              SELECT a, a AND abs(-9223372036854775808) FROM k;"
+            "CREATE TABLE k(a); INSERT INTO k VALUES (0),(1),(NULL); SELECT a, a AND abs(-9223372036854775808) FROM k;"
                 .to_string(),
             Some(0),
         ),
         (
             "a constant right operand of AND that is a JSON function",
-            "CREATE TABLE k(a); INSERT INTO k VALUES (0),(1),(NULL);              SELECT a, a AND json('{') FROM k;"
+            "CREATE TABLE k(a); INSERT INTO k VALUES (0),(1),(NULL); SELECT a, a AND json('{') FROM k;"
                 .to_string(),
             Some(0),
         ),
         (
             "a constant right operand in a WHERE clause is evaluated when a row needs it",
-            "CREATE TABLE k(a); INSERT INTO k VALUES (1),(0),(NULL);              SELECT a FROM k WHERE (a = 1) OR abs(-9223372036854775808);"
+            "CREATE TABLE k(a); INSERT INTO k VALUES (1),(0),(NULL); SELECT a FROM k WHERE (a = 1) OR abs(-9223372036854775808);"
                 .to_string(),
             Some(1),
         ),
