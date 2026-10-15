@@ -588,6 +588,23 @@ mod tests {
         assert_eq!(limit.seen, 15);
     }
 
+    /// A skip passes on the stop of the limit below it, so the source stops too.
+    ///
+    /// `Limit` answers from its own count, so a skip that answered the same way
+    /// never stopped a source with no end, such as a recursive query.
+    #[test]
+    fn a_skip_hands_back_the_stop_of_the_limit_below_it() {
+        let values: Vec<Datum<'_>> = (0..100).map(Datum::Int).collect();
+        let mut skip = Skip::new(5, Box::new(Limit::new(3, 0, Box::new(Collect::new()))));
+        let batch = Batch::new(100, vec![Vector::Values(&values)]);
+        assert_eq!(skip.push(&batch).unwrap(), Flow::Stop);
+        let few: Vec<Datum<'_>> = (0..4).map(Datum::Int).collect();
+        let mut skip = Skip::new(5, Box::new(Collect::new()));
+        let small = Batch::new(4, vec![Vector::Values(&few)]);
+        assert_eq!(skip.push(&small).unwrap(), Flow::Continue);
+        assert_eq!(skip.push(&batch).unwrap(), Flow::Continue);
+    }
+
     /// A projection that is a permutation borrows rather than copying, and one
     /// that computes materialises - both producing the same values.
     #[test]

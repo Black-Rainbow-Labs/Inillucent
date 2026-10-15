@@ -388,3 +388,65 @@ impl Sink for Limit {
         self.downstream.reset()
     }
 }
+
+/// Throws away the first `offset` rows and passes every later row on.
+///
+/// **It answers what the operator below it answers.** [`Limit`] answers `Stop`
+/// from its own count and drops whatever its downstream said, which is right for
+/// the last operator in a chain. A `LIMIT` that sits below this operator decides
+/// when the source can stop, and a recursive query with no end of its own relies
+/// on it: an operator here that answered `Continue` for ever made
+/// `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n FROM
+/// r WHERE n%7=0 LIMIT 3 OFFSET 2` run until it ran out of memory.
+pub struct Skip {
+    offset: usize,
+    remaining: usize,
+    downstream: Box<dyn Sink>,
+}
+impl Skip {
+    /// Returns an operator that skips rows.
+    ///
+    /// @param offset - how many rows to throw away first
+    /// @param downstream - what to push the later rows into
+    pub fn new(offset: usize, downstream: Box<dyn Sink>) -> Skip {
+        Skip {
+            offset,
+            remaining: offset,
+            downstream,
+        }
+    }
+}
+impl Sink for Skip {
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if self.remaining == 0 {
+            return self.downstream.push(batch);
+        }
+        let mut selection: Vec<u32> = Vec::new();
+        for nth in 0..batch.live() {
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                continue;
+            }
+            selection.push(batch.row_at(nth) as u32);
+        }
+        if selection.is_empty() {
+            return Ok(Flow::Continue);
+        }
+        let kept = Batch {
+            rows: batch.rows,
+            selection: Some(&selection),
+            columns: batch.columns.clone(),
+        };
+        self.downstream.push(&kept)
+    }
+
+    fn finish(&mut self) -> DbResult<()> {
+        self.downstream.finish()
+    }
+
+    /// Returns this operator and everything below it to its pre-input state.
+    fn reset(&mut self) -> DbResult<()> {
+        self.remaining = self.offset;
+        self.downstream.reset()
+    }
+}

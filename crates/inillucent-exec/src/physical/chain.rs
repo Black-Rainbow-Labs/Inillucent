@@ -25,8 +25,8 @@ use inillucent_value::collation::Collation;
 
 use crate::expr::{compile, Expr, StaticType};
 use crate::ops::{
-    AdjacentDistinct, Distinct, Filter, HashAggregate, Limit, Project, SimpleAggregate, Sink, Sort,
-    SortKey, StreamAggregate, TopN,
+    AdjacentDistinct, Distinct, Filter, HashAggregate, Limit, Project, SimpleAggregate, Sink, Skip,
+    Sort, SortKey, StreamAggregate, TopN,
 };
 use crate::paged::{FullScan, PointProbe, ReverseScan, SkipScan, SpanScan};
 use crate::scan::Projection;
@@ -977,15 +977,16 @@ fn skips_before_projection(up: &Upward<'_>) -> bool {
 
 /// Puts the operator that throws the `OFFSET` rows away below the projection.
 ///
-/// It is the same `Limit` operator with no limit, so the rows it counts are the
-/// ones the `LIMIT` above would have counted. The description gets no line of
-/// its own: [`push_limit`] already prints `OFFSET`.
+/// It counts the rows the `LIMIT` above would have counted, and it hands back
+/// the answer of the operator below it, so a `LIMIT` that has all its rows still
+/// stops the source. The description gets no line of its own: [`push_limit`]
+/// already prints `OFFSET`.
 ///
 /// @param chain - the projection, which it will push into
 /// @param up - everything the operators are built from
 fn push_early_skip(chain: Box<dyn Sink>, up: &Upward<'_>) -> Box<dyn Sink> {
     match skips_before_projection(up) {
-        true => Box::new(Limit::new(usize::MAX, up.offset, chain)),
+        true => Box::new(Skip::new(up.offset, chain)),
         false => chain,
     }
 }
