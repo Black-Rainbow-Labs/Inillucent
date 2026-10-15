@@ -319,6 +319,7 @@ fn every_stability_is_one_of_the_two_that_mean_something() {
         vec![
             "inillucent_bind_json",
             "inillucent_cancel",
+            "inillucent_error_take_rows",
             "inillucent_params_free",
             "inillucent_py_execute",
             "inillucent_py_init",

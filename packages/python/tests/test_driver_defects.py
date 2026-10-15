@@ -561,6 +561,59 @@ def test_two_connections_of_one_database_have_a_transaction_each() -> None:
     database.close()
 
 
+def test_a_failed_query_carries_the_rows_before_the_failure() -> None:
+    """A query that failed on its 4th row raised with no rows, and SQLite hands over 3.
+
+    ``DriverError.partial`` is a ``Rows`` through the C ABI, on the one call path,
+    the JSON path and the accessor path, and a list of dictionaries through the
+    command line helper ``query``. It is ``None`` when the statement failed before
+    its first row.
+    """
+    staged = _need()
+    module, driver = staged["module"], staged["driver"]
+    sql = "SELECT a, CASE WHEN a = 4 THEN json('x') END AS b FROM t"
+    names = ("_PY", "_CALLS", "_PARAMS", "_STMT_EXECUTE", "_CONN_EXECUTE", "_JSON")
+    saved = {name: getattr(driver, name) for name in names}
+    try:
+        for mode in ("fast", "json", "accessors"):
+            if mode != "fast":
+                for name in names[:-1]:
+                    setattr(driver, name, None)
+            if mode == "accessors":
+                driver._JSON = False
+            database, _ = _database("partial" + mode)
+            connection = database.connect()
+            connection.execute("CREATE TABLE t (a)")
+            connection.execute_batch("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3); INSERT INTO t VALUES (4); INSERT INTO t VALUES (5)")
+            try:
+                connection.execute(sql)
+            except module.DriverError as failed:
+                assert failed.partial is not None, mode
+                assert failed.partial.rows == [[1, None], [2, None], [3, None]], (mode, failed.partial.rows)
+                assert failed.partial.total == 3, mode
+                assert failed.partial.columns == ["a", "b"], mode
+            else:
+                raise AssertionError(f"{mode}: row 4 did not fail")
+            try:
+                connection.execute("SELECT json('x') FROM t")
+            except module.DriverError as failed:
+                assert failed.partial is None, mode
+            database.close()
+    finally:
+        for name, value in saved.items():
+            setattr(driver, name, value)
+    database, directory = _database("partialcli")
+    path = str(directory / "probe.rdb")
+    database.connect().execute_batch("CREATE TABLE t (a); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3); INSERT INTO t VALUES (4)")
+    database.close()
+    try:
+        module.query(sql, db=path)
+    except module.DriverError as failed:
+        assert failed.partial == [{"a": 1, "b": None}, {"a": 2, "b": None}, {"a": 3, "b": None}], failed.partial
+    else:
+        raise AssertionError("row 4 did not fail through the command line")
+
+
 def main() -> int:
     """Run every test in this file, for a machine with no pytest."""
     failures = []

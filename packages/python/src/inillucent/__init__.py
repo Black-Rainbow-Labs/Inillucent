@@ -290,6 +290,14 @@ def query(
     result = run("query", db=db, key=key, sql=sql, params=params, limit=limit)
     if not result.get("ok"):
         raise _refusal(result)
+    return _row_dicts(result)
+
+
+def _row_dicts(result: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return a result's rows as dictionaries keyed by column name.
+
+    :param result: a ``--output json`` object that has ``columns`` and ``rows``
+    """
     names = [column["name"] for column in result["columns"]]
     return [
         dict(zip(names, (_decode_value(value) for value in row)))
@@ -339,17 +347,22 @@ def _refusal(result: Mapping[str, Any]) -> DriverError:
     exception with the wrong status is still better than a ``KeyError`` from
     inside the error path.
 
+    A query that failed after producing rows carries them in ``partial``, as
+    dictionaries keyed by column name, as :func:`query` returns rows.
+
     :param result: the ``--output json`` object of a command that failed
     """
     named = str(result.get("status", "internal"))
     status = _STATUS_BY_NAME.get(named, _driver.INTERNAL)
     kind = Unsupported if status == _driver.UNSUPPORTED else DriverError
+    before = _row_dicts(result) if result.get("rows") and result.get("columns") else None
     return kind(
         status,
         str(result.get("message", "the command failed")),
         result.get("feature"),
         result.get("detail"),
         int(result.get("offset", -1)),
+        before,
     )
 
 

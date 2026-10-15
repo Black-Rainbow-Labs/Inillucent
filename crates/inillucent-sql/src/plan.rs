@@ -53,6 +53,7 @@ use terms::{
 };
 mod queue;
 mod seek_union;
+mod subquery_rows;
 pub use queue::RecursiveQueue;
 
 /// A comparison an access path can enforce.
@@ -1500,7 +1501,7 @@ fn order_cost(select: &BoundSelect, terms: &[BoundExpr], order: &[usize], levers
         if level == 0 {
             first_provides = ordering_provided(select, source.id, &source.table, &path).is_some();
         }
-        let (cost, rows) = path_cost(source, &path);
+        let (cost, rows) = subquery_rows::ordered_path_cost(select, source, &path);
         total += outer_rows * cost;
         let kept = rows * residual_share(select, terms, &consumed, &ids, level, source);
         outer_rows *= kept.max(1.0);

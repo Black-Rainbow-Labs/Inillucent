@@ -188,6 +188,31 @@ try {
 holds('a refused query throws Inillucent\\Error', $classified instanceof Error);
 holds('the thrown error is not an unsupported one', $classified !== null && !$classified->isUnsupported());
 
+// --- a failed query carries the rows before the failure ---------------------
+// SQLite returns every row ahead of the one that raised the error and then
+// reports the error. The rows ride on the thrown error, as `query()` returns rows.
+$before = null;
+try {
+    $db->query(
+        'WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM c WHERE a < 5) '
+        . "SELECT a, CASE WHEN a = 4 THEN json('x') END AS b FROM c"
+    );
+} catch (Error $why) {
+    $before = $why->partial;
+}
+same(
+    'the rows before the failure come with it',
+    $before,
+    [['a' => 1, 'b' => null], ['a' => 2, 'b' => null], ['a' => 3, 'b' => null]]
+);
+$early = 'unset';
+try {
+    $db->query("SELECT json('x') AS b FROM people");
+} catch (Error $why) {
+    $early = $why->partial;
+}
+same('a query that fails before its first row carries none', $early, null);
+
 // --- a VECTOR column survives the wrapper ------------------------------------
 // The value goes in as a blob literal of little-endian `f32` bits, which is what
 // a `VECTOR(N)` column is: three floats, twelve bytes. `vector` is one of the

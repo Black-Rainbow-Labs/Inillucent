@@ -25,8 +25,8 @@ use inillucent_value::collation::Collation;
 
 use crate::expr::{compile, Expr, StaticType};
 use crate::ops::{
-    AdjacentDistinct, Distinct, Filter, HashAggregate, Limit, Project, SimpleAggregate, Sink, Sort,
-    SortKey, StreamAggregate, TopN,
+    AdjacentDistinct, Distinct, Filter, HashAggregate, Limit, Project, SimpleAggregate, Sink, Skip,
+    Sort, SortKey, StreamAggregate, TopN,
 };
 use crate::paged::{FullScan, PointProbe, ReverseScan, SkipScan, SpanScan};
 use crate::scan::Projection;
@@ -936,15 +936,69 @@ fn source_limit_of(
 /// @param chain - what it will push into
 /// @param operators - the description, collected sink first
 /// @param limit - how many rows to pass on
-/// @param offset - how many to throw away first
+/// @param offset - how many to throw away first, as the description says it
+/// @param applied - how many this operator throws away itself, which is zero
+///   when [`push_early_skip`] already threw them away below the projection
 fn push_limit(
     chain: Box<dyn Sink>,
     operators: &mut Listing,
     limit: usize,
     offset: usize,
+    applied: usize,
 ) -> Box<dyn Sink> {
     operators.add(|| format!("LIMIT {limit} OFFSET {offset}"));
-    Box::new(Limit::new(limit, offset, chain))
+    Box::new(Limit::new(limit, applied, chain))
+}
+
+/// Whether the `OFFSET` rows can be thrown away before the projection sees them.
+///
+/// **SQLite does not evaluate the select list of a row it skips.** In
+/// `SELECT a, CASE WHEN a = 3 THEN json('x') END FROM t LIMIT 1 OFFSET 5` the
+/// third row is skipped, so `json('x')` never runs and the query answers the
+/// sixth row. The projection used to run ahead of the `LIMIT`, so the skipped
+/// row's expression raised its error and the query failed.
+///
+/// This holds only when the rows leave the source in the order they are
+/// answered in, and when nothing between the projection and the `LIMIT` reads
+/// the projected values to decide which rows survive. A sorter reads the sort
+/// keys the projection computes, `DISTINCT` compares the projected row, an
+/// aggregate or a window function has to see every row, so each of those keeps
+/// the `OFFSET` above the projection.
+///
+/// @param up - everything the operators are built from
+fn skips_before_projection(up: &Upward<'_>) -> bool {
+    up.offset > 0
+        && (up.outputs.sort_keys.is_empty() || up.sorted_already)
+        && !up.plan.select.distinct
+        && !up.skipping
+        && up.plan.aggregation == AggregationMode::None
+        && up.plan.select.windows.is_empty()
+}
+
+/// Puts the operator that throws the `OFFSET` rows away below the projection.
+///
+/// It counts the rows the `LIMIT` above would have counted, and it hands back
+/// the answer of the operator below it, so a `LIMIT` that has all its rows still
+/// stops the source. The description gets no line of its own: [`push_limit`]
+/// already prints `OFFSET`.
+///
+/// @param chain - the projection, which it will push into
+/// @param up - everything the operators are built from
+fn push_early_skip(chain: Box<dyn Sink>, up: &Upward<'_>) -> Box<dyn Sink> {
+    match skips_before_projection(up) {
+        true => Box::new(Skip::new(up.offset, chain)),
+        false => chain,
+    }
+}
+
+/// How many rows the `LIMIT` operator itself throws away.
+///
+/// @param up - everything the operators are built from
+fn limit_offset(up: &Upward<'_>) -> usize {
+    match skips_before_projection(up) {
+        true => 0,
+        false => up.offset,
+    }
 }
 
 /// Puts the projection that drops the carried sort columns on, if there are any.
@@ -1001,10 +1055,12 @@ fn push_sort(
     let sort_keys = &up.outputs.sort_keys;
     if sort_keys.is_empty() || up.sorted_already {
         let chain = match (up.limit, up.offset) {
-            (Some(limit), offset) => push_limit(chain, operators, limit, offset),
+            (Some(limit), offset) => push_limit(chain, operators, limit, offset, limit_offset(up)),
             // A negative `LIMIT` means no limit but an `OFFSET` beside it still
             // skips rows, so `LIMIT -1 OFFSET 3` is a limit that never stops.
-            (None, offset) if offset > 0 => push_limit(chain, operators, usize::MAX, offset),
+            (None, offset) if offset > 0 => {
+                push_limit(chain, operators, usize::MAX, offset, limit_offset(up))
+            }
             (None, _) => chain,
         };
         return push_trim(chain, operators, up);
@@ -1013,7 +1069,7 @@ fn push_sort(
     let Some(limit) = up.limit else {
         let chain = match up.offset {
             0 => chain,
-            offset => push_limit(chain, operators, usize::MAX, offset),
+            offset => push_limit(chain, operators, usize::MAX, offset, offset),
         };
         operators.add(|| "SORT".to_string());
         return Ok(Box::new(
@@ -1022,14 +1078,14 @@ fn push_sort(
     };
     let bounded = limit.saturating_add(up.offset);
     if bounded > TopN::MAX_LIMIT || up.prepared.forced.full_sort {
-        let chain = push_limit(chain, operators, limit, up.offset);
+        let chain = push_limit(chain, operators, limit, up.offset, up.offset);
         operators.add(|| "SORT".to_string());
         return Ok(Box::new(
             Sort::new(sort_keys.clone(), chain).spilling_to(spill_of(up)),
         ));
     }
     let chain = if up.offset > 0 {
-        push_limit(chain, operators, limit, up.offset)
+        push_limit(chain, operators, limit, up.offset, up.offset)
     } else {
         chain
     };
@@ -1395,6 +1451,7 @@ pub(crate) fn build_upper(
     chain = push_sort(chain, &mut operators, &up)?;
     chain = push_distinct(chain, &mut operators, &up);
     chain = push_projection(chain, &mut operators, &up)?;
+    chain = push_early_skip(chain, &up);
     chain = push_having(chain, &mut operators, &up)?;
     chain = push_aggregate(chain, &mut operators, &up)?;
     if plan.reverse_stream {

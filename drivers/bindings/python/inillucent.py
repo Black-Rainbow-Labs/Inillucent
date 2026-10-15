@@ -139,6 +139,11 @@ class DriverError(Exception):
 
     Carries everything the C error carried, because throwing away ``status`` and
     keeping only the message is what forces callers back to matching on prose.
+
+    ``partial`` holds the rows the statement produced before it failed, as a
+    :class:`Rows`, or ``None`` when it failed before its first row. SQLite
+    returns every row ahead of the one that raised the error and then reports
+    the error, and a program that reads rows until a failure needs them.
     """
 
     def __init__(
@@ -148,8 +153,10 @@ class DriverError(Exception):
         feature: Optional[str] = None,
         detail: Optional[str] = None,
         offset: int = -1,
+        partial: "Optional[Rows]" = None,
     ) -> None:
         super().__init__(message)
+        self.partial = partial
         self.status = status
         self.status_name = _STATUS_NAMES.get(status, f"status {status}")
         self.message = message
@@ -359,6 +366,12 @@ def _declare(lib: ctypes.CDLL) -> None:
     lib.inillucent_error_offset.restype = c_int32
     lib.inillucent_error_free.argtypes = [c_void_p]
     lib.inillucent_error_free.restype = None
+    # ABI 1.5.0: the rows a statement produced before it failed. A library older
+    # than that has no such function and the exception then has no rows.
+    taker = getattr(lib, "inillucent_error_take_rows", None)
+    if taker is not None:
+        taker.argtypes = [c_void_p]
+        taker.restype = c_void_p
 
     # ABI 1.3.0: a whole result, or a whole list of parameters, as one JSON
     # text. A library older than that has none of the three, and the binding
@@ -763,10 +776,24 @@ def _raise(error: c_void_p) -> None:
         feature = _text(_LIB.inillucent_error_feature(error))
         detail = _text(_LIB.inillucent_error_detail(error))
         offset = _LIB.inillucent_error_offset(error)
+        partial = _partial_rows(error)
     finally:
         _LIB.inillucent_error_free(error)
     kind = Unsupported if status == UNSUPPORTED else DriverError
-    raise kind(status, message or "", feature, detail, offset)
+    raise kind(status, message or "", feature, detail, offset, partial)
+
+
+def _partial_rows(error: c_void_p) -> "Optional[Rows]":
+    """Take the rows a failed statement produced before it failed.
+
+    Answers ``None`` for a library older than ABI 1.5.0 and for a statement
+    that failed before its first row. ``Rows`` frees the C result it is given.
+    """
+    taker = getattr(_LIB, "inillucent_error_take_rows", None)
+    if taker is None:
+        return None
+    handle = taker(error)
+    return Rows(c_void_p(handle)) if handle else None
 
 
 def _text(pointer: Optional[bytes]) -> Optional[str]:

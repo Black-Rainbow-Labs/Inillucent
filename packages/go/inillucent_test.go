@@ -93,6 +93,29 @@ func TestBindingIsNotInterpolation(t *testing.T) {
 	}
 }
 
+// A query that fails on its 4th row carries the 3 rows before it in Error.Partial.
+func TestAFailedQueryCarriesTheRowsBeforeTheFailure(t *testing.T) {
+	skipWithoutBinary(t)
+	ctx := context.Background()
+	db := inillucent.Open(filepath.Join(t.TempDir(), "probe.rdb"))
+	_, err := db.Query(ctx, "WITH RECURSIVE c(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM c WHERE a < 5) "+
+		"SELECT a, CASE WHEN a = 4 THEN json('x') END AS b FROM c")
+	held, ok := err.(*inillucent.Error)
+	if !ok {
+		t.Fatalf("expected an *inillucent.Error, got %T", err)
+	}
+	if len(held.Partial) != 3 {
+		t.Fatalf("expected the 3 rows before the failure, got %v", held.Partial)
+	}
+	if got := held.Partial[2]["a"]; got != float64(3) {
+		t.Fatalf("the third row should hold a = 3, got %v", got)
+	}
+	_, err = db.Query(ctx, "SELECT json('x') AS b")
+	if held, ok := err.(*inillucent.Error); !ok || held.Partial != nil {
+		t.Fatalf("a query that fails before its first row carries no rows, got %v", err)
+	}
+}
+
 // A missing table is not_found, which is a different thing from a bad statement.
 func TestStatusIsClassified(t *testing.T) {
 	skipWithoutBinary(t)

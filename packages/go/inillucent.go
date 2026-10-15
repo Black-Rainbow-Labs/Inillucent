@@ -201,6 +201,11 @@ type Error struct {
 	Message string
 	Feature string
 	Command string
+	// Partial holds the rows the statement produced before it failed, as Maps
+	// returns rows. SQLite returns every row ahead of the one that raised the
+	// error and then reports the error. Nil when the statement failed before
+	// its first row.
+	Partial []map[string]any
 }
 
 // Error makes this an error, naming the class as well as the message so a log
@@ -309,11 +314,16 @@ func (db *DB) Run(ctx context.Context, command string, arguments Args) (Result, 
 	}
 	result.raw = json.RawMessage(trimmed)
 	if !result.OK {
+		var partial []map[string]any
+		if len(result.Rows) > 0 {
+			partial = result.Maps()
+		}
 		return result, &Error{
 			Status:  result.Status,
 			Message: result.Message,
 			Feature: result.Feature,
 			Command: command,
+			Partial: partial,
 		}
 	}
 	return result, nil

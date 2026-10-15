@@ -10,6 +10,37 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A query that fails partway returns the rows before the failure through the C library and the
+Python, Node, PHP and Go packages.** SQLite hands out every row ahead of the one that raised the
+error and then reports the error, and the Rust driver and the command line already did the same.
+The C library dropped those rows, so a query that failed on its 4th row gave a Python, Node or C
+caller the error and none of the first 3 rows. `inillucent_error_take_rows` (ABI 1.5.0, provisional)
+returns them once as a result the caller frees with `inillucent_rows_free`, and returns `NULL` when
+the statement failed before its first row. The Python `DriverError.partial` is a `Rows` through the
+C library and a list of dictionaries through the command line helper `query`. The Node error has an
+array of row objects as `partial`, the PHP `Error::$partial` is a list of associative arrays, and the
+Go `Error.Partial` is a slice of maps. Each is empty or `null` when no row came before the failure.
+New tests fail each package's call when the rows are missing.
+
+**`LIMIT` with `OFFSET` no longer evaluates the select list of the rows it skips.** In
+`SELECT a, CASE WHEN a = 3 THEN json('x') END FROM t LIMIT 1 OFFSET 5` SQLite skips row 3 without
+running `json('x')` and answers row 6. The engine projected every row ahead of the `LIMIT`, so the
+skipped row raised `malformed JSON`. The `OFFSET` is now applied below the projection when the rows
+reach the `LIMIT` in the order they are answered in: no `ORDER BY` that needs a sort, no `DISTINCT`,
+no aggregate and no window function. Those four keep evaluating every row, as SQLite does. A
+`UNION ALL` with an `OFFSET` still projects the rows it skips.
+
+**A join with a derived table that is known to be small returns its rows in SQLite's order.**
+`SELECT t.a, j.k FROM t, (SELECT 1 k UNION ALL SELECT 2) j` returned `10|1, 10|2, 20|1, 20|2` where
+SQLite returns `10|1, 20|1, 10|2, 20|2`. SQLite sizes a subquery it cannot flatten and makes the
+small one the outer loop. The planner gave every subquery the row count of a table it had not
+analysed, so both orders cost the same and the written order stood. A subquery with no `FROM`
+clause, a `UNION` or `UNION ALL` of such subqueries, and one with a constant `LIMIT` are now sized
+the way SQLite sizes them, which puts them first. A subquery over a table keeps the default size,
+so it stays where it was written, as it does in SQLite. A `CROSS JOIN` still pins the order. Ten
+join statements in the ordering differential suite compare the order with SQLite, and five of them
+failed before this change.
+
 **`DISTINCT`, compound selects and window functions no longer hold every row.** Only `ORDER BY` wrote sorted runs to a temporary file; the others kept every row in memory. Over 3,000,000 rows `row_number() OVER (ORDER BY a)` peaked at 650 MB, a running `sum` with `rank` at 884 MB, `SELECT DISTINCT` at 434 MB, a `UNION` at 893 MB and an `EXCEPT` at 692 MB; they peak at 108 MB, 147 MB, 160 MB, 176 MB and 192 MB now. `DISTINCT`, `UNION`, `INTERSECT` and `EXCEPT` hash while their keys and rows fit in 32 MiB and sort in runs past that, and the answers are the same rows in the same order. Each arm of a compound is pushed into the set operation by its own pipeline instead of being collected first. A window computes one partition at a time and hands its rows on, so it holds the largest partition and not the table. A partition larger than 32 MiB is computed a run of peer groups at a time when every call is `row_number`, `rank`, `dense_rank` or an aggregate over the default frame; a window with another call, such as `ntile`, `lead` or a frame with following rows, still holds one partition whole. A window query with a `LIMIT` stops reading once the limit is met, so an overflow in a row past the limit is no longer reported.
 
 **`INSERT ... SELECT` no longer holds every source row in memory.** The statement still reads all of its source before it writes a row, so no row it writes is read back by its own source. Source rows past 32 MiB are now appended to a temporary file as they arrive and read back in order. Into a table that holds rows or has a `UNIQUE` index, the rows are written one at a time inside the same statement, so a failure on any row puts every earlier row back and names the same constraint as before. Into an empty table the rows are built and checked twice from the file and written a chunk at a time while the indexes sort in runs; a source whose rowids do not increase takes the row by row insert. Copying 3,000,000 rows peaked at 622 MB into a table that held a row and 527 MB into an empty one, and peaks at 167 MB and 142 MB now.

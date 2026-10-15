@@ -755,4 +755,75 @@ mod tests {
         assert_eq!(unsafe { inillucent_close(db, none) }, INILLUCENT_OK);
         let _ = std::fs::remove_file(&file);
     }
+
+    /// A statement that fails on its 4th row hands the first 3 over through the error.
+    ///
+    /// **The rows before a runtime error used to be lost across the ABI.** The Rust
+    /// driver carries them in `Error::partial`, and the C error handle dropped them,
+    /// so a C, Python or Node caller saw only the message. `inillucent_error_take_rows`
+    /// gives them over once, as a result the caller frees. A statement that fails
+    /// before its first row has none, a second take answers null, and an error whose
+    /// rows were never taken frees them with itself.
+    #[test]
+    fn a_failed_statement_hands_over_the_rows_before_the_failure() {
+        let file = std::env::temp_dir().join(format!(
+            "inillucent-capi-partial-{}.rdb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        let path = CString::new(file.display().to_string()).unwrap();
+        let mut db: *mut inillucent_db = std::ptr::null_mut();
+        let mut conn: *mut inillucent_conn = std::ptr::null_mut();
+        let none: *mut *mut inillucent_error = std::ptr::null_mut();
+        unsafe { inillucent_open(path.as_ptr(), INILLUCENT_OPEN_CREATE, &mut db, none) };
+        unsafe { inillucent_connect(db, &mut conn, none) };
+        let setup =
+            CString::new("CREATE TABLE t(a); INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+        assert_eq!(
+            unsafe { inillucent_execute_batch(conn, setup.as_ptr(), none) },
+            INILLUCENT_OK
+        );
+
+        let fails_at_four =
+            CString::new("SELECT a, CASE WHEN a = 4 THEN json('x') END FROM t").unwrap();
+        let mut rows: *mut inillucent_rows = std::ptr::null_mut();
+        let mut error: *mut inillucent_error = std::ptr::null_mut();
+        let status = unsafe {
+            inillucent_execute(
+                conn,
+                fails_at_four.as_ptr(),
+                u64::MAX,
+                &mut rows,
+                &mut error,
+            )
+        };
+        assert_ne!(status, INILLUCENT_OK);
+        assert!(rows.is_null());
+        let partial = unsafe { inillucent_error_take_rows(error) };
+        assert!(
+            !partial.is_null(),
+            "the 3 rows before the failure come with it"
+        );
+        assert_eq!(unsafe { inillucent_rows_count(partial) }, 3);
+        assert_eq!(unsafe { inillucent_rows_total(partial) }, 3);
+        assert_eq!(unsafe { inillucent_rows_column_count(partial) }, 2);
+        assert_eq!(unsafe { inillucent_value_int(partial, 2, 0) }, 3);
+        assert!(unsafe { inillucent_error_take_rows(error) }.is_null());
+        unsafe { inillucent_rows_free(partial) };
+        unsafe { inillucent_error_free(error) };
+
+        let fails_at_one = CString::new("SELECT json('x') FROM t").unwrap();
+        let mut error: *mut inillucent_error = std::ptr::null_mut();
+        let status = unsafe {
+            inillucent_execute(conn, fails_at_one.as_ptr(), u64::MAX, &mut rows, &mut error)
+        };
+        assert_ne!(status, INILLUCENT_OK);
+        assert!(unsafe { inillucent_error_take_rows(error) }.is_null());
+        unsafe { inillucent_error_free(error) };
+        assert!(unsafe { inillucent_error_take_rows(std::ptr::null_mut()) }.is_null());
+
+        unsafe { inillucent_conn_free(conn) };
+        assert_eq!(unsafe { inillucent_close(db, none) }, INILLUCENT_OK);
+        let _ = std::fs::remove_file(&file);
+    }
 }

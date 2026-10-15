@@ -54,6 +54,8 @@ const SCHEMA: &[&str] = &[
     "INSERT INTO side VALUES (2, 2, 'q')",
     "INSERT INTO side VALUES (3, 2, 'r')",
     "INSERT INTO side VALUES (4, 9, 's')",
+    "CREATE TABLE plain (a INTEGER)",
+    "INSERT INTO plain VALUES (10), (20), (30)",
 ];
 
 /// The statements. Every one of them names an order, so every one is compared
@@ -126,6 +128,23 @@ const STATEMENTS: &[&str] = &[
     "SELECT DISTINCT name FROM t ORDER BY name",
     "SELECT name, count(*) FROM t GROUP BY name ORDER BY name",
     "SELECT name COLLATE NOCASE, count(*) FROM t GROUP BY name COLLATE NOCASE",
+    // No `ORDER BY` here, so these grade the order SQLite visits a join in. A
+    // derived table that cannot be flattened and is known to be small is the
+    // outer loop, as it is in SQLite, and one that is not known to be small
+    // stays where it was written.
+    "SELECT plain.a, j.k FROM plain, (SELECT 1 k UNION ALL SELECT 2) j",
+    "SELECT plain.a, j.k FROM (SELECT 1 k UNION ALL SELECT 2) j, plain",
+    "SELECT plain.a, j.k FROM plain, (SELECT 1 k UNION SELECT 2) j",
+    "SELECT plain.a, j.k FROM plain, (SELECT 1 k UNION ALL SELECT 2 UNION ALL SELECT 3) j",
+    "SELECT plain.a, j.k FROM plain, (SELECT a k FROM plain LIMIT 2) j",
+    "SELECT plain.a, j.k, other.a FROM plain, (SELECT 1 k UNION ALL SELECT 2) j, plain other",
+    "SELECT plain.a, j.k FROM plain, (SELECT a k FROM plain WHERE a > 10 UNION ALL SELECT 2) j",
+    "SELECT plain.a, j.k FROM plain CROSS JOIN (SELECT 1 k UNION ALL SELECT 2) j",
+    "SELECT plain.a, j.k FROM plain, (SELECT 1 k) j",
+    // A recursive term stays the outer loop. Sizing the subquery as one row put
+    // it first, and the recursion, which only the `LIMIT` ends, never stopped.
+    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n, n*2 FROM r, (SELECT 1) WHERE n > 3 LIMIT 2",
+    "SELECT t.id, j.k FROM t, (SELECT 1 k UNION ALL SELECT 2) j",
     // Shapes where the order is not the walk's, and the sort has to stay.
     "SELECT k, id FROM t ORDER BY note",
     "SELECT k, id FROM t ORDER BY k + 1",

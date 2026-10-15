@@ -205,8 +205,16 @@ A query that fails on one row still returns `Err`, and `Error::partial` holds th
 the failure. SQLite returns every row ahead of the failing one and then reports the error, and a program
 that reads rows until a failure and reports how far it got needs those rows. `partial` is a `Rows` cut to
 the same `limit` as a success. It is `None` when the failure came before the first row and for a
-statement that is not a query, so a caller that ignores the field behaves as before. The C library does
-not carry the rows yet: an `inillucent_error` has the status, the message and the offset.
+statement that is not a query, so a caller that ignores the field behaves as before.
+
+The C library carries the same rows. `inillucent_error_take_rows(error)` returns them once as an
+`inillucent_rows` the caller frees with `inillucent_rows_free`, and returns `NULL` when the statement
+failed before its first row, when the rows were already taken, and for a `NULL` handle. Call it before
+`inillucent_error_free`, which frees rows nobody took. Each binding puts them on its error as `partial`:
+the Python `DriverError.partial` is a `Rows` through the C library and a list of dictionaries through
+the command line helper `query`, the Node error carries an array of row objects, the PHP `Error::$partial`
+is a list of associative arrays, and the Go `Error.Partial` is a slice of maps. Each is empty or `null`
+when the statement failed before its first row.
 
 `Database::open` uses these defaults from `OpenOptions`:
 
@@ -324,6 +332,8 @@ Every binding follows the same six steps.
    not `INILLUCENT_OK`, build your exception from `inillucent_error_status`,
    `inillucent_error_message`, `inillucent_error_feature` and `inillucent_error_offset`. Then call
    `inillucent_error_free` in a `finally` block, so building the exception cannot leak the error.
+   Before the free, call `inillucent_error_take_rows` and keep the result as the exception's `partial`
+   rows. It is not `NULL` when the statement produced rows before it failed.
 4. **Map `INILLUCENT_UNSUPPORTED` to its own exception type.** The Python binding calls it
    `Unsupported`.
 5. **Copy every `const char *` into your own string.** The pointer points inside a handle, and the
@@ -495,7 +505,7 @@ another process can write, and the next statement sees the write.
 
 ## ABI stability
 
-`abi.toml` gives each of the 65 symbols in the header a stability and a `since` version.
+`abi.toml` gives each of the 70 symbols in the header a stability and a `since` version.
 `inillucent-driver-capi/tests/abi.rs` checks that the header, `abi.toml` and the Rust code name the
 same symbols. It also checks that every numeric constant in the header equals the driver's own enum
 value. A status renumbered in Rust without the header changing would make every binding read every
@@ -504,7 +514,7 @@ error wrongly, and both sides would still compile.
 | Stability | Promise |
 |---|---|
 | stable | The signature will not change, and the symbol will not be removed. |
-| provisional | The symbol exists and may change in a minor version. Fifteen symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free`, `inillucent_py_init_threads`, `inillucent_py_stmt_execute`, `inillucent_py_execute` and `napi_register_module_v1` under "Python objects and the Node addon". `inillucent_release_models` drops the loaded embedder and reranker sessions, and is described under "Releasing the embedding model before exit". |
+| provisional | The symbol exists and may change in a minor version. Sixteen symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free`, `inillucent_py_init_threads`, `inillucent_py_stmt_execute`, `inillucent_py_execute` and `napi_register_module_v1` under "Python objects and the Node addon". `inillucent_release_models` drops the loaded embedder and reranker sessions, and is described under "Releasing the embedding model before exit". `inillucent_error_take_rows` hands over the rows a statement produced before it failed, as described under the driver's `Error::partial`. |
 
 The ABI version is 1.5.0, and `inillucent_abi_version()` returns 1005000. Version 1.1.0 added
 `inillucent_open_with_key`, version 1.2.0 added `inillucent_open_with_timeout`, version 1.3.0
@@ -512,7 +522,7 @@ added `inillucent_rows_json`, `inillucent_bind_json`, `inillucent_stmt_execute_m
 `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`,
 `inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1`, and
 version 1.4.0 added `inillucent_py_init_threads`, `inillucent_py_stmt_execute` and
-`inillucent_py_execute`, and version 1.5.0 added `inillucent_release_models`. A binding written against 1.0.0 finds every symbol it calls.
+`inillucent_py_execute`, and version 1.5.0 added `inillucent_release_models` and `inillucent_error_take_rows`. A binding written against 1.0.0 finds every symbol it calls.
 
 ## Releasing the embedding model before exit
 

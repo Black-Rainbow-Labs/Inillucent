@@ -458,12 +458,39 @@ function rowsOf(result) {
     const error = new Error(result.message);
     error.status = result.status;
     error.feature = result.feature;
+    error.partial = partialRowsOf(result);
     throw error;
   }
+  return objectsOf(result);
+}
+
+/**
+ * Turns a result object's rows into objects keyed by column name.
+ *
+ * @param result - an `inillucent('query', ...)` result, or a failure that carries rows
+ */
+function objectsOf(result) {
   const names = result.columns.map((column) => column.name);
   return result.rows.map((row) =>
     Object.fromEntries(names.map((name, at) => [name, decodeValue(row[at])])),
   );
+}
+
+/**
+ * Returns the rows a failed query produced before it failed, as objects keyed
+ * by column name, or `null` when it failed before its first row.
+ *
+ * SQLite returns every row ahead of the one that raised the error and then
+ * reports the error. The program's JSON and the addon both carry those rows on
+ * the failure, and a program that reads rows until a failure needs them.
+ *
+ * @param failure - a result object with `ok: false`
+ */
+function partialRowsOf(failure) {
+  if (!Array.isArray(failure.rows) || failure.rows.length === 0) {
+    return null;
+  }
+  return objectsOf(failure);
 }
 
 /**
@@ -832,12 +859,12 @@ function nativeAddon() {
  */
 function nativeCall(native, conn, command, options) {
   const started = performance.now();
+  const limit = options.limit === undefined || options.limit === null ? 200 : Number(options.limit);
   try {
     // The fifth argument makes the addon refuse a statement that is not a read,
     // with status `readonly`, as the `inillucent query` program does. Without it
     // `ATTACH ?1 AS o` reached the engine and came back `unsupported`.
     const result = native.query(conn, String(options.sql), options.params, true, command === 'query');
-    const limit = options.limit === undefined || options.limit === null ? 200 : Number(options.limit);
     const kept = command === 'query' && limit > 0 ? result.rows.slice(0, limit) : result.rows;
     return {
       ok: true,
@@ -852,7 +879,7 @@ function nativeCall(native, conn, command, options) {
       elapsed_ms: performance.now() - started,
     };
   } catch (why) {
-    return failureOf(command, why);
+    return failureOf(command, why, limit);
   }
 }
 
@@ -861,14 +888,26 @@ function nativeCall(native, conn, command, options) {
  *
  * `feature` is there when the engine named the construct it has not built, as
  * it is in the program's JSON, so `error.feature` is the same on every route.
+ * The rows the statement produced before it failed are there as `columns`,
+ * `rows`, `row_count`, `total` and `more`, as they are in the program's JSON.
  *
  * @param command - the verb
  * @param why - what the addon threw: `code` is the status name
+ * @param limit - how many of the rows before the failure to keep, 0 or less for all
  */
-function failureOf(command, why) {
+function failureOf(command, why, limit = 0) {
   const failure = { ok: false, command, status: why.code ?? 'internal', message: why.message };
   if (typeof why.feature === 'string') {
     failure.feature = why.feature;
+  }
+  const before = why.partial;
+  if (before && Array.isArray(before.rows) && before.rows.length > 0) {
+    const kept = limit > 0 ? before.rows.slice(0, limit) : before.rows;
+    failure.columns = before.columns.map((name) => ({ name, type: '' }));
+    failure.rows = kept;
+    failure.row_count = kept.length;
+    failure.total = before.total;
+    failure.more = kept.length < before.rows.length;
   }
   return failure;
 }
@@ -1101,6 +1140,7 @@ export class NativeSession {
       const error = new Error(why.message);
       error.status = why.code ?? 'internal';
       error.feature = why.feature;
+      error.partial = why.partial?.rows?.length > 0 ? why.partial.rows : null;
       throw error;
     }
     const limit = options.limit === undefined || options.limit === null ? 200 : Number(options.limit);
