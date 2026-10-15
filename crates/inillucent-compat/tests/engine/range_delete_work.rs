@@ -151,7 +151,11 @@ fn copied_table(vfs: &Arc<SimVfs>, exclusive: bool) -> ImportedDatabase {
     );
     run(
         &mut engine,
-        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000)          INSERT INTO copied SELECT i, (i * 2654435761) % 100000,          'row ' || i || ' lorem ipsum dolor sit amet consectetur' FROM c",
+        concat!(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000) ",
+            "INSERT INTO copied SELECT i, (i * 2654435761) % 100000, ",
+            "'row ' || i || ' lorem ipsum dolor sit amet consectetur' FROM c",
+        ),
     );
     engine.checkpoint().expect("the fixture's checkpoint");
     engine
@@ -211,15 +215,23 @@ fn a_range_delete_after_the_gates_copy_rounds_costs_the_same_each_round() {
     database
         .session()
         .execute_batch(
-            "CREATE TABLE main_table(id INTEGER PRIMARY KEY, key INTEGER NOT NULL, category INTEGER NOT NULL, label TEXT NOT NULL, payload BLOB);              CREATE INDEX main_key ON main_table(key);              CREATE INDEX main_category ON main_table(category, key);              WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000)              INSERT INTO main_table SELECT i, (i * 2654435761) % 100000, i % 64,              'row ' || i || ' lorem ipsum dolor sit amet consectetur', zeroblob(48) FROM c",
+            concat!(
+                "CREATE TABLE main_table(id INTEGER PRIMARY KEY, key INTEGER NOT NULL, category INTEGER NOT NULL, label TEXT NOT NULL, payload BLOB); ",
+                "CREATE INDEX main_key ON main_table(key); ",
+                "CREATE INDEX main_category ON main_table(category, key); ",
+                "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000) ",
+                "INSERT INTO main_table SELECT i, (i * 2654435761) % 100000, i % 64, ",
+                "'row ' || i || ' lorem ipsum dolor sit amet consectetur', zeroblob(48) FROM c",
+            ),
         )
         .expect("the source table is built");
     for round in 0..4 {
         database
             .session()
-            .execute_batch(
-                "DROP TABLE IF EXISTS copied;                  CREATE TABLE copied(id INTEGER PRIMARY KEY, key INTEGER, label TEXT)",
-            )
+            .execute_batch(concat!(
+                "DROP TABLE IF EXISTS copied; ",
+                "CREATE TABLE copied(id INTEGER PRIMARY KEY, key INTEGER, label TEXT)",
+            ))
             .expect("the copy table is made");
         database
             .session()
@@ -239,9 +251,13 @@ fn a_range_delete_after_the_gates_copy_rounds_costs_the_same_each_round() {
         let records = log.records - log_before.records;
         let bytes = log.bytes - log_before.bytes;
         println!(
-            "round {round}: fetches {fetches} reads {} writes {} log records {records}              log bytes {bytes} log syncs {}",
+            "round {}: fetches {} reads {} writes {} log records {} log bytes {} log syncs {}",
+            round,
+            fetches,
             cache.reads - cache_before.reads,
             cache.writes - cache_before.writes,
+            records,
+            bytes,
             log.syncs - log_before.syncs
         );
         // The table has 81 leaves in the range. A record for each of 40,000 rows would be over
