@@ -637,7 +637,7 @@ impl ImportedDatabase {
     /// @param params - the values the statement's parameters are bound to
     fn vacuum_target(&mut self, expression: &str, params: &Params) -> DbResult<Vec<u8>> {
         let rows = self
-            .execute_any(&format!("SELECT ({expression})"), params)?
+            .execute_any_unstreamed(&format!("SELECT ({expression})"), params)?
             .rows;
         match rows.first().and_then(|row| row.first()) {
             Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes.clone()),
@@ -656,7 +656,7 @@ impl ImportedDatabase {
     /// @param params - the values the statement's parameters are bound to
     fn file_name_of(&mut self, expression: &str, params: &Params) -> DbResult<Vec<u8>> {
         let rows = self
-            .execute_any(&format!("SELECT CAST(({expression}) AS TEXT)"), params)?
+            .execute_any_unstreamed(&format!("SELECT CAST(({expression}) AS TEXT)"), params)?
             .rows;
         match rows.first().and_then(|row| row.first()) {
             Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes.clone()),

@@ -5,7 +5,7 @@
 # `inillucent-compat::obligations::the_registers_match_the_engine` fails if
 # this file and the engine disagree.
 
-count = 69
+count = 70
 profile = "default"
 
 [[symbol]]
@@ -95,6 +95,10 @@ signature = "inillucent_error_offset(error: *const inillucent_error) -> i32"
 [[symbol]]
 name = "inillucent_error_status"
 signature = "inillucent_error_status(error: *const inillucent_error) -> i32"
+
+[[symbol]]
+name = "inillucent_error_take_rows"
+signature = "inillucent_error_take_rows( error: *mut inillucent_error, ) -> *mut crate::capi::value::inillucent_rows"
 
 [[symbol]]
 name = "inillucent_execute"
