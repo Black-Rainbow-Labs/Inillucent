@@ -233,7 +233,7 @@ fn produce(
             let (failure, before) = *failed;
             return Err(failed_after_rows(
                 context, command, &failure, before, limit, elapsed,
-            ))
+            ));
         }
     };
     let (names, rows, total) = (held.columns, held.rows, held.total);
