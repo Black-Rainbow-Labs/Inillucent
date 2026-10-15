@@ -238,4 +238,4 @@ windows-sys = { version = "0.59", features = [
 # compile with the `embed` feature. Move this pin only together with
 # `embed_onnx.rs`, after building against the new candidate.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "load-dynamic", "cuda"] }
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
