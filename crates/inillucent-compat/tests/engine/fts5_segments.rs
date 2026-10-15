@@ -277,7 +277,7 @@ fn run(seed: u64, statements: usize, chunk: usize) {
                 done += 1;
             }
         }
-        if done % 7 == 0 {
+        if done.is_multiple_of(7) {
             check(&connection, &model, &format!("seed {seed}, after {done}"));
         }
         if random.below(60) == 0 {
@@ -426,7 +426,7 @@ fn an_index_from_before_segments_is_read_and_extended() {
                 WORDS[(rowid % 10) as usize],
                 WORDS[((rowid * 3) % 10) as usize]
             ),
-            format!("{}", WORDS[((rowid * 7) % 10) as usize]),
+            WORDS[((rowid * 7) % 10) as usize].to_string(),
         );
         connection
             .execute(&format!(

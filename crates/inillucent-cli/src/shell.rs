@@ -1609,23 +1609,24 @@ impl Shell {
     /// it is counted as the rows go by, which is what a caller that shows `(200 of 3000000
     /// rows)` needs and what `collect_bound` gave by holding every row to count them.
     ///
-    /// @param sql - the statement
-    /// @param bound - the values for `?1`, `?2`, ... in order
     /// **A statement that fails part of the way through hands back the rows before the failure**
     /// beside it, as SQLite returns them before it reports the error, and `total` is then the
-    /// number of rows before the failure.
+    /// number of rows before the failure. The pair is boxed because a `Failure` is large, and
+    /// every successful call would otherwise carry its size.
     ///
+    /// @param sql - the statement
+    /// @param bound - the values for `?1`, `?2`, ... in order
     /// @param keep - how many rows to keep
     pub fn collect_limited(
         &self,
         sql: &str,
         bound: &[OwnedDatum],
         keep: usize,
-    ) -> Result<Limited, (Failure, Option<Limited>)> {
+    ) -> Result<Limited, Box<(Failure, Option<Limited>)>> {
         let connection = self.connection();
         let mut statement = self
             .prepare_bound(&connection, sql, bound)
-            .map_err(|failure| (failure, None))?;
+            .map_err(|failure| Box::new((failure, None)))?;
         let limiter = std::rc::Rc::new(std::cell::RefCell::new(stream::Limiter::new(keep)));
         let ended = match statement.stream(&limiter) {
             Ok(ended) => ended,
@@ -1643,7 +1644,7 @@ impl Shell {
                     error: Some(error),
                     partial: None,
                 };
-                return Err((failure, before));
+                return Err(Box::new((failure, before)));
             }
         };
         let rows = std::mem::take(&mut limiter.borrow_mut().rows);

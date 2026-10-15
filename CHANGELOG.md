@@ -90,7 +90,7 @@ or `STATUS_STACK_BUFFER_OVERRUN`, and a process that dropped a session ended the
 run in six. The `ort` crate released ONNX Runtime's environment while the process was exiting, after
 other libraries had started to unload, and the release read freed memory. The engine now holds one
 reference to the environment from the moment it first builds a session, on every operating system,
-so that release is never the last one. `inillucent embed` no longer keeps finished sessions in a
+so that release is never the last one. A few runs in a thousand still crashed when many programs ran at once, because `ExitProcess` ends the CUDA and ONNX Runtime threads in the middle of a heap operation and an unrelated library then freed into that heap. On Windows the `inillucent` program now flushes its output and ends the process with the exit code it chose, without running library detach code, once ONNX Runtime was loaded. `inillucent embed` no longer keeps finished sessions in a
 static to avoid the drop. The idle reaper leaves a session alone once the process has started to
 exit. A new C call, `inillucent_release_models` (ABI 1.5.0), drops the loaded embedder and reranker
 sessions, and the Node and Python packages call it when the process exits. The macOS abort in Node

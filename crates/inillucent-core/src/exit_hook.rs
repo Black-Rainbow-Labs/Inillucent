@@ -107,6 +107,15 @@ pub fn keep_environment() {
     }
 }
 
+/// Whether this process created ONNX Runtime's environment, which means the library was loaded.
+///
+/// A program that must end without running library detach code asks this first. It is true
+/// after a session opened and after a session failed to open, because both create the
+/// environment.
+pub fn environment_was_created() -> bool {
+    KEPT_ENVIRONMENT.get().is_some()
+}
+
 /// Whether the process has started to exit.
 ///
 /// The idle reaper checks it so it never drops a session while the exit handler is dropping them.
