@@ -84,7 +84,7 @@ $ python drivers/bindings/python/run_conformance.py
 57 capabilities reported
 ```
 
-The 57 rows are 42 `yes`, 2 `partial` and 13 `no`. The two `partial` rows are:
+The 57 rows are 43 `yes`, 2 `partial` and 12 `no`. The two `partial` rows are:
 
 | Capability | Why it is `partial` |
 |---|---|
