@@ -2430,7 +2430,7 @@ impl Statement<'_> {
         DbResult<(std::rc::Rc<Vec<String>>, usize)>,
         Box<dyn RowConsumer>,
     ) {
-        let mut held = match self.database.ready() {
+        let mut held = match self.lane.ready() {
             Ok(held) => held,
             Err(error) => return (Err(error), consumer),
         };
