@@ -636,11 +636,8 @@ impl ImportedDatabase {
     /// @param expression - the expression as it was written
     /// @param params - the values the statement's parameters are bound to
     fn vacuum_target(&mut self, expression: &str, params: &Params) -> DbResult<Vec<u8>> {
-        let rows = self
-            .execute_any(&format!("SELECT ({expression})"), params)?
-            .rows;
-        match rows.first().and_then(|row| row.first()) {
-            Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes.clone()),
+        match self.file_name_value(&format!("SELECT ({expression})"), params)? {
+            Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes),
             _ => Err(statement_refusal("non-text filename")),
         }
     }
@@ -655,13 +652,33 @@ impl ImportedDatabase {
     /// @param expression - the expression as it was written
     /// @param params - the values the statement's parameters are bound to
     fn file_name_of(&mut self, expression: &str, params: &Params) -> DbResult<Vec<u8>> {
-        let rows = self
-            .execute_any(&format!("SELECT CAST(({expression}) AS TEXT)"), params)?
-            .rows;
-        match rows.first().and_then(|row| row.first()) {
-            Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes.clone()),
+        match self.file_name_value(&format!("SELECT CAST(({expression}) AS TEXT)"), params)? {
+            Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes),
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Runs the `SELECT` that computes a file name and returns its one value.
+    ///
+    /// **It runs on a copy of the bound values.** When the outer statement is streamed, the
+    /// caller's row consumer rides on its `Params`, and a `SELECT` run with those `Params` hands
+    /// its row to that consumer: the file name was printed as a result row and the directive saw
+    /// no row, so `ATTACH` opened a private temporary database in place of the named file and
+    /// `VACUUM INTO` failed. A copy made from the values alone carries no consumer.
+    ///
+    /// @param select - the `SELECT` that computes the file name
+    /// @param params - the values the outer statement's parameters are bound to
+    fn file_name_value(
+        &mut self,
+        select: &str,
+        params: &Params,
+    ) -> DbResult<Option<inillucent_tree::datum::OwnedDatum>> {
+        let values = Params::from_values(params.values());
+        let rows = self.execute_any(select, &values)?.rows;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next()))
     }
 }
 
