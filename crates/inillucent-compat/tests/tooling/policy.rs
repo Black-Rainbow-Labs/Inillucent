@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 25] = [
+const UNSAFE_ALLOWED: [&str; 26] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -155,6 +155,13 @@ const UNSAFE_ALLOWED: [&str; 25] = [
     // get one. One call, `GetCurrentThreadStackLimits`, which writes two
     // integers on the caller's frame and keeps nothing.
     "crates/inillucent-cli/src/stack.rs",
+    // **Ending the `inillucent` program without library detach code on Windows.** A
+    // process that had loaded ONNX Runtime ended with `STATUS_ACCESS_VIOLATION` about
+    // once in 300 runs, because `ExitProcess` ends the CUDA and ONNX Runtime threads
+    // before the detach code of the loaded libraries frees into a heap those threads
+    // left damaged. One call, `TerminateProcess` on the current process, after the
+    // output is flushed. It carries a SAFETY note and runs only in that case.
+    "crates/inillucent-cli/src/process_end.rs",
     // The allocator's own concurrency suite, added in task-1932 (H9). It
     // allocates on one thread and frees on another through `GlobalAlloc`, which
     // is an unsafe trait - the boundary is what the suite exists to cross, and

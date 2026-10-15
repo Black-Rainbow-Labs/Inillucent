@@ -78,7 +78,7 @@ struct Invocation {
 fn main() -> ExitCode {
     // Every statement this program runs is on a stack this crate sized - see
     // `inillucent_cli::STATEMENT_STACK`.
-    inillucent_cli::on_a_sized_stack(run)
+    inillucent_cli::process_end::finish(inillucent_cli::on_a_sized_stack(run))
 }
 
 /// Everything `main` does, on the sized thread.
