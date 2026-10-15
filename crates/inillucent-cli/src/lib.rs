@@ -137,6 +137,9 @@ pub mod keys;
 pub mod mcp;
 pub mod modes;
 pub mod opening;
+// The third file allowed `unsafe`; see its module comment and `policy.rs`.
+#[allow(unsafe_code)]
+pub mod process_end;
 pub mod raw;
 pub mod redirecting;
 pub mod render;
