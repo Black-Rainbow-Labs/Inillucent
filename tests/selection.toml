@@ -4026,3 +4026,19 @@ name = "engine"
 module = "vacuum_attached_database"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "range_delete_work"
+tier = "engine"
+covers = ["inillucent-pool", "inillucent-wal", "inillucent-tree", "inillucent-txn", "inillucent-exec", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "derived_table_lookup_work"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-engine", "inillucent-sql"]

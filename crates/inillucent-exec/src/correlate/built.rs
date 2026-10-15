@@ -89,8 +89,7 @@ pub(super) fn decide(
     let scans_a_table = stage.kind == AccessKind::Full
         && stage.functions.is_empty()
         && !stage.is_lookup
-        && matches!(term.path, AccessPath::TableScan { .. })
-        && term.table.kind == TableKind::Table
+        && reads_one_set_of_rows(term)
         && plan.sources.len() == 1
         && plan.compounds.is_empty();
     let Some(residual) = plan.residuals.first().and_then(Option::as_ref) else {
@@ -120,6 +119,43 @@ pub(super) fn decide(
         filter,
         existence_only,
     }))
+}
+
+/// Reports whether a block's one FROM term gives the same rows for every outer row, so
+/// they can be read once and keyed.
+///
+/// **A table scan, or a derived table or view that reads nothing from the outer row.**
+/// A grouped view looked up once per outer row on a column it does not group by was
+/// rescanned for every outer row, because only a table scan was keyed. `EXPLAIN` already
+/// named an automatic index for it. A derived table whose body names an outer value as a
+/// parameter changes with the outer row, so it is not keyed.
+///
+/// @param term - the block's one FROM term
+fn reads_one_set_of_rows(term: &inillucent_sql::plan::PlannedSource) -> bool {
+    match &term.path {
+        AccessPath::TableScan { .. } => term.table.kind == TableKind::Table,
+        AccessPath::Subquery {
+            plan, correlated, ..
+        } => !*correlated && !holds_outer_parameter(&plan.select),
+        _ => false,
+    }
+}
+
+/// Reports whether a query reads a parameter the engine made from an outer reference.
+///
+/// @param select - the query, searched through its derived tables, arms and subqueries
+fn holds_outer_parameter(select: &inillucent_sql::bind::BoundSelect) -> bool {
+    let mut found = false;
+    let mut copy = select.clone();
+    inillucent_sql::rewrite::rewrite_select(&mut copy, &mut |expr: &mut BoundExpr| {
+        if let BoundExpr::Parameter(number) = expr {
+            found |= *number >= crate::physical::ENGINE_PARAMETER_BASE;
+        }
+        if let Some(inner) = expr.block_mut() {
+            found |= holds_outer_parameter(inner);
+        }
+    });
+    found
 }
 
 /// Sorts the conjuncts of a residual into keys, filter and the rest.

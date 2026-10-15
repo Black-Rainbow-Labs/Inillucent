@@ -903,6 +903,44 @@ mod tests {
         }
     }
 
+    /// Searching a leaf of integer keys never reads a key column's class array, and
+    /// searching one with a key stored out of line does.
+    ///
+    /// **The count of those reads is the work the check on the first line of a
+    /// comparison is there to avoid.** An indexed insert makes about fifteen
+    /// comparisons, and reading the class array for each was part of what made
+    /// `write.insert.batch` slower once keys could be stored out of line. The second leaf
+    /// proves the counter moves, so the first count of zero is not a counter that never counts.
+    #[test]
+    fn ordinary_keys_are_compared_without_reading_the_stored_key_class() {
+        let builder = LeafBuilder::new(4_096, 1, vec![ColumnSpec::key(PhysicalType::Int64)], 1)
+            .expect("a builder");
+        let rows: Vec<Vec<Datum<'_>>> = (0..200).map(|number| vec![Datum::Int(number)]).collect();
+        let page = match builder
+            .pack_with(&rows, 1.0, Some(&mut Nowhere))
+            .expect("a pack")
+        {
+            Packed::Filled { page, .. } => page,
+            Packed::RowTooLarge => panic!("the rows were refused"),
+        };
+        let leaf = LeafRef::parse(&page).expect("a leaf");
+        STORED_KEY_READS.with(|count| count.set(0));
+        for row in 0..200 {
+            let order = leaf
+                .compare_key(row, &[Datum::Int(77)])
+                .expect("a comparison");
+            assert_eq!(order, (row as i64).cmp(&77));
+        }
+        assert_eq!(STORED_KEY_READS.with(std::cell::Cell::get), 0);
+
+        let long = long_key(b"hello", 5_000);
+        let spilled = leaf_page(&long);
+        let leaf = LeafRef::parse(&spilled).expect("a leaf");
+        STORED_KEY_READS.with(|count| count.set(0));
+        let _ = leaf.compare_key(0, &[Datum::Null]);
+        assert_eq!(STORED_KEY_READS.with(std::cell::Cell::get), 1);
+    }
+
     /// A probe of another class and a descending column are decided without
     /// reading the value.
     #[test]
