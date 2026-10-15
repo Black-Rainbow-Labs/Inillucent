@@ -369,6 +369,7 @@ impl EntrySet {
     /// and nothing is copied a second time.
     ///
     /// @param order - the entry indices, in the order to write them
+    #[cfg(test)]
     pub(crate) fn to_datums(&self, order: &[u32]) -> Vec<Datum<'_>> {
         let mut out: Vec<Datum<'_>> = Vec::with_capacity(order.len().saturating_mul(self.width));
         for entry in order {
@@ -412,6 +413,55 @@ impl EntrySet {
     /// @param order - the entries in key order, from [`EntrySet::order`]
     pub(crate) fn in_order<'a>(&'a self, order: &'a [u32]) -> Ordered<'a> {
         Ordered { set: self, order }
+    }
+
+    /// Returns roughly how many bytes the set holds in memory.
+    ///
+    /// The cells, the payload arena and the sort prefix, which is what a run threshold has to
+    /// count: 105 bytes an entry was measured for a two column index, and an estimate of the
+    /// values alone would be a third of it.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        let cells = self.cells.len().saturating_mul(std::mem::size_of::<Cell>());
+        let prefix = self.prefix.len().saturating_mul(8);
+        cells
+            .saturating_add(self.bytes.len())
+            .saturating_add(prefix) as u64
+    }
+
+    /// Reports whether the set holds no entry.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Empties the set and keeps the room it grew to, so the next run does not grow again.
+    pub(crate) fn clear(&mut self) {
+        self.cells.clear();
+        self.bytes.clear();
+        self.prefix.clear();
+    }
+
+    /// Encodes the entries, in the order given, as one run for a spill file.
+    ///
+    /// The form [`inillucent_exec::spill::encode_run`] writes: a count of values and then that many
+    /// tagged values for each entry, so the run is read back by the reader every other spill uses.
+    /// It is written straight out of the arena. Building an owned row for each entry first would
+    /// allocate what the arena exists to avoid allocating.
+    ///
+    /// @param order - the entries in the order they are to be read back
+    pub(crate) fn encode_in_order(&self, order: &[u32]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(
+            order
+                .len()
+                .saturating_mul(self.width.saturating_mul(12).saturating_add(4)),
+        );
+        let width = u32::try_from(self.width).unwrap_or(u32::MAX);
+        for entry in order {
+            out.extend_from_slice(&width.to_le_bytes());
+            for column in 0..self.width {
+                self.datum(*entry as usize, column).encode_tagged(&mut out);
+            }
+        }
+        out
     }
 
     /// Returns one payload out of the arena.

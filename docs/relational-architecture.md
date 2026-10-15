@@ -465,6 +465,66 @@ has `RETURNING`, an upsert, or a conflict clause other than `ABORT`. A column's 
 `NOT NULL ON CONFLICT IGNORE` or `REPLACE` does not stop the bulk build. `CREATE TABLE ... AS
 SELECT` fills its table through the same statement, so it gets the bulk build too.
 
+The bulk build holds the rows it is given until it has built every page. A query whose rows pass
+32 MiB is therefore handled the way the next section describes.
+
+### Statements that read more rows than fit in memory
+
+Five kinds of statement used to hold every row they read. Each now holds at most about 32 MiB of
+rows or entries, and writes the rest to a temporary file on the database's file system. `ORDER BY`
+already did, and is in the table to show the same limit. The
+operating system deletes the file when it is closed and when the process ends, and nothing in it
+has to survive a crash. If the file cannot be opened, the statement holds everything, as it did
+before.
+
+| Statement | What it holds | What goes to the file |
+|---|---|---|
+| `INSERT ... SELECT` | the query's rows | the rows, in the order they arrive |
+| `CREATE INDEX` and `REINDEX` | the entries of the new index | sorted runs of entries, merged into the tree builder a chunk at a time |
+| `SELECT DISTINCT` | the key of every row kept; the rows go on as they are found | every later row with its key and its arrival number, sorted into runs |
+| `UNION`, `INTERSECT`, `EXCEPT` | the key of every row kept, and the row | every row with its key, the arm it came from and its arrival number, sorted into runs |
+| a window function | one partition | nothing: a partition that passes the limit is computed a run of peer groups at a time, when every call allows it |
+| `ORDER BY` | the rows, as it already did | sorted runs |
+
+**`INSERT ... SELECT`.** The statement still reads all of its query before it writes a row, so
+no row it writes is read back by its own query. Past 32 MiB the rows are appended to the file as
+they arrive. Into a table that holds rows, or that has a `UNIQUE` index, the rows are then read
+back one at a time inside the one statement, so a failure on any row puts every earlier row back
+and names the constraint the row by row insert names. Into an empty table the engine reads the file
+twice. The first read builds and checks every row in order and keeps nothing, so a constraint that
+fails is found before a page is written. The second builds each row again, hands the finished rows
+to the tree builder a chunk at a time, and sorts the entries of each index in runs. This needs
+the rowids to increase, which a copy from a rowid table does. Any other order takes the row by row
+insert.
+
+**`CREATE INDEX`.** The entries are scanned into an arena of about 105 bytes an entry. When the
+arena holds 32 MiB it is sorted and written as a run, and the runs are merged under the comparison
+the tree uses. A `UNIQUE` index is checked over the merge, and the keys are checked against the
+key length limit, before any page is written.
+
+**`DISTINCT` and the set operations.** While the keys and rows fit, they are hashed, and the
+answer is what it always was. Past the limit the hash set is dropped and every row goes to a
+sorter. For `DISTINCT` the rows found before the switch were handed on already, so their keys go to the sorter as markers
+that drop any later row with the same key; the first later row of each other key, by arrival, is kept and the survivors are sorted
+back into arrival order, which is the order the hash set answered in. For the set operations the
+row kept for a key is the one from the later arm, or the first row of its arm, and the answer
+comes out in key order, as it does when everything fits.
+
+**Window functions.** The rows of the query that feeds a window arrive sorted by its `PARTITION
+BY` and `ORDER BY`. The window computes a partition when the next one starts and hands its rows
+on, so it holds the largest partition and not the table. A partition that passes 32 MiB, in a
+window whose calls are only `row_number`, `rank`, `dense_rank` and aggregates over the default
+frame, is computed in pieces of whole peer groups, carrying the counts and the accumulators from
+piece to piece. A window with any other call (`ntile`, `lag`, `lead`, a frame that looks at
+following rows, `last_value` over a whole partition, a `DISTINCT` aggregate) holds a partition
+whole, so one partition larger than memory is still held in memory for such a window. Calls with
+different frames are computed one after another: the rows are numbered as they arrive, sorted into
+the next frame's order, and sorted back by the number at the end.
+
+A query with a `LIMIT` stops reading its input once the limit is met, so a window that is followed
+by a `LIMIT` computes only the partitions it has to. An error in a window call part way through
+the input is reported after the rows before it, as SQLite does.
+
 ### A `DELETE` or `UPDATE` of many rows
 
 A `DELETE` or an `UPDATE` that nothing can watch changes each leaf once for all of the statement's

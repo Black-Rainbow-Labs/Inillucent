@@ -3,7 +3,9 @@
 //! Invariant: **a compound statement's arms are run in the order the text
 //! gives and combined afterwards.** `UNION` and `EXCEPT` are set operations
 //! over the whole of each arm, so an implementation that streamed one into the
-//! other would answer differently for a `LIMIT`.
+//! other would answer differently for a `LIMIT`. Each arm is pushed into the set operation by its
+//! own pipeline, so an arm is never held as a vector of rows; what the set operation holds is its
+//! own business, and it sorts in runs when that is too much (`crate::setop`).
 
 use inillucent_base::DbResult;
 // `literal_value` is named by path from a dozen call sites in
@@ -24,9 +26,10 @@ use inillucent_value::affinity::Affinity;
 use inillucent_value::collation::Collation;
 
 use crate::expr::Expr;
-use crate::join::ValuesScan;
+use crate::gather::{Gathered, Gathering};
+
 use crate::ops::{CollectInto, Limit, Sink, Sort, SortKey};
-use crate::setop::{SetKeys, SetKind, SetOp};
+use crate::setop::{SetKind, SetOp};
 
 /// A catalog that also answers one recursive CTE's queue.
 ///
@@ -213,16 +216,43 @@ pub fn run_compound(
     catalog: &dyn TreeCatalog,
     params: &Params,
 ) -> DbResult<(Vec<Vec<OwnedDatum>>, Shape)> {
+    let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = Box::new(CollectInto::new(std::rc::Rc::clone(&rows)));
+    let shape = run_compound_into(plan, catalog, params, sink)?;
+    let collected = std::mem::take(&mut *rows.borrow_mut());
+    Ok((collected, shape))
+}
+/// Runs a compound query into a sink.
+///
+/// The body of [`run_compound`]: the answer is pushed to `sink` after the compound's own `ORDER
+/// BY`, `LIMIT` and `OFFSET`, so a caller that writes the rows somewhere does not hold them.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+/// @param catalog - where the trees and layouts come from
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param sink - where the answer goes; it is finished when the answer ends
+pub fn run_compound_into(
+    plan: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    params: &Params,
+    sink: Box<dyn Sink>,
+) -> DbResult<Shape> {
     // Every uncorrelated subquery is answered once, here, before anything is
     // built over it. See `crate::subquery` for why it is per execution.
     let folded = crate::subquery::fold(plan, catalog, params)?;
     let params = folded.as_ref().unwrap_or(params);
     let collations = compound_collations(plan);
+    let spill = catalog.spill();
     let streams = compound_streams(plan);
-    let (mut rows, shape) = match run_arm(plan, catalog, params) {
-        Ok(answer) => answer,
-        Err(error) => return compound_failure(plan, params, streams, Vec::new(), error),
+    let gathering = new_gathering(&spill);
+    let shape = match run_arm_into(plan, catalog, params, collecting(&gathering)) {
+        Ok(shape) => shape,
+        Err(error) => {
+            stash_partial(&gathering);
+            return compound_failure_into(plan, params, streams, error, sink);
+        }
     };
+    let mut rows = take_gathered(&gathering)?;
     for (op, arm) in &plan.compounds {
         if !arm.compounds.is_empty() {
             // The binder flattens a chain of compounds onto the head, so an arm
@@ -230,14 +260,15 @@ pub fn run_compound(
             // is what the physical pass does with a shape it has not seen.
             return unsupported("a compound query nested inside a compound arm");
         }
-        let right = match run_arm(arm, catalog, params) {
-            Ok((right, _)) => right,
-            Err(error) => return compound_failure(plan, params, streams, rows, error),
+        rows = match combine(kind_of(*op), &collations, rows, arm, catalog, params) {
+            Ok(combined) => combined,
+            Err(error) => return compound_failure_into(plan, params, streams, error, sink),
         };
-        rows = combine(kind_of(*op), &collations, rows, right)?;
     }
-    let ordered = order_compound(&plan.select, rows, params)?;
-    Ok((ordered, shape))
+    let mut tail = compound_tail(&plan.select, params, catalog.spill(), sink)?;
+    feed_rows(rows, tail.as_mut())?;
+    tail.finish()?;
+    Ok(shape)
 }
 /// Says whether a compound hands its rows out as each arm produces them.
 ///
@@ -317,16 +348,18 @@ fn compound_collations(plan: &PhysicalPlan) -> Vec<Collation> {
         })
         .collect()
 }
-/// Runs one arm of a compound, without the compound's own ordering or limit.
+/// Runs one arm of a compound into a sink, without the compound's own ordering or limit.
 ///
 /// @param plan - the arm
 /// @param catalog - where the trees and layouts come from
 /// @param params - the bound parameters
-fn run_arm(
+/// @param sink - where the arm's rows go; it is finished when the arm ends
+fn run_arm_into(
     plan: &PhysicalPlan,
     catalog: &dyn TreeCatalog,
     params: &Params,
-) -> DbResult<(Vec<Vec<OwnedDatum>>, Shape)> {
+    sink: Box<dyn Sink>,
+) -> DbResult<Shape> {
     let mut arm = plan.clone();
     arm.compounds.clear();
     arm.select.order_by.clear();
@@ -334,7 +367,63 @@ fn run_arm(
     arm.select.offset = None;
     arm.needs_sort = false;
     arm.reverse = false;
-    run_any(&arm, catalog, params)
+    if !arm.select.windows.is_empty() {
+        return crate::windowpass::run_windowed_into(&arm, catalog, params, sink);
+    }
+    let prepared = prepare(&arm, catalog, ForcePlan::default())?;
+    let (mut pipeline, shape) = build_prepared(&arm, catalog, &prepared, params, sink)?;
+    pipeline.run()?;
+    Ok(shape)
+}
+/// Returns a collection that holds an arm's rows, moving them to a file when there are too many.
+///
+/// @param spill - where files come from, when the connection offers them
+fn new_gathering(
+    spill: &Option<std::rc::Rc<dyn crate::spill::Spill>>,
+) -> std::rc::Rc<std::cell::RefCell<Option<Gathering>>> {
+    std::rc::Rc::new(std::cell::RefCell::new(Some(Gathering::rows(
+        spill.clone(),
+    ))))
+}
+/// Returns a sink that collects into a collection.
+///
+/// @param gathering - the collection
+fn collecting(gathering: &std::rc::Rc<std::cell::RefCell<Option<Gathering>>>) -> Box<dyn Sink> {
+    let unused = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    Box::new(CollectInto::new(unused).with_gathering(std::rc::Rc::clone(gathering)))
+}
+/// Ends a collection and returns what it holds.
+///
+/// @param gathering - the collection
+fn take_gathered(
+    gathering: &std::rc::Rc<std::cell::RefCell<Option<Gathering>>>,
+) -> DbResult<Gathered> {
+    match gathering.borrow_mut().take() {
+        Some(held) => held.finish(),
+        None => Ok(Gathered::Rows(Vec::new())),
+    }
+}
+/// A sink that pushes into a set operation shared by several arms and never ends it.
+///
+/// Each arm of a compound is a pipeline of its own and a pipeline finishes its sink when it ends.
+/// The set operation must see both arms before it finishes, so each arm gets one of these, and the
+/// set operation is finished once, by the caller, when the last arm is done.
+struct ArmSink {
+    /// The set operation every arm pushes into.
+    shared: std::rc::Rc<std::cell::RefCell<SetOp>>,
+}
+impl Sink for ArmSink {
+    fn push(&mut self, batch: &crate::batch::Batch<'_>) -> DbResult<crate::ops::Flow> {
+        self.shared.borrow_mut().push(batch)
+    }
+
+    fn finish(&mut self) -> DbResult<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> DbResult<()> {
+        Ok(())
+    }
 }
 /// Runs any planned query, whichever of the three shapes it is.
 ///
@@ -468,6 +557,60 @@ pub fn run_any_prepared_limited(
     }
     run_prepared_limited(plan, catalog, prepared, params, limit)
 }
+/// Runs any planned query into a sink, whichever of the three shapes it is.
+///
+/// **For a caller that writes the rows somewhere and has no use for them as a vector**: an
+/// `INSERT ... SELECT` source. A compound and a windowed query push their answers as they produce
+/// them, so none of the three holds the answer.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from
+/// @param prepared - the structural choice
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param sink - where the answer goes; it is finished when the answer ends
+pub fn run_any_into(
+    plan: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    prepared: &Prepared,
+    params: &Params,
+    sink: Box<dyn Sink>,
+) -> DbResult<Shape> {
+    if !plan.compounds.is_empty() {
+        return run_compound_into(plan, catalog, params, sink);
+    }
+    if !plan.select.windows.is_empty() {
+        return crate::windowpass::run_windowed_into(plan, catalog, params, sink);
+    }
+    let (mut pipeline, shape) = build_prepared(plan, catalog, prepared, params, sink)?;
+    pipeline.run()?;
+    Ok(shape)
+}
+/// Runs any planned query and collects its answer, in memory or in a file when it is large.
+///
+/// For the source of an `INSERT ... SELECT` that has no compiled chain: a compound, a window, or a
+/// query whose chain is in use.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from
+/// @param prepared - the structural choice
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param packed - whether to pack the rows, for the bulk build, or keep one vector a row
+pub fn run_any_gathered(
+    plan: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    prepared: &Prepared,
+    params: &Params,
+    packed: bool,
+) -> DbResult<Gathered> {
+    let spill = catalog.spill();
+    let gathering = std::rc::Rc::new(std::cell::RefCell::new(Some(if packed {
+        Gathering::packed(spill)
+    } else {
+        Gathering::rows(spill)
+    })));
+    run_any_into(plan, catalog, prepared, params, collecting(&gathering))?;
+    take_gathered(&gathering)
+}
 /// Returns the set operation a compound operator names.
 ///
 /// @param op - the binder's operator
@@ -479,55 +622,147 @@ fn kind_of(op: inillucent_sql::ast::CompoundOp) -> SetKind {
         inillucent_sql::ast::CompoundOp::Intersect => SetKind::Intersect,
     }
 }
-/// Applies one set operation to two already-materialised arms.
+/// Applies one set operation to the rows so far and the next arm.
+///
+/// **The next arm is run into the set operation, not collected first.** The rows so far are read
+/// from where they are held and pushed in, the arm's pipeline pushes the rest, and the answer is
+/// collected, in memory or in a file when it is large. For `EXCEPT` and `INTERSECT` the right arm
+/// goes first, because a left row cannot be judged until the whole right arm is known.
 ///
 /// @param kind - which of the four
 /// @param collations - the collation of each result column
 /// @param left - the rows so far
-/// @param right - the arm being folded in
+/// @param arm - the arm being folded in
+/// @param catalog - where the trees and layouts come from
+/// @param params - the bound parameters
 fn combine(
     kind: SetKind,
     collations: &[Collation],
-    left: Vec<Vec<OwnedDatum>>,
-    right: Vec<Vec<OwnedDatum>>,
-) -> DbResult<Vec<Vec<OwnedDatum>>> {
-    let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let mut keys = SetKeys::new(collations.to_vec());
+    left: Gathered,
+    arm: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    params: &Params,
+) -> DbResult<Gathered> {
+    let spill = catalog.spill();
+    let gathering = new_gathering(&spill);
+    let operation = std::rc::Rc::new(std::cell::RefCell::new(
+        SetOp::new(kind, collations.to_vec(), collecting(&gathering)).spilling_to(spill),
+    ));
+    let arm_sink = || -> Box<dyn Sink> {
+        Box::new(ArmSink {
+            shared: std::rc::Rc::clone(&operation),
+        })
+    };
     if kind.needs_right_first() {
-        // `EXCEPT` and `INTERSECT` cannot judge a left row until the right arm
-        // is complete, which is what `needs_right_first` says and why the right
-        // arm is reduced to its keys before the left arm is pushed at all.
-        ValuesScan::new(right.clone()).run(&mut keys)?;
+        run_arm_into(arm, catalog, params, arm_sink())
+            .inspect_err(|_| stash_partial(&gathering))?;
+        operation.borrow_mut().next_arm();
+        feed_rows(left, &mut *operation.borrow_mut())?;
+    } else {
+        feed_rows(left, &mut *operation.borrow_mut())?;
+        operation.borrow_mut().next_arm();
+        run_arm_into(arm, catalog, params, arm_sink())
+            .inspect_err(|_| stash_partial(&gathering))?;
     }
-    let mut operation = SetOp::new(
-        kind,
-        collations.to_vec(),
-        keys,
-        Box::new(CollectInto::new(std::rc::Rc::clone(&collected))),
-    );
-    ValuesScan::new(left).run_without_finish(&mut operation)?;
-    if !kind.needs_right_first() {
-        // Both unions push both arms through the same operator, because neither
-        // needs to know about the other in advance.
-        operation.next_arm();
-        ValuesScan::new(right).run_without_finish(&mut operation)?;
-    }
-    operation.finish()?;
-    let answer = collected.borrow().clone();
-    Ok(answer)
+    operation.borrow_mut().finish()?;
+    take_gathered(&gathering)
 }
-/// Applies a compound's own `ORDER BY`, `LIMIT` and `OFFSET`.
+/// Keeps the rows a collection holds for [`take_partial_rows`], after the arm feeding it failed.
+///
+/// A failing arm of a compound that streams has delivered the rows before the failure, and SQLite
+/// returns them ahead of the error. They are read back whole, which only a failure pays for.
+///
+/// @param gathering - the collection the failed run was filling
+fn stash_partial(gathering: &std::rc::Rc<std::cell::RefCell<Option<Gathering>>>) {
+    let held = take_gathered(gathering).and_then(Gathered::into_rows);
+    keep_partial_rows(held.unwrap_or_default());
+}
+/// Reports an arm of a compound that failed, into a sink, with the rows SQLite returns first.
+///
+/// The rows the arms delivered are in [`take_partial_rows`] when this is called; see
+/// [`compound_failure`] for what is done with them. When the compound's `LIMIT` is met by
+/// them the answer is those rows and no failure.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+/// @param params - the bound parameters
+/// @param streams - whether the compound hands out rows as each arm produces them
+/// @param error - what the failing arm said
+/// @param sink - where the answer goes
+fn compound_failure_into(
+    plan: &PhysicalPlan,
+    params: &Params,
+    streams: bool,
+    error: inillucent_base::DbError,
+    mut sink: Box<dyn Sink>,
+) -> DbResult<Shape> {
+    let (rows, shape) = compound_failure(plan, params, streams, Vec::new(), error)?;
+    crate::ops::emit_rows(&rows, sink.as_mut())?;
+    sink.finish()?;
+    Ok(shape)
+}
+/// Pushes rows that were collected earlier into a sink, without finishing it.
+///
+/// @param rows - the rows
+/// @param sink - where they go
+fn feed_rows(rows: Gathered, sink: &mut dyn Sink) -> DbResult<()> {
+    match rows {
+        Gathered::Rows(rows) => {
+            crate::ops::emit_rows(&rows, sink)?;
+        }
+        Gathered::Packed(packed) => {
+            crate::ops::emit_rows(&packed.into_rows(), sink)?;
+        }
+        Gathered::Spooled(spooled) => {
+            let mut batch: Vec<Vec<OwnedDatum>> = Vec::with_capacity(crate::batch::BATCH_ROWS);
+            for row in spooled {
+                batch.push(row?);
+                if batch.len() >= crate::batch::BATCH_ROWS {
+                    let flow = crate::ops::emit_rows(&batch, sink)?;
+                    batch.clear();
+                    if flow == crate::ops::Flow::Stop {
+                        return Ok(());
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                crate::ops::emit_rows(&batch, sink)?;
+            }
+        }
+    }
+    Ok(())
+}
+/// Applies a compound's own `ORDER BY`, `LIMIT` and `OFFSET` to rows already in hand.
 ///
 /// @param select - the head arm's bound statement, which carries them
-/// @param rows - the combined rows
+/// @param rows - the rows
 /// @param params - the bound parameters
 fn order_compound(
     select: &BoundSelect,
     rows: Vec<Vec<OwnedDatum>>,
     params: &Params,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = Box::new(CollectInto::new(std::rc::Rc::clone(&collected)));
+    let mut tail = compound_tail(select, params, None, sink)?;
+    feed_rows(Gathered::Rows(rows), tail.as_mut())?;
+    tail.finish()?;
+    let answer = std::mem::take(&mut *collected.borrow_mut());
+    Ok(answer)
+}
+/// Returns the operators that apply a compound's own `ORDER BY`, `LIMIT` and `OFFSET` to its rows.
+///
+/// @param select - the head arm's bound statement, which carries them
+/// @param params - the bound parameters
+/// @param catalog - where a sort that does not fit in memory writes its runs
+/// @param sink - where the ordered and limited rows go
+fn compound_tail(
+    select: &BoundSelect,
+    params: &Params,
+    spill: Option<std::rc::Rc<dyn crate::spill::Spill>>,
+    collect: Box<dyn Sink>,
+) -> DbResult<Box<dyn Sink>> {
     if select.order_by.is_empty() && select.limit.is_none() && select.offset.is_none() {
-        return Ok(rows);
+        return Ok(collect);
     }
     let mut keys = Vec::with_capacity(select.order_by.len());
     for term in &select.order_by {
@@ -561,8 +796,6 @@ fn order_compound(
     }
     let limit = constant_count(select.limit.as_ref(), params, Negative::NoLimit)?;
     let offset = constant_count(select.offset.as_ref(), params, Negative::Zero)?;
-    let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let collect: Box<dyn Sink> = Box::new(CollectInto::new(std::rc::Rc::clone(&collected)));
     let sink: Box<dyn Sink> = match (limit, offset) {
         (None, None) => collect,
         (limit, offset) => Box::new(Limit::new(
@@ -571,14 +804,12 @@ fn order_compound(
             collect,
         )),
     };
-    let mut head: Box<dyn Sink> = if keys.is_empty() {
+    let head: Box<dyn Sink> = if keys.is_empty() {
         sink
     } else {
-        Box::new(Sort::new(keys, sink))
+        Box::new(Sort::new(keys, sink).spilling_to(spill))
     };
-    ValuesScan::new(rows).run(head.as_mut())?;
-    let answer = collected.borrow().clone();
-    Ok(answer)
+    Ok(head)
 }
 /// Returns the collation each result column is compared under by `DISTINCT`.
 ///

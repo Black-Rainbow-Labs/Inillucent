@@ -39,6 +39,9 @@ use crate::batch::Batch;
 use crate::join::RowStore;
 use crate::ops::{emit_rows, Flow, Sink};
 
+mod stream;
+pub use stream::{pieces_computed, StreamShape, WindowStream};
+
 /// Which family a window call belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowSlot {
@@ -471,9 +474,31 @@ fn growing_aggregate(
     kind: AggregateKind,
     values: &mut Vec<OwnedDatum>,
 ) -> DbResult<()> {
-    let whole_rows = keeps_whole_rows(&kind);
     let mut accumulator = Accumulator::new(kind);
     accumulator.compare_under(call.collation);
+    growing_aggregate_carrying(rows, call, partition, &mut accumulator, values)
+}
+
+/// Computes an aggregate over a growing frame with an accumulator the caller keeps.
+///
+/// **The body of [`growing_aggregate`], so a partition computed in pieces adds each row to the same
+/// accumulator once.** Each piece is a run of whole peer groups, handed in as its own partition;
+/// the frame's start never matters to a growing frame, because the accumulator already holds
+/// everything before the piece.
+///
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param partition - the partition, or the piece of one
+/// @param accumulator - the accumulator, holding every row before this piece
+/// @param values - where the answers go, so a failure keeps the ones before it
+fn growing_aggregate_carrying(
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    partition: &frames::Partition,
+    accumulator: &mut Accumulator,
+    values: &mut Vec<OwnedDatum>,
+) -> DbResult<()> {
+    let whole_rows = keeps_whole_rows(&call_kind(call));
     let mut added = partition.start;
     values.reserve(partition.end.saturating_sub(partition.start));
     for row in partition.start..partition.end {
@@ -488,7 +513,7 @@ fn growing_aggregate(
         }
         for member in added..end {
             if passes_filter(rows, call, member) {
-                feed(&mut accumulator, rows, call, member, whole_rows)?;
+                feed(accumulator, rows, call, member, whole_rows)?;
             }
         }
         added = end;

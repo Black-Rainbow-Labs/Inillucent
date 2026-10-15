@@ -122,6 +122,7 @@ pub use engine::rowshape::{identity_columns, logical_row, source_layout_of, stor
 pub use engine::statements::{Outcome, Statement};
 mod entries;
 pub(crate) mod import;
+mod index_sort;
 mod inspect;
 mod introspect;
 mod marks;

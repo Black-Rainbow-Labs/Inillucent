@@ -26,14 +26,14 @@ use inillucent_sql::function::AggregateFunc;
 
 use crate::aggregate::{AggregateKind, Percentile};
 use crate::expr::{compile, Expr, StaticType};
-use crate::join::ValuesScan;
 use crate::ops::{CollectInto, Distinct, Limit, Project, Sink, Sort, SortKey};
 use crate::physical::{
-    constant_count, distinct_collations, expression_collation, prepare, run_prepared, translate,
+    build_prepared, constant_count, distinct_collations, expression_collation, prepare, translate,
     unsupported, ForcePlan, Frame, HeldSpace, Negative, Params, Shape, TreeCatalog,
 };
 use crate::window::{
-    FrameEnd, OrderTerm as WindowOrderTerm, WindowCall, WindowFrame, WindowPlan, WindowSlot,
+    FrameEnd, OrderTerm as WindowOrderTerm, StreamShape, WindowCall, WindowFrame, WindowPlan,
+    WindowSlot, WindowStream,
 };
 
 /// Runs a query with window functions.
@@ -74,6 +74,50 @@ pub fn run_windowed(
     catalog: &dyn TreeCatalog,
     params: &Params,
 ) -> DbResult<(Vec<Vec<OwnedDatum>>, Shape)> {
+    let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = Box::new(CollectInto::new(std::rc::Rc::clone(&rows)));
+    match run_windowed_into(plan, catalog, params, sink) {
+        Ok(shape) => {
+            let collected = std::mem::take(&mut *rows.borrow_mut());
+            Ok((collected, shape))
+        }
+        Err(error) => {
+            // SQLite answers the rows before the one that raised the error, so the rows the
+            // pipeline delivered before it failed are kept for whoever reports the failure.
+            crate::physical::keep_partial_rows(std::mem::take(&mut *rows.borrow_mut()));
+            Err(error)
+        }
+    }
+}
+
+/// Runs a query with window functions into a sink.
+///
+/// **The input is read once, in order, and each partition is computed and handed on before the
+/// next is read.** The inner query that supplies the rows is pushed into one operator for each
+/// distinct window frame ([`crate::window::WindowStream`]), and the rows come out of the last of
+/// them into the projection, the `ORDER BY`, the `DISTINCT` and the `LIMIT` the statement has.
+/// Nothing holds more than a partition (or, for the calls that only read what came before, a run
+/// of peer groups) unless an operator above it does.
+///
+/// ## Several frames
+///
+/// Calls with different `PARTITION BY` or `ORDER BY` need the rows in different orders. Each
+/// row is numbered as it arrives, the pass of the first frame fills its calls' slots, a sorter puts
+/// the rows in the second frame's order (ties by the number, as the stable sort of the buffered
+/// rows did), the second pass fills its slots, and so on. A last sort by the number puts the rows
+/// back in the order the first frame read them in, which is the order the answer has when the
+/// statement names none. The sorters write runs when they hold too much.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param sink - where the answer goes; it is finished when the answer ends
+pub fn run_windowed_into(
+    plan: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    params: &Params,
+    sink: Box<dyn Sink>,
+) -> DbResult<Shape> {
     // Every uncorrelated subquery is answered once, here, before anything is
     // built over it. See `crate::subquery` for why it is per execution.
     let folded = crate::subquery::fold(plan, catalog, params)?;
@@ -89,174 +133,54 @@ pub fn run_windowed(
     // calls that share a `PARTITION BY` and an `ORDER BY` see the same
     // partitions and the same peer groups, so they are computed together over
     // one ordering; two that do not need the rows in two different orders and
-    // there is no single sort that serves both. Refusing the second shape was
-    // honest while there was one pass; grouping the calls is what makes it
-    // unnecessary.
+    // there is no single sort that serves both.
     let groups = window_groups(select);
     let pre = window_inputs(select);
-    let rows = window_input_rows(select, &pre, first, catalog, params, plan.levers)?;
     // The output row is the buffered values followed by one slot per call, in
     // the order the binder numbered them - which is the space
     // `Frame::Window` addresses and the reason the slots are filled by
     // scattering rather than by appending.
     let width = pre.len();
-    // **A window pass holds more than its input, and the budget saw only the
-    // input (task-1932, H6).** `window_input_rows` runs an inner query whose
-    // `Collect` sink charges the rows it buffers, and then this function builds
-    // a widened copy of every one of them - and, below, one re-sorted copy per
-    // window frame after the first. Three windows in different orders over a
-    // large table is five copies of it in memory. Each is charged where it is
-    // made rather than estimated up front, because the number of copies is
-    // decided by the statement rather than by the data.
-    inillucent_base::budget::materialise(owned_rows_bytes(&rows))?;
-    // **One frame needs no second copy of the rows (task-2183).** The rows
-    // arrive in that frame's order, so its values are computed over them as
-    // they are and appended to the rows themselves, which are moved rather
-    // than copied into the widened list, then into a tagged list, then into
-    // the pass's output. Its calls are numbered in slot order, because a
-    // single group holds every call in the order the binder numbered them.
-    if let [group] = groups.as_slice() {
-        let pass = window_plan(select, &pre, group)?;
-        let calls = group.slots.len();
-        let in_order = group
-            .slots
+    let slots = select.windows.len();
+    let several = groups.len() > 1;
+    let shape = Shape {
+        names: select
+            .columns
             .iter()
-            .enumerate()
-            .all(|(nth, slot)| nth == *slot)
-            && calls == select.windows.len();
-        let (values, failure) = crate::window::compute_values_until_failure(&rows, &pass);
-        if let Some(failure) = failure {
-            if in_order {
-                let before =
-                    keep_rows_before_failure(select, &pre, width, &rows, &values, &failure, params);
-                // A `LIMIT` already met by the rows before the failing one is
-                // the whole answer, because SQLite stops before it computes the
-                // failing row.
-                if let Some(answered) = before {
-                    return Ok(answered);
-                }
-            }
-            return Err(failure.error);
-        }
-        if in_order {
-            let mut values = values.into_iter();
-            let widened: Vec<Vec<OwnedDatum>> = rows
-                .into_iter()
-                .map(|mut row| {
-                    row.reserve(calls);
-                    row.extend(values.by_ref().take(calls));
-                    row
-                })
-                .collect();
-            return project_over_window(select, &pre, width, widened, params);
-        }
+            .map(|column| column.name.clone())
+            .collect(),
+        operators: vec![
+            "SCAN".to_string(),
+            "SORT".to_string(),
+            "WINDOW".to_string(),
+            "PROJECT".to_string(),
+        ],
+    };
+    let mut next = projection_chain(select, &pre, width, params, catalog, sink)?;
+    if several {
+        next = restoring_order(next, width, slots, catalog)?;
     }
-    let mut widened: Vec<Vec<OwnedDatum>> = rows
-        .iter()
-        .map(|row| {
-            let mut whole = row.clone();
-            whole.extend(std::iter::repeat_n(OwnedDatum::Null, select.windows.len()));
-            whole
-        })
-        .collect();
-    for (position, group) in groups.iter().enumerate() {
-        // The first group's ordering is the one the inner query already sorted
-        // by, so it is not sorted again; every other group needs the rows in
-        // its own order.
-        let ordered = if position == 0 {
-            tagged(&rows)
-        } else {
-            // A second frame needs the rows in a second order, which is a
-            // second whole copy of them.
-            inillucent_base::budget::materialise(owned_rows_bytes(&rows))?;
-            sort_tagged(tagged(&rows), &pre, group)?
-        };
+    for (position, group) in groups.iter().enumerate().rev() {
         let pass = window_plan(select, &pre, group)?;
-        let computed = crate::window::compute(&ordered, &pass)?;
-        for row in &computed {
-            let Some(OwnedDatum::Int(at)) = row.get(width) else {
-                return Err(misuse("a window pass lost the row it was computing for"));
-            };
-            let at = *at as usize;
-            for (nth, slot) in group.slots.iter().enumerate() {
-                let value = row
-                    .get(width.saturating_add(1).saturating_add(nth))
-                    .cloned()
-                    .unwrap_or(OwnedDatum::Null);
-                if let Some(cell) = widened
-                    .get_mut(at)
-                    .and_then(|row| row.get_mut(width.saturating_add(*slot)))
-                {
-                    *cell = value;
-                }
-            }
-        }
+        let shape = StreamShape {
+            width,
+            total_slots: slots,
+            first: position == 0,
+            carries_seq: several,
+            // Rows before a failing row are handed on only when this pass's rows go straight on
+            // to the answer.
+            partial_rows_on_failure: !several,
+        };
+        let stream = WindowStream::new(pass, group.slots.clone(), shape, next);
+        next = if position == 0 {
+            Box::new(stream)
+        } else {
+            let keys = group_sort_keys(&pre, group, width.saturating_add(slots))?;
+            Box::new(Sort::new(keys, Box::new(stream)).spilling_to(catalog.spill()))
+        };
     }
-    project_over_window(select, &pre, width, widened, params)
-}
-
-/// Keeps the result rows of the rows computed before a window call failed, for
-/// whoever reports the failure, or returns them when a `LIMIT` is already met.
-///
-/// **SQLite answers the rows before the one that raised the error (bug hunt
-/// 10).** `SELECT sum(a) OVER (ORDER BY a)` over 1, 3 and 9223372036854775807
-/// returns `1` and `4` and then `integer overflow`. That only holds when
-/// nothing after the window has to see every row first: with an outer `ORDER
-/// BY` or a `DISTINCT` nothing is answered before the error, so no row is kept.
-///
-/// @param select - the bound statement
-/// @param pre - the buffered row's expressions
-/// @param width - how many columns the buffered row had before the pass
-/// @param rows - the buffered input
-/// @param values - the window values computed, `calls` for each row
-/// @param failure - the first row that could not be computed
-/// @param params - the bound parameters
-fn keep_rows_before_failure(
-    select: &BoundSelect,
-    pre: &[BoundExpr],
-    width: usize,
-    rows: &[Vec<OwnedDatum>],
-    values: &[OwnedDatum],
-    failure: &crate::window::WindowFailure,
-    params: &Params,
-) -> Option<(Vec<Vec<OwnedDatum>>, Shape)> {
-    if !select.order_by.is_empty() || select.distinct || failure.before == 0 {
-        return None;
-    }
-    let calls = select.windows.len();
-    let widened: Vec<Vec<OwnedDatum>> = rows
-        .iter()
-        .take(failure.before)
-        .enumerate()
-        .map(|(at, row)| {
-            let mut whole = row.clone();
-            let from = at.saturating_mul(calls);
-            whole.extend(
-                values
-                    .get(from..from.saturating_add(calls))
-                    .unwrap_or(&[])
-                    .iter()
-                    .cloned(),
-            );
-            whole
-        })
-        .collect();
-    let (answered, shape) = project_over_window(select, pre, width, widened, params).ok()?;
-    let limit = constant_count(select.limit.as_ref(), params, Negative::NoLimit).ok()?;
-    if limit.is_some_and(|limit| answered.len() >= limit) {
-        return Some((answered, shape));
-    }
-    crate::physical::keep_partial_rows(answered);
-    None
-}
-
-/// Returns roughly how many bytes a buffer of owned rows holds.
-///
-/// @param rows - the buffer to measure
-fn owned_rows_bytes(rows: &[Vec<OwnedDatum>]) -> u64 {
-    rows.iter()
-        .map(|row| crate::ops::owned_row_bytes(row))
-        .fold(0u64, u64::saturating_add)
+    run_inner_into(select, &pre, first, catalog, params, plan.levers, next)?;
+    Ok(shape)
 }
 
 /// One set of window calls that share a frame.
@@ -286,34 +210,13 @@ fn window_groups(select: &BoundSelect) -> Vec<WindowGroup> {
     groups
 }
 
-/// Returns the rows with their original position appended.
+/// Returns the terms a sorter orders rows by for one window group: the partition keys, the
+/// window's own ordering, and then the number the row arrived with.
 ///
-/// The position is what lets a pass over a *re-sorted* copy write its answers
-/// back into the row they belong to. It sits after the buffered values, where
-/// `window_plan` addresses nothing, so no pass can read it by accident.
-///
-/// @param rows - the buffered rows, in their original order
-fn tagged(rows: &[Vec<OwnedDatum>]) -> Vec<Vec<OwnedDatum>> {
-    rows.iter()
-        .enumerate()
-        .map(|(at, row)| {
-            let mut whole = row.clone();
-            whole.push(OwnedDatum::Int(at as i64));
-            whole
-        })
-        .collect()
-}
-
-/// Sorts tagged rows into one window group's own order.
-///
-/// @param rows - the tagged rows
 /// @param pre - the buffered row's expressions
 /// @param group - the group whose frame decides the order
-fn sort_tagged(
-    rows: Vec<Vec<OwnedDatum>>,
-    pre: &[BoundExpr],
-    group: &WindowGroup,
-) -> DbResult<Vec<Vec<OwnedDatum>>> {
+/// @param seq - the column holding the number the row arrived with
+fn group_sort_keys(pre: &[BoundExpr], group: &WindowGroup, seq: usize) -> DbResult<Vec<SortKey>> {
     let mut keys: Vec<SortKey> = Vec::new();
     // A partition key only has to bring a partition's rows together, so its
     // direction is free; the ordering terms are the window's own and are not.
@@ -333,17 +236,42 @@ fn sort_tagged(
             nulls_first: term.nulls == NullOrder::First,
         });
     }
-    if keys.is_empty() {
-        return Ok(rows);
-    }
-    let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let mut sorter = Sort::new(
-        keys,
-        Box::new(CollectInto::new(std::rc::Rc::clone(&collected))),
-    );
-    ValuesScan::new(rows).run(&mut sorter)?;
-    let answer = collected.borrow().clone();
-    Ok(answer)
+    keys.push(SortKey {
+        column: seq,
+        descending: false,
+        collation: Collation::Binary,
+        nulls_first: true,
+    });
+    Ok(keys)
+}
+
+/// Puts a sorter by arrival number and a trim of that number in front of a sink.
+///
+/// @param next - what takes the rows in the order they arrived, without the number
+/// @param width - how many values the passes read
+/// @param slots - how many window calls the statement has
+/// @param catalog - where the sorter writes its runs
+fn restoring_order(
+    next: Box<dyn Sink>,
+    width: usize,
+    slots: usize,
+    catalog: &dyn TreeCatalog,
+) -> DbResult<Box<dyn Sink>> {
+    let whole = width.saturating_add(slots);
+    let types = vec![StaticType::Unknown; whole.saturating_add(1)];
+    let kept: Vec<Box<dyn crate::expr::Eval>> = (0..whole)
+        .map(|column| compile(&Expr::Column(column), &types))
+        .collect::<DbResult<Vec<_>>>()?;
+    let trimmed: Box<dyn Sink> = Box::new(Project::new(kept, next));
+    let key = SortKey {
+        column: whole,
+        descending: false,
+        collation: Collation::Binary,
+        nulls_first: true,
+    };
+    Ok(Box::new(
+        Sort::new(vec![key], trimmed).spilling_to(catalog.spill()),
+    ))
 }
 
 /// Returns the values a window pass reads, in buffered-row order.
@@ -441,7 +369,7 @@ fn gather_leaves(expr: &BoundExpr, pre: &mut Vec<BoundExpr>) {
     }
 }
 
-/// Returns the rows a window pass runs over, already sorted.
+/// Runs the query that supplies a window pass's rows into a sink.
 ///
 /// @param select - the bound statement
 /// @param pre - the buffered row's expressions
@@ -449,14 +377,16 @@ fn gather_leaves(expr: &BoundExpr, pre: &mut Vec<BoundExpr>) {
 /// @param catalog - where the trees and layouts come from
 /// @param params - the bound parameters
 /// @param levers - the planner levers the statement was planned with
-fn window_input_rows(
+/// @param sink - where the rows go, already sorted by the first window's frame
+fn run_inner_into(
     select: &BoundSelect,
     pre: &[BoundExpr],
     window: &BoundWindow,
     catalog: &dyn TreeCatalog,
     params: &Params,
     levers: Levers,
-) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    sink: Box<dyn Sink>,
+) -> DbResult<()> {
     let mut inner = select.clone();
     inner.columns = pre
         .iter()
@@ -490,7 +420,8 @@ fn window_input_rows(
     // the statement is off for the rows its window reads as well.
     let planned = plan_select_with(inner, levers);
     let prepared = prepare(&planned, catalog, ForcePlan::default())?;
-    Ok(run_prepared(&planned, catalog, &prepared, params)?.0)
+    let (mut pipeline, _) = build_prepared(&planned, catalog, &prepared, params, sink)?;
+    pipeline.run()
 }
 
 /// Builds one window pass, addressing everything by buffered column.
@@ -637,7 +568,10 @@ fn column_of(pre: &[BoundExpr], expr: &BoundExpr) -> DbResult<usize> {
         .ok_or_else(|| misuse("a window pass did not carry a value its own plan reads"))
 }
 
-/// Projects a statement's result columns out of the widened rows.
+/// Builds the operators that turn widened rows into the statement's answer.
+///
+/// The rows are pushed into the returned sink; it projects the result columns, and orders, de-duplicates
+/// and limits them as the statement says.
 ///
 /// **The ordering happens below the projection, not above it.** Under
 /// [`Frame::Window`] a translated expression addresses the *widened* row - the
@@ -655,15 +589,17 @@ fn column_of(pre: &[BoundExpr], expr: &BoundExpr) -> DbResult<usize> {
 /// @param select - the bound statement
 /// @param pre - the buffered row's expressions
 /// @param width - how many columns the buffered row had before the pass
-/// @param rows - the widened rows
+/// @param catalog - where a sort that does not fit in memory writes its runs
+/// @param sink - where the answer goes
 /// @param params - the bound parameters
-fn project_over_window(
+fn projection_chain(
     select: &BoundSelect,
     pre: &[BoundExpr],
     width: usize,
-    rows: Vec<Vec<OwnedDatum>>,
     params: &Params,
-) -> DbResult<(Vec<Vec<OwnedDatum>>, Shape)> {
+    catalog: &dyn TreeCatalog,
+    sink: Box<dyn Sink>,
+) -> DbResult<Box<dyn Sink>> {
     let held = HeldSpace {
         layouts: Vec::new(),
         types: Vec::new(),
@@ -719,22 +655,21 @@ fn project_over_window(
 
     let limit = constant_count(select.limit.as_ref(), params, Negative::NoLimit)?;
     let offset = constant_count(select.offset.as_ref(), params, Negative::Zero)?;
-    let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let collect: Box<dyn Sink> = Box::new(CollectInto::new(std::rc::Rc::clone(&collected)));
     let mut head: Box<dyn Sink> = match (limit, offset) {
-        (None, None) => collect,
+        (None, None) => sink,
         (limit, offset) => Box::new(Limit::new(
             limit.unwrap_or(usize::MAX),
             offset.unwrap_or(0),
-            collect,
+            sink,
         )),
     };
     if select.distinct {
-        head = Box::new(Distinct::new(distinct_collations(select), head));
+        head =
+            Box::new(Distinct::new(distinct_collations(select), head).spilling_to(catalog.spill()));
     }
     head = Box::new(Project::new(projected, head));
     if !keys.is_empty() {
-        head = Box::new(Sort::new(keys, head));
+        head = Box::new(Sort::new(keys, head).spilling_to(catalog.spill()));
     }
     if !computed_keys.is_empty() {
         let mut extended: Vec<Box<dyn crate::expr::Eval>> = (0..whole)
@@ -743,28 +678,5 @@ fn project_over_window(
         extended.extend(computed_keys);
         head = Box::new(Project::new(extended, head));
     }
-    if let Err(error) = ValuesScan::new(rows).run(head.as_mut()) {
-        // The rows the projection answered before the one it failed on are kept
-        // for whoever reports the failure; a sort or a `DISTINCT` above it that
-        // had not emitted yet has left nothing here, as in SQLite.
-        crate::physical::keep_partial_rows(std::mem::take(&mut *collected.borrow_mut()));
-        return Err(error);
-    }
-    let answer = collected.borrow().clone();
-    Ok((
-        answer,
-        Shape {
-            names: select
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect(),
-            operators: vec![
-                "SCAN".to_string(),
-                "SORT".to_string(),
-                "WINDOW".to_string(),
-                "PROJECT".to_string(),
-            ],
-        },
-    ))
+    Ok(head)
 }

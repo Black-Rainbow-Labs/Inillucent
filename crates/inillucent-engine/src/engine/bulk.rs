@@ -31,16 +31,18 @@
 //! the commit. The table's indexes are rebuilt the same way, from entries
 //! sorted the way `CREATE INDEX` sorts them.
 
+use crate::index_sort::EntrySorter;
 use inillucent_base::error::refusal;
 use inillucent_base::DbResult;
 use inillucent_catalog::paged::SchemaEntry;
 use inillucent_exec::dml::bulk::BulkRows;
 use inillucent_exec::dml::{self, Changes, Row};
+use inillucent_exec::gather::{Gathered, SpooledRows};
 use inillucent_exec::insert_plan::RowSource;
 use inillucent_exec::packed::PackedRows;
 use inillucent_exec::physical::Params;
 use inillucent_pool::PageId;
-use inillucent_sql::catalog_view::{IndexInfo, TableInfo};
+use inillucent_sql::catalog_view::{IndexInfo, TableInfo, TableKind};
 use inillucent_sql::dml::BoundInsert;
 use inillucent_tree::datum::{Datum, OwnedDatum};
 use inillucent_tree::paged::KeyEncoding;
@@ -64,16 +66,33 @@ use crate::*;
 /// so the numbers moved by up to 40% between runs; the crossover did not.
 const BULK_FLOOR: usize = 1_024;
 
-/// The rows an `INSERT`'s source produced, one vector a row or packed.
+/// The rows an `INSERT`'s source produced, one vector a row, packed, or in a transient file.
 ///
 /// Packed when the source is a `SELECT` the bulk build could take (task-2226); see
 /// [`PackedRows`]. The ordinary insert takes rows one vector each, so a packed set the bulk
-/// build declines is unpacked for it.
+/// build declines is unpacked for it. A source past the byte limit of [`inillucent_exec::gather`]
+/// is in a file and is read back a row at a time, by the ordinary insert only: the bulk build needs
+/// every row at once.
 pub(crate) enum Collected {
     /// One vector a row.
     Rows(Vec<Row>),
     /// Every row in two vectors.
     Packed(PackedRows),
+    /// Every row in a transient file.
+    Spooled(SpooledRows),
+}
+
+impl From<Gathered> for Collected {
+    /// Names what a collection of an insert's source produced.
+    ///
+    /// @param gathered - the collection
+    fn from(gathered: Gathered) -> Collected {
+        match gathered {
+            Gathered::Rows(rows) => Collected::Rows(rows),
+            Gathered::Packed(packed) => Collected::Packed(packed),
+            Gathered::Spooled(spooled) => Collected::Spooled(spooled),
+        }
+    }
 }
 
 impl Collected {
@@ -82,6 +101,7 @@ impl Collected {
         match self {
             Collected::Rows(rows) => rows.len(),
             Collected::Packed(packed) => packed.len(),
+            Collected::Spooled(spooled) => usize::try_from(spooled.len()).unwrap_or(usize::MAX),
         }
     }
 
@@ -91,10 +111,14 @@ impl Collected {
     }
 
     /// Returns the rows one vector each, for the ordinary insert.
-    fn into_rows(self) -> Vec<Row> {
+    ///
+    /// A set in a file is read back whole, which is why a statement that can stream does not call
+    /// this.
+    pub(crate) fn into_rows(self) -> DbResult<Vec<Row>> {
         match self {
-            Collected::Rows(rows) => rows,
-            Collected::Packed(packed) => packed.into_rows(),
+            Collected::Rows(rows) => Ok(rows),
+            Collected::Packed(packed) => Ok(packed.into_rows()),
+            Collected::Spooled(spooled) => spooled.collect(),
         }
     }
 }
@@ -105,6 +129,106 @@ impl Collected {
 fn packed_sources(packed: &PackedRows) -> impl Iterator<Item = RowSource<'_>> {
     (0..packed.len()).map(move |row| RowSource::Packed(packed, row))
 }
+
+/// The failure for rows in a file reaching the bulk build, which `insert_in_bulk` declines first.
+fn never_bulk_built() -> dml::bulk::BulkFailure {
+    dml::bulk::BulkFailure {
+        error: refusal("rows held in a file were offered to the bulk build"),
+        last_rowid: None,
+    }
+}
+
+/// One index tree of a streamed bulk build: where its entries come from and where they are sorted.
+struct StreamedIndex {
+    /// The index's position in `TableInfo::indexes`.
+    position: usize,
+    /// The handle the index's tree is registered under.
+    root: u32,
+    /// The index tree's column directory.
+    columns: Vec<ColumnSpec>,
+    /// How the index tree's columns map onto the table's.
+    layout: SourceLayout,
+    /// The table tree slots an entry is read from, or none when the evaluator computed it.
+    slots: Option<Vec<usize>>,
+    /// The entries, sorted in runs when there are too many for memory.
+    sorter: EntrySorter,
+}
+
+/// The images of a streamed bulk build, handed to the tree builder a chunk at a time.
+struct ImageChunks<'a> {
+    /// Builds and checks each image.
+    stream: dml::bulk::BulkStream,
+    /// The bound insert.
+    statement: &'a BoundInsert,
+    /// The source rows.
+    spooled: SpooledRows,
+    /// The index trees, which take an entry from every image.
+    builds: &'a mut Vec<StreamedIndex>,
+}
+
+impl inillucent_tree::paged::RowChunks for ImageChunks<'_> {
+    fn for_each_chunk(
+        &mut self,
+        each: &mut dyn for<'d> FnMut(&dyn inillucent_tree::leaf::Rows<'d>) -> DbResult<()>,
+    ) -> DbResult<()> {
+        let per_chunk = inillucent_exec::spill::chunk_rows(CHUNK_IMAGES);
+        loop {
+            let mut packed = PackedRows::new();
+            let mut taken = 0usize;
+            while taken < per_chunk {
+                let Some(row) = self.spooled.next() else {
+                    break;
+                };
+                let streamed = match self.stream.add(self.statement, row?) {
+                    Ok(Some(streamed)) => streamed,
+                    Ok(None) => continue,
+                    Err(dml::bulk::StreamFailure::Failed(failure)) => return Err(failure.error),
+                    Err(dml::bulk::StreamFailure::NotIncreasing) => {
+                        return Err(refusal(
+                            "the rows of a copy changed order between two reads",
+                        ))
+                    }
+                };
+                for build in self.builds.iter_mut() {
+                    let mut entry: Vec<Datum<'_>> = Vec::new();
+                    match &build.slots {
+                        Some(slots) => entry.extend(slots.iter().map(|slot| {
+                            streamed
+                                .image
+                                .get(*slot)
+                                .map_or(Datum::Null, OwnedDatum::borrow)
+                        })),
+                        None => match streamed
+                            .entries
+                            .iter()
+                            .find(|(at, _)| *at == build.position)
+                        {
+                            Some((_, computed)) => {
+                                entry.extend(computed.iter().map(OwnedDatum::borrow))
+                            }
+                            None => continue,
+                        },
+                    }
+                    build.sorter.push(&entry)?;
+                }
+                if !packed.push_owned(&streamed.image) {
+                    return Err(refusal(
+                        "a row built for a bulk insert is not as wide as the rows before it",
+                    ));
+                }
+                taken = taken.saturating_add(1);
+            }
+            if taken == 0 {
+                return Ok(());
+            }
+            let view: &PackedRows = &packed;
+            each(&view)?;
+        }
+    }
+}
+
+/// How many images are handed to the tree builder at a time.
+const CHUNK_IMAGES: usize = 16 * 1024;
 
 /// What [`ImportedDatabase::insert_in_bulk`] did with a statement.
 enum Bulk {
@@ -147,16 +271,33 @@ impl ImportedDatabase {
     ) -> DbResult<Outcome> {
         let rows = match self.insert_in_bulk(statement, params, rows)? {
             Bulk::Done(outcome) => return Ok(outcome),
-            Bulk::Declined(rows) => rows.into_rows(),
+            Bulk::Declined(rows) => rows,
+        };
+        // **A source in a file is written a row at a time, inside the one write view.** Anything
+        // else is a slice, as it always was. A view is written through its `INSTEAD OF` trigger,
+        // which takes the rows as a slice, so a view's source is read back whole.
+        let mut rows = match rows {
+            Collected::Spooled(spooled) if statement.table.kind == TableKind::View => {
+                Collected::Rows(spooled.collect::<DbResult<Vec<Row>>>()?)
+            }
+            other => other,
         };
         self.write(
             params,
             returning_names(&statement.returning),
-            |target, params| match cache {
-                Some(cache) => {
-                    dml::insert::cached::insert_cached(statement, target, params, &rows, cache)
+            |target, params| match &mut rows {
+                Collected::Spooled(spooled) => {
+                    dml::insert::cached::insert_streamed(statement, target, params, spooled, cache)
                 }
-                None => dml::insert(statement, target, params, &rows),
+                other => {
+                    let held = std::mem::replace(other, Collected::Rows(Vec::new())).into_rows()?;
+                    match cache {
+                        Some(cache) => dml::insert::cached::insert_cached(
+                            statement, target, params, &held, cache,
+                        ),
+                        None => dml::insert(statement, target, params, &held),
+                    }
+                }
             },
         )
     }
@@ -196,6 +337,9 @@ impl ImportedDatabase {
         params: &Params,
         rows: Collected,
     ) -> DbResult<Bulk> {
+        if matches!(rows, Collected::Spooled(_)) {
+            return self.insert_in_bulk_streamed(statement, params, rows);
+        }
         if rows.len() < BULK_FLOOR || !dml::bulk::bulk_shape_with(statement, !rows.is_empty()) {
             return Ok(Bulk::Declined(rows));
         }
@@ -210,6 +354,7 @@ impl ImportedDatabase {
                 Collected::Packed(packed) => {
                     dml::bulk::bulk_rows(statement, view, params, packed_sources(packed))
                 }
+                Collected::Spooled(_) => Err(never_bulk_built()),
             });
             match built {
                 Ok(built) => (built, Some(rows)),
@@ -221,6 +366,7 @@ impl ImportedDatabase {
                 Collected::Packed(packed) => {
                     dml::bulk::bulk_rows(statement, view, params, packed_sources(&packed))
                 }
+                Collected::Spooled(_) => Err(never_bulk_built()),
             });
             match built {
                 Ok(built) => (built, None),
@@ -323,14 +469,31 @@ impl ImportedDatabase {
         built: BulkRows,
         indexes: Vec<IndexBuild>,
     ) -> DbResult<Outcome> {
+        let count = built.rows.len();
+        self.apply_bulk_with(table, count, built.last_rowid, |database| {
+            database.replace_trees(table, &built.rows, indexes)
+        })
+    }
+
+    /// Runs the part of a bulk build that writes, and settles the statement after it.
+    ///
+    /// @param table - the table being written
+    /// @param count - how many rows the statement writes
+    /// @param last_rowid - the rowid of the last row kept, in input order
+    /// @param write - builds the trees
+    fn apply_bulk_with(
+        &mut self,
+        table: &TableInfo,
+        count: usize,
+        last_rowid: Option<i64>,
+        write: impl FnOnce(&mut Self) -> DbResult<()>,
+    ) -> DbResult<Outcome> {
         let autocommit = self.writing.batch().is_none();
         let mark = self.statement_mark();
         let txn = self.current_txn();
         let previous = self.schema.ddl_schema;
         self.schema.ddl_schema = table.database;
-        let written = self
-            .replace_trees(table, &built.rows, indexes)
-            .and_then(|()| self.seal());
+        let written = write(self).and_then(|()| self.seal());
         self.schema.ddl_schema = previous;
         if let Err(error) = written {
             let undone = self.undo_to_floor(mark, true, txn);
@@ -346,18 +509,226 @@ impl ImportedDatabase {
             // now, and a later `ROLLBACK` must not reach its before-images.
             self.writing.undo().borrow_mut().clear();
         }
-        let count = built.rows.len();
-        self.remember_rowid(built.last_rowid);
+        self.remember_rowid(last_rowid);
         self.record_changes(count as i64, count as i64);
         Ok(Outcome {
             rows: Vec::new(),
             names: std::rc::Rc::new(Vec::new()),
             changes: Changes {
                 rows: count,
-                last_rowid: built.last_rowid,
+                last_rowid,
                 ..Default::default()
             },
         })
+    }
+
+    /// Builds an empty table's tree from an `INSERT ... SELECT` whose source is in a file.
+    ///
+    /// **The fast path for a copy too large to hold, which reads its source twice.** The first pass
+    /// builds and checks every row in input order and keeps nothing, so a constraint that fails is
+    /// found, and named, before a page is written, exactly as the bulk build names it. The second
+    /// builds each row again and hands the images to the tree builder a chunk at a time, while the
+    /// entries of the table's indexes go to sorters that write runs past a byte limit. The rows
+    /// must arrive with increasing rowids, which an `INSERT ... SELECT` from a rowid table and one
+    /// that lets every rowid be allocated both produce; any other order is handed back to the
+    /// ordinary insert, which needs no order, having written nothing.
+    ///
+    /// A table with a `UNIQUE` index is not built this way, because the ordinary insert names the
+    /// constraint SQLite names when two fail on different rows.
+    ///
+    /// @param statement - the bound insert
+    /// @param params - the bound parameters
+    /// @param rows - the source rows, which are in a file
+    fn insert_in_bulk_streamed(
+        &mut self,
+        statement: &BoundInsert,
+        params: &Params,
+        rows: Collected,
+    ) -> DbResult<Bulk> {
+        let Collected::Spooled(mut spooled) = rows else {
+            return Ok(Bulk::Declined(rows));
+        };
+        let table = &statement.table;
+        let txn = self.current_txn();
+        let ready = dml::bulk::bulk_shape_with(statement, true)
+            && !dml::bulk::has_unique_index(table)
+            && self.with_write_view(txn, |view| dml::bulk::bulk_target_ready(statement, view))?;
+        if !ready {
+            return Ok(Bulk::Declined(Collected::Spooled(spooled)));
+        }
+        let checked = self.with_write_view(txn, |view| {
+            let mut stream = dml::bulk::BulkStream::open(statement, view, params)?;
+            for row in &mut spooled {
+                let row = row.map_err(|error| dml::bulk::BulkFailure {
+                    error,
+                    last_rowid: stream.last_rowid(),
+                })?;
+                match stream.add(statement, row) {
+                    Ok(_) => {}
+                    Err(dml::bulk::StreamFailure::NotIncreasing) => return Ok(None),
+                    Err(dml::bulk::StreamFailure::Failed(failure)) => return Err(failure),
+                }
+            }
+            Ok(Some((stream.kept(), stream.last_rowid())))
+        });
+        spooled.rewind();
+        let (count, last_rowid) = match checked {
+            Ok(Some(counted)) => counted,
+            Ok(None) => return Ok(Bulk::Declined(Collected::Spooled(spooled))),
+            Err(failure) => {
+                // What the ordinary insert's failure path records: the last rowid it wrote, and
+                // no rows changed.
+                self.remember_rowid(failure.last_rowid);
+                self.record_changes(0, 0);
+                return Err(failure.error);
+            }
+        };
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        inillucent_exec::gather::note_streamed_build();
+        self.apply_bulk_with(table, count, last_rowid, |database| {
+            database.replace_trees_streamed(statement, params, spooled)
+        })
+        .map(Bulk::Done)
+    }
+
+    /// Builds the table's tree and its indexes' trees from a source in a file, a chunk at a time.
+    ///
+    /// The shape of [`Self::replace_trees`], with the images built as the table's tree is built.
+    ///
+    /// @param statement - the bound insert
+    /// @param params - the bound parameters
+    /// @param spooled - the source rows, positioned at the first
+    fn replace_trees_streamed(
+        &mut self,
+        statement: &BoundInsert,
+        params: &Params,
+        spooled: SpooledRows,
+    ) -> DbResult<()> {
+        let table = &statement.table;
+        let root = table.root;
+        let covering = self.schema.covering.get(&root).cloned().unwrap_or_default();
+        let (columns, key_columns) = self
+            .schema
+            .trees
+            .get(&root)
+            .map(|tree| (tree.columns().to_vec(), tree.key_columns()))
+            .ok_or_else(|| refusal("no tree for the table being built"))?;
+        let layout = self
+            .schema
+            .layouts
+            .get(&root)
+            .map(|held| (**held).clone())
+            .ok_or_else(|| refusal("no layout for the table being built"))?;
+        let table_layout = self
+            .schema
+            .layouts
+            .get(&root)
+            .cloned()
+            .ok_or_else(|| refusal("no layout for the table being built"))?;
+        let mut builds = self.streamed_index_builds(table, &table_layout)?;
+        let txn = self.current_txn();
+        let stream = self
+            .with_write_view(txn, |view| {
+                dml::bulk::BulkStream::open(statement, view, params)
+            })
+            .map_err(|failure| failure.error)?;
+        let mut handles = vec![root];
+        self.release_tree(root)?;
+        let mut chunks = ImageChunks {
+            stream,
+            statement,
+            spooled,
+            builds: &mut builds,
+        };
+        self.build_tree_chunks(root, columns, key_columns, layout, &mut chunks)?;
+        for build in builds {
+            let StreamedIndex {
+                root: handle,
+                columns,
+                layout,
+                sorter,
+                ..
+            } = build;
+            let width = columns.len();
+            let entries = sorter.finish()?;
+            entries.refuse_long_keys(&columns, width)?;
+            self.release_tree(handle)?;
+            self.build_tree_from_entries(handle, columns, width, layout, &entries)?;
+            handles.push(handle);
+        }
+        if !covering.is_empty() {
+            self.schema.covering.insert(root, covering);
+            self.sort_covering(root);
+        }
+        for handle in handles {
+            self.record_new_root(table.database, handle)?;
+        }
+        Ok(())
+    }
+
+    /// Returns a sorter for each index tree the table has, and where its entries come from.
+    ///
+    /// @param table - the table being written
+    /// @param table_layout - the table's layout, which says where each column is
+    fn streamed_index_builds(
+        &self,
+        table: &TableInfo,
+        table_layout: &SourceLayout,
+    ) -> DbResult<Vec<StreamedIndex>> {
+        let mut builds = Vec::new();
+        for (position, index) in table.indexes.iter().enumerate() {
+            if index.root == 0 || index.root == table.root {
+                continue;
+            }
+            let (columns, layout) = index_shape(table, index, index.root);
+            let width = columns.len();
+            let collations: Vec<Collation> = columns.iter().map(|spec| spec.collation).collect();
+            let directions: Vec<bool> = columns.iter().map(|spec| spec.descending).collect();
+            let encoding = KeyEncoding::choose(&columns, width);
+            let computed = index.partial_sql.is_some()
+                || index.columns.iter().any(|key| key.expr_sql.is_some());
+            let slots = if computed {
+                None
+            } else {
+                let mut slots: Vec<usize> =
+                    Vec::with_capacity(index.columns.len().saturating_add(1));
+                for key in &index.columns {
+                    let slot = key
+                        .column
+                        .and_then(|declared| {
+                            table_layout
+                                .slots
+                                .get(usize::from(declared))
+                                .copied()
+                                .flatten()
+                        })
+                        .ok_or_else(|| refusal("an index on a column the tree does not carry"))?;
+                    slots.push(slot);
+                }
+                slots.push(
+                    table_layout
+                        .rowid
+                        .ok_or_else(|| refusal("an index on a table that identifies no row"))?,
+                );
+                Some(slots)
+            };
+            builds.push(StreamedIndex {
+                position,
+                root: index.root,
+                columns,
+                layout,
+                slots,
+                sorter: EntrySorter::new(
+                    width,
+                    0,
+                    encoding,
+                    &collations,
+                    &directions,
+                    inillucent_exec::physical::TreeCatalog::spill(self),
+                ),
+            });
+        }
+        Ok(builds)
     }
 
     /// Releases the table's empty trees, builds the full ones under the same

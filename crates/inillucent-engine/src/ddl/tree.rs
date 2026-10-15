@@ -15,6 +15,17 @@ use inillucent_tree::PagedTree;
 
 use crate::*;
 
+/// Writes the pages of a tree and returns it: the file, where the log records go, the tree's number in
+/// the file, the column directory, and how many leading columns form the key.
+type TreeConstructor<'a> = dyn FnMut(
+        &mut inillucent_pool::Database,
+        Option<&mut dyn inillucent_tree::write::TreeLog>,
+        u64,
+        Vec<ColumnSpec>,
+        usize,
+    ) -> DbResult<PagedTree>
+    + 'a;
+
 impl crate::ImportedDatabase {
     /// Builds one empty tree and registers it.
     ///
@@ -80,6 +91,78 @@ impl crate::ImportedDatabase {
         layout: SourceLayout,
         rows: &dyn inillucent_tree::leaf::Rows<'d>,
     ) -> DbResult<PageId> {
+        self.build_tree_with(
+            root,
+            columns,
+            key_columns,
+            layout,
+            &mut |database, log, local, columns, key_columns| {
+                // The data file is synced by `commit_across` before the commit, once for every
+                // tree the transaction built.
+                PagedTree::bulk_build_rows_syncing(
+                    database,
+                    log,
+                    local,
+                    columns,
+                    key_columns,
+                    rows,
+                    false,
+                )
+            },
+        )
+    }
+    /// Builds a tree from sorted rows that arrive a chunk at a time.
+    ///
+    /// The form a `CREATE INDEX` uses when its entries did not fit in memory and were sorted in
+    /// runs: the builder holds one chunk, so the entries are never all resident. Everything about
+    /// registering the tree is [`Self::build_tree_rows`].
+    ///
+    /// @param root - the identifier the tree is registered under
+    /// @param columns - the column directory, key columns first
+    /// @param key_columns - how many leading columns form the key
+    /// @param layout - how the tree's columns map onto the table's
+    /// @param chunks - the rows, in key order
+    pub(crate) fn build_tree_chunks(
+        &mut self,
+        root: u32,
+        columns: Vec<ColumnSpec>,
+        key_columns: usize,
+        layout: SourceLayout,
+        chunks: &mut dyn inillucent_tree::paged::RowChunks,
+    ) -> DbResult<PageId> {
+        self.build_tree_with(
+            root,
+            columns,
+            key_columns,
+            layout,
+            &mut |database, log, local, columns, key_columns| {
+                PagedTree::bulk_build_chunks(
+                    database,
+                    log,
+                    local,
+                    columns,
+                    key_columns,
+                    chunks,
+                    false,
+                )
+            },
+        )
+    }
+    /// Builds a tree with the constructor it is given and registers it.
+    ///
+    /// @param root - the identifier the tree is registered under
+    /// @param columns - the column directory, key columns first
+    /// @param key_columns - how many leading columns form the key
+    /// @param layout - how the tree's columns map onto the table's
+    /// @param construct - writes the pages and returns the tree
+    fn build_tree_with(
+        &mut self,
+        root: u32,
+        columns: Vec<ColumnSpec>,
+        key_columns: usize,
+        layout: SourceLayout,
+        construct: &mut TreeConstructor<'_>,
+    ) -> DbResult<PageId> {
         let at = self.schema.ddl_schema;
         let local = self.local_of(at, root);
         let tree = {
@@ -100,9 +183,7 @@ impl crate::ImportedDatabase {
                 session,
                 at,
             )?;
-            // The data file is synced by `commit_across` before the commit, once for every tree
-            // the transaction built.
-            PagedTree::bulk_build_rows_syncing(
+            construct(
                 database,
                 Some(&mut log),
                 // **The file's own number, not the connection's.** Every record
@@ -111,8 +192,6 @@ impl crate::ImportedDatabase {
                 local,
                 columns,
                 key_columns,
-                rows,
-                false,
             )?
         };
         // In a file that keeps its roots at the start, the root goes to the first

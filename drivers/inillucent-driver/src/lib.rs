@@ -85,9 +85,9 @@ pub use error::{Error, Result, Status};
 /// The engine's own row consumer and the borrowed value it is handed, for the shell, which
 /// streams the rows of a statement it prepared on the engine's statement.
 pub use inillucent_engine::connect::{Flow, RowConsumer};
-pub use inillucent_engine::Datum;
 /// Drops the embedder's and the reranker's loaded model sessions; see `inillucent_search::release_models`.
 pub use inillucent_engine::release_models;
+pub use inillucent_engine::Datum;
 pub use introspect::{Item, Kind, Table};
 pub use rows::Rows;
 pub use shared::{SharedConnection, SharedDatabase, SharedTransaction};

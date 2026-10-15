@@ -648,28 +648,32 @@ impl ImportedDatabase {
         physical::run_any_prepared_streaming(plan, self, prepared, params, consumer)
     }
 
-    /// [`ImportedDatabase::run_cached_query`] for an `INSERT ... SELECT` the bulk build can
-    /// take, collecting into packed rows when the chain is compiled.
+    /// [`ImportedDatabase::run_cached_query`] for the source of an `INSERT ... SELECT`, collecting
+    /// the rows packed or one vector a row, and in a transient file when they are too many to hold.
     ///
-    /// The slot is tried and remembered exactly as `run_cached_query` does. A query that has
-    /// no compiled chain, or whose chain is in use, answers rows one vector each, as before
-    /// (task-2226).
+    /// The slot is tried and remembered exactly as `run_cached_query` does. A query that has no
+    /// compiled chain, or whose chain is in use, answers rows one vector each, as before
+    /// (task-2226); only a compiled chain can move its rows to a file, because the collection is
+    /// the chain's own last operator. A source that is a compound or has a window function is run
+    /// by its own functions and answers a vector.
     ///
     /// @param plan - the planner's output
     /// @param prepared - the structural choice `prepare` made
     /// @param slot - this query's compiled chain cache
     /// @param params - the bound parameters
-    pub(crate) fn run_cached_query_packed(
+    /// @param packed - whether the bulk build could take the rows, which are then packed
+    pub(crate) fn run_cached_query_gathered(
         &self,
         plan: &PhysicalPlan,
         prepared: &physical::Prepared,
         slot: &std::cell::RefCell<physical::Slot>,
         params: &Params,
+        packed: bool,
     ) -> DbResult<crate::engine::bulk::Collected> {
         use crate::engine::bulk::Collected;
         let Ok(mut held) = slot.try_borrow_mut() else {
-            let rows = physical::run_any_prepared(plan, self, prepared, params)?.0;
-            return Ok(Collected::Rows(rows));
+            return physical::run_any_gathered(plan, self, prepared, params, packed)
+                .map(Collected::from);
         };
         if let physical::Slot::Reusable(compiled) = &*held {
             if !compiled.built_under(params) {
@@ -679,26 +683,25 @@ impl ImportedDatabase {
         match &mut *held {
             physical::Slot::Reusable(compiled) => {
                 return compiled
-                    .run_packed(plan, self, params)
-                    .map(Collected::Packed);
+                    .run_gathered(plan, self, params, packed)
+                    .map(Collected::from);
             }
             physical::Slot::Never => {}
             physical::Slot::Untried => match physical::try_compile(plan, self, prepared, params)? {
                 Some(mut compiled) => {
-                    let packed = compiled.run_packed(plan, self, params)?;
+                    let gathered = compiled.run_gathered(plan, self, params, packed)?;
                     *held = if compiled.rebindable() {
                         physical::Slot::Reusable(Box::new(compiled))
                     } else {
                         physical::Slot::Never
                     };
-                    return Ok(Collected::Packed(packed));
+                    return Ok(Collected::from(gathered));
                 }
                 None => *held = physical::Slot::Never,
             },
         }
         drop(held);
-        let rows = physical::run_any_prepared(plan, self, prepared, params)?.0;
-        Ok(Collected::Rows(rows))
+        physical::run_any_gathered(plan, self, prepared, params, packed).map(Collected::from)
     }
 }
 
