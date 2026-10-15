@@ -8,11 +8,11 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## Unreleased
+## 2.8.0, 15 October 2026
 
 **A query that fails partway returns the rows before the failure through the C library and the
 Python, Node, PHP and Go packages.** SQLite hands out every row ahead of the one that raised the
-error and then reports the error, and the Rust driver and the command line already did the same.
+error and then reports the error, as the Rust driver and the command line now do (see below).
 The C library dropped those rows, so a query that failed on its 4th row gave a Python, Node or C
 caller the error and none of the first 3 rows. `inillucent_error_take_rows` (ABI 1.5.0, provisional)
 returns them once as a result the caller frees with `inillucent_rows_free`, and returns `NULL` when
@@ -20,6 +20,41 @@ the statement failed before its first row. The Python `DriverError.partial` is a
 C library and a list of dictionaries through the command line helper `query`. The Node error has an
 array of row objects as `partial`, the PHP `Error::$partial` is a list of associative arrays, and the
 Go `Error.Partial` is a slice of maps. Each is empty or `null` when no row came before the failure.
+
+**A query that fails partway returns the rows it produced before the failure, then the error.**
+SQLite hands out every row ahead of the one that raised the error and then reports the error. The
+Rust driver and the command line reported only the error. In Rust, `Error` has a new field,
+`partial`, which holds those rows cut to the same `limit` as a success. It is `None` when the failure
+came before the first row and for a statement that is not a query. `Error` no longer implements
+`Eq`, because `partial` can hold floating point values. `==` still works through `PartialEq`, but code
+that needs `Error: Eq`, such as a generic bound or a key in a `HashSet`, has to change. `inillucent query` and the MCP tools return the rows in
+the `rows` member of the failure, and the shell prints them before the error. A sort, an aggregate,
+`UNION`, `INTERSECT` and `EXCEPT` build their whole answer first, so they return no rows before an
+error.
+
+**An `UPDATE ... FROM` in a trigger body writes the joined values.** The body statement was run
+with only its target table, so the `FROM` table its assignments named did not exist when the body
+ran. It now joins its `FROM` terms as the same statement does outside a
+trigger. Four differential cases compare it with SQLite, with `BEFORE` and
+`AFTER` triggers, `new` and `old` values, and a `FROM` table that matches a row more than once.
+
+**A trigger that writes a second table with a vector index updates that table's index.** A row a
+trigger body inserted, updated or deleted in another table that had its own vector index was
+applied to the index of the table that fired the trigger, so the second table's index lost the
+row or kept an old vector, and a search over it returned wrong rows. Each write now goes to the
+index of the table it changed.
+
+**`PRAGMA integrity_check` compares search tables and vector indexes with their rows.** An
+`inillucent_search` table whose index had lost a row, or a vector index missing a row its table
+still had, passed the check. Both are now reported by name.
+
+**A cosine table accepts a query vector of any length.** The table scaled the stored vectors to
+length 1 and used the query vector as it was passed, so the order of the hits was right but
+`confidence(docs)` changed with the query vector's length: 0.517 for `'[0.2, 0, 0]'` against 0.753
+for `'[1, 0, 0]'`. The query vector is now scaled to length 1 too, and both give the same answer. A
+query vector of length 0 is used as given, and an `l2` table still uses the query vector as given,
+because length is part of an L2 distance.
+
 New tests fail each package's call when the rows are missing.
 
 **`LIMIT` with `OFFSET` no longer evaluates the select list of the rows it skips.** In
@@ -203,6 +238,8 @@ or fetches more. The test that a key is stored out of line is now inlined into t
 leaf's key with a probe, and the delta area tests one tag byte before it slices a row. Each was a
 function call and a returned `Result` for every key column of every comparison, and together they
 were about 5% of `write.insert.batch` once keys could be stored out of line.
+
+## 2.7.0, 14 October 2026
 
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;
