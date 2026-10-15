@@ -229,7 +229,8 @@ fn produce(
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
     let held = match collected {
         Ok(held) => held,
-        Err((failure, before)) => {
+        Err(failed) => {
+            let (failure, before) = *failed;
             return Err(failed_after_rows(
                 context, command, &failure, before, limit, elapsed,
             ))
