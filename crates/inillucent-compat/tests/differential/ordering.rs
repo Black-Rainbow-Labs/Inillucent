@@ -143,7 +143,7 @@ const STATEMENTS: &[&str] = &[
     "SELECT plain.a, j.k FROM plain, (SELECT 1 k) j",
     // A recursive term stays the outer loop. Sizing the subquery as one row put
     // it first, and the recursion, which only the `LIMIT` ends, never stopped.
-    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r)      SELECT n, n*2 FROM r, (SELECT 1) WHERE n > 3 LIMIT 2",
+    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n, n*2 FROM r, (SELECT 1) WHERE n > 3 LIMIT 2",
     "SELECT t.id, j.k FROM t, (SELECT 1 k UNION ALL SELECT 2) j",
     // Shapes where the order is not the walk's, and the sort has to stay.
     "SELECT k, id FROM t ORDER BY note",
