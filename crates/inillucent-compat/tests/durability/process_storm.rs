@@ -37,8 +37,13 @@ use inillucent_compat::storm::{run, Storm};
 use inillucent_compat::workspace_root;
 
 /// Returns `inillucent-chaos`, which cargo builds for this package's tests.
+///
+/// `STORM_CHAOS` names a copy of it instead, so a long reproduction can keep
+/// running from a snapshot while the build directory is rebuilt.
 fn chaos() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_inillucent-chaos"))
+    std::env::var_os("STORM_CHAOS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_inillucent-chaos")))
 }
 
 /// Returns a directory of this case's own, emptied first.

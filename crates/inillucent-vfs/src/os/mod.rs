@@ -659,6 +659,15 @@ impl VfsFile for OsFile {
         None
     }
 
+    /// Moves the shared log segment's token on, so a connection of this process that last saw the
+    /// segment quiet checks it again.
+    fn end_quiet(&self) {
+        #[cfg(windows)]
+        if let Some(share) = &self.log {
+            share.end_quiet();
+        }
+    }
+
     /// Sets the file's length.
     fn truncate(&self, size: u64) -> VfsResult<()> {
         self.require_writable(VfsOperation::Truncate)?;

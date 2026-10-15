@@ -568,23 +568,22 @@ pub struct Distinct {
     /// here has to resist a chosen key - see `inillucent_base::table_hash` for what
     /// that buys and what it gives up.
     seen: inillucent_base::table_hash::TableSet<Vec<u8>>,
-    pub(crate) rows: Vec<Vec<OwnedDatum>>,
     downstream: Box<dyn Sink>,
     /// Where files come from, when the caller gave this operator somewhere to put them.
     spill: Option<std::rc::Rc<dyn crate::spill::Spill>>,
-    /// Roughly how many bytes the key set and the rows occupy.
+    /// Roughly how many bytes the key set occupies.
     held: u64,
-    /// How many bytes the key set and the rows may occupy before they move to runs.
+    /// How many bytes the key set may occupy before the rows go to runs.
     limit: u64,
     /// The rows once the set passed its limit: sorted by key in runs, not hashed.
     external: Option<ExternalDistinct>,
 }
 
-/// How many bytes `Distinct` holds in its key set and its rows before it sorts in runs.
+/// How many bytes `Distinct` holds in its key set before it sorts in runs.
 ///
-/// **Half of what `Sort` holds.** The key set and the rows are held at the same time, and when the
-/// limit is passed the rows move to a sorter that holds as much again, so the peak is the limit
-/// twice over.
+/// **Half of what `Sort` holds.** Rows go downstream as they are found, so only the keys are held.
+/// When the limit is passed the keys move to a sorter that holds as much again, so the peak is the
+/// limit twice over.
 const DISTINCT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// What a `Distinct` that passed its limit is doing.
@@ -634,26 +633,6 @@ fn same_key(earlier: &[OwnedDatum], later: &[OwnedDatum]) -> bool {
     )
 }
 
-/// Returns the encoded key of a row that is already owned.
-///
-/// The same bytes `Distinct::push` builds from a batch, so a row that went into the hash set and a
-/// row that arrives after the switch to runs agree about what a duplicate is.
-///
-/// @param row - the row
-/// @param compared - how many leading columns decide whether the row is a duplicate
-/// @param collations - the collation of each compared column
-fn encoded_key(row: &[OwnedDatum], compared: usize, collations: &[Collation]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(32);
-    for (column, value) in row.iter().take(compared).enumerate() {
-        key::encode_into_with(
-            &value.borrow(),
-            collations.get(column).copied().unwrap_or(Collation::Binary),
-            &mut encoded,
-        );
-    }
-    encoded
-}
-
 /// Returns a row laid out for the first sorter: the key, the arrival number, then the row.
 ///
 /// @param key - the encoded key
@@ -689,7 +668,6 @@ impl Distinct {
             collations,
             compared,
             seen: inillucent_base::table_hash::TableSet::default(),
-            rows: Vec::new(),
             downstream,
             spill: None,
             held: 0,
@@ -709,9 +687,12 @@ impl Distinct {
         self
     }
 
-    /// Moves the rows and keys held to a sorter, once they have passed the limit.
+    /// Moves the keys held to a sorter, once they have passed the limit.
     ///
-    /// The hash set is dropped, not cleared, so its memory goes back before the sorter fills.
+    /// **The rows those keys stand for have been emitted already**, so each key goes to the sorter
+    /// as a marker that sorts before any later row of its key (arrival number -1, no row), and the
+    /// merge drops every row of a key that has one. The hash set is dropped, not cleared, so its
+    /// memory goes back before the sorter fills.
     fn go_external(&mut self) -> DbResult<()> {
         let Some(spill) = self.spill.clone() else {
             return Ok(());
@@ -722,18 +703,12 @@ impl Distinct {
             self.limit,
         )
         .with_redundant(same_key);
-        self.seen = inillucent_base::table_hash::TableSet::default();
-        let mut arrival = 0i64;
-        for row in std::mem::take(&mut self.rows) {
-            let encoded = encoded_key(&row, self.compared, &self.collations);
-            first.push(keyed(encoded, arrival, row))?;
-            arrival = arrival.saturating_add(1);
+        let seen = std::mem::take(&mut self.seen);
+        for key in seen {
+            first.push(keyed(key, -1, Vec::new()))?;
         }
         self.held = 0;
-        self.external = Some(ExternalDistinct {
-            first,
-            seq: arrival,
-        });
+        self.external = Some(ExternalDistinct { first, seq: 0 });
         Ok(())
     }
 
@@ -771,7 +746,7 @@ impl Distinct {
         Ok(())
     }
 
-    /// Emits the first row of each key, in the order the keys first arrived.
+    /// Emits the first row of each key that was not emitted before, in the order the keys arrived.
     ///
     /// @param external - the sorter the rows were written to
     fn finish_external(&mut self, external: ExternalDistinct) -> DbResult<()> {
@@ -794,6 +769,10 @@ impl Distinct {
                 return Ok(Flow::Continue);
             }
             previous = Some(key);
+            // A marker is a key whose row was emitted before the switch, and it sorts first.
+            if arrival_of(&row) < 0 {
+                return Ok(Flow::Continue);
+            }
             // Drop the key; the arrival number leads the row the second sorter orders by.
             row.remove(0);
             survivors.push(row)?;
@@ -821,12 +800,19 @@ impl Distinct {
         self.downstream.finish()
     }
 }
-impl Sink for Distinct {
-    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
-        if self.external.is_some() {
-            self.push_external(batch)?;
-            return Ok(Flow::Continue);
-        }
+impl Distinct {
+    /// Finds the rows of one batch that no earlier row duplicates.
+    ///
+    /// Stops at the first row it cannot judge and hands back the rows found
+    /// before it with the failure, so the caller can deliver them first.
+    ///
+    /// @param batch - the rows arriving
+    /// @param fresh - where the surviving rows are added
+    fn collect_fresh(
+        &mut self,
+        batch: &Batch<'_>,
+        fresh: &mut Vec<Vec<OwnedDatum>>,
+    ) -> DbResult<()> {
         let mut encoded = Vec::with_capacity(32);
         let columns = batch.columns.len();
         // A carried column is kept in the row and left out of the key, so it
@@ -860,41 +846,63 @@ impl Sink for Distinct {
             for column in 0..columns {
                 row.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
             }
-            // **Both halves are charged (task-1932, H6).** `DISTINCT` holds
-            // the key set *and* every surviving row until `finish`, so its
-            // memory is decided by how many rows are distinct - which is
-            // the input size whenever they all are.
+            // **Both halves are charged (task-1932, H6).** `DISTINCT` holds the
+            // key set, so its memory is decided by how many rows are distinct -
+            // which is the input size whenever they all are. The row is charged
+            // too, as it was when the rows were held until `finish`, so the limit
+            // a statement hits does not move.
             inillucent_base::budget::materialise(
                 owned_row_bytes(&row).saturating_add(encoded.len() as u64),
             )?;
-            // The row as held, the key as held, and the hash set's slot for it, which is a vector
-            // header, an allocation and a table entry.
+            // The key as held, and the hash set's slot for it, which is a vector header, an
+            // allocation and a table entry.
             self.held = self
                 .held
-                .saturating_add(resident_row_bytes(&row))
                 .saturating_add((encoded.len() as u64).saturating_add(64));
             self.seen.insert(encoded.clone());
-            self.rows.push(row);
+            fresh.push(row);
         }
+        Ok(())
+    }
+}
+impl Sink for Distinct {
+    /// Passes each row on the first time it is seen.
+    ///
+    /// **Rows go downstream as they arrive and are not held until `finish`.**
+    /// SQLite answers a `DISTINCT` row as soon as it is found, so a statement
+    /// that fails on a later row has already returned the rows before it, and a
+    /// `LIMIT` stops the scan once it has enough. Holding every row until the end
+    /// lost the first and read all of the input for the second. The rows found
+    /// before a failing one are delivered, and then the failure is returned.
+    ///
+    /// @param batch - the rows arriving
+    fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
+        if self.external.is_some() {
+            self.push_external(batch)?;
+            return Ok(Flow::Continue);
+        }
+        let mut fresh = Vec::new();
+        let found = self.collect_fresh(batch, &mut fresh);
+        let flow = emit_rows(&fresh, self.downstream.as_mut())?;
         if self.spill.is_some() && self.held >= self.limit {
             self.go_external()?;
         }
-        Ok(Flow::Continue)
+        match (found, flow) {
+            (Err(error), Flow::Continue) => Err(error),
+            (_, flow) => Ok(flow),
+        }
     }
 
     fn finish(&mut self) -> DbResult<()> {
         if let Some(external) = self.external.take() {
             return self.finish_external(external);
         }
-        let rows = std::mem::take(&mut self.rows);
-        emit_rows(&rows, self.downstream.as_mut())?;
         self.downstream.finish()
     }
 
     /// Returns this operator and everything below it to its pre-input state.
     fn reset(&mut self) -> DbResult<()> {
         self.seen.clear();
-        self.rows.clear();
         self.held = 0;
         self.external = None;
         self.downstream.reset()

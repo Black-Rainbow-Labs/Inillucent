@@ -32,6 +32,15 @@
 //!   bytes, and `doclist` is the postings this build used to keep in a
 //!   separate `%_data` row. Reading or writing a term is one row.
 //!
+//! ## Segments
+//!
+//! The rows of `%_idx` below are the base segment, number 0, which every earlier build wrote
+//! and this build still reads. A commit no longer rewrites them. It writes the postings it
+//! added as a new segment, numbered above 0, and merges small segments as the load goes on.
+//! `segment.rs` has the layout, the merge rule and the reasons. A commit of one small row
+//! therefore writes what the row adds, where it used to write the whole list of every word
+//! the row contains.
+//!
 //! ## One row per term, not two
 //!
 //! Building the index used to cost two tree writes per term touched - the
@@ -85,10 +94,12 @@ mod fts3_snippet;
 mod index;
 mod merge;
 mod query;
+mod segment;
 mod snippet;
 
 pub use doclist::{doclist_entries_decoded, reset_doclist_entries_decoded};
 pub use index::{build_stages, decode_sizes, reset_build_stages, Buffer, BuildStages, Pending};
+pub use segment::set_merge_chunk_bytes;
 
 pub mod bm25;
 mod doclist;
@@ -115,13 +126,6 @@ use self::tokenize::Tokenizer;
 
 /// The `%_data` row that holds the totals.
 const TOTALS: i64 = 1;
-/// The segment number the term dictionary uses.
-///
-/// SQLite's `%_idx` keys a term by the segment it is in; this index has one
-/// logical segment, so every term is in segment zero and the key is really the
-/// term. Keeping the column means the table's declaration is the one SQLite
-/// writes, and a reader looking at the schema sees what it expects.
-const SEGMENT: i64 = 0;
 
 /// Which full-text surface a table presents.
 ///
@@ -175,6 +179,11 @@ impl Module for Fts3Module {
     /// The same shadow tables the FTS5 index uses.
     fn shadow_tables(&self, arguments: &ModuleArguments) -> DbResult<Vec<ShadowTable>> {
         Fts5Module.shadow_tables(arguments)
+    }
+
+    /// The query that reads an external content table's rows when they are a view's.
+    fn owner_query(&self, arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+        owner_query_of(arguments)
     }
 
     /// Connects, declaring the FTS3 surface over the FTS5 index.
@@ -262,6 +271,30 @@ impl Module for Fts5Module {
     ) -> DbResult<Box<dyn VirtualTable>> {
         connect_with(arguments, creating, Dialect::Five)
     }
+
+    /// The query that reads an external content table's rows when they are a view's.
+    fn owner_query(&self, arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+        owner_query_of(arguments)
+    }
+}
+
+/// Returns the owner of an external content table and the query that reads its rows.
+///
+/// SQLite reads external content with a query over the named table or view**, so a
+/// view works as an owner. The first column is the rowid, taken from `content_rowid=`
+/// and `rowid` when none was written, and the rest are the columns this table declares,
+/// in declared order. [`content_offsets_named`] reads a view's rows by those positions.
+///
+/// @param arguments - the arguments the table was created with
+fn owner_query_of(arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+    let options = parse_options(&arguments.arguments).ok()?;
+    let owner = options.content?;
+    let quoted =
+        |name: &[u8]| format!("\"{}\"", String::from_utf8_lossy(name).replace('"', "\"\""));
+    let mut selected = vec![quoted(&options.content_rowid)];
+    selected.extend(options.columns.iter().map(|column| quoted(&column.name)));
+    let query = format!("SELECT {} FROM {}", selected.join(", "), quoted(&owner));
+    Some((owner, query))
 }
 
 /// Connects one full-text table, in whichever dialect it was made with.
@@ -457,6 +490,11 @@ fn content_offsets_named(
         return (0..names.len()).map(|at| at.saturating_add(1)).collect();
     };
     let found = catalog.and_then(|catalog| catalog.table_named(&owner.to_ascii_lowercase()));
+    // **A view's rows are the declared columns in declared order** (see `owner_query_of`), so
+    // a column's position in the row is its position in the declaration.
+    if found.is_some_and(|table| table.kind == inillucent_sql::catalog_view::TableKind::View) {
+        return (0..names.len()).collect();
+    }
     names
         .iter()
         .map(|name| {
@@ -706,6 +744,10 @@ impl VirtualTable for Fts5Table {
             &[Value::owned_text(b"version")?, Value::Integer(4)],
         )?;
         layout::stamp(context, &self.shadows)?;
+        // No segment list is written here. VACUUM creates the table again and then copies the
+        // old shadow rows over it, and a list that says the base is empty would outlive a copy
+        // of an index whose rows are all in the base. The first commit writes the list, after
+        // looking at whether the base holds anything.
         // `version` is the only row FTS5 writes. The tokenizer is *not* kept
         // here: it is re-read from the module arguments in `sqlite_master`
         // every time the table is connected, and a `tokenize` row would be a
@@ -924,23 +966,17 @@ impl VirtualTable for Fts5Table {
                 problems.push(format!("row {rowid} has no size"));
             }
         }
-        let mut terms: Vec<(Vec<u8>, Vec<Value<'static>>)> = Vec::new();
-        self.shadows.scan_keyed(context, b"idx", 2, |values| {
-            if let Some(term) = values.get(1).and_then(Value::as_blob) {
-                terms.push((term.raw().to_vec(), values.to_vec()));
-            }
-            Ok(true)
-        })?;
-        for (term, row) in &terms {
-            let Some(bytes) = resolve_doclist(context, &self.shadows, row)? else {
-                problems.push(format!(
-                    "the term {} has no doclist",
-                    String::from_utf8_lossy(term)
-                ));
-                continue;
-            };
-            for entry in decode_doclist(&bytes) {
-                if !rows.contains(&entry.rowid) {
+        let structure = segment::read_structure(context, &self.shadows)?;
+        problems.extend(segment::check_structure(
+            context,
+            &self.shadows,
+            &structure,
+        )?);
+        let held: std::collections::BTreeSet<i64> = rows.iter().copied().collect();
+        let terms = segment::scan_terms(context, &self.shadows, None, &structure, None)?;
+        for (term, entries) in &terms {
+            for entry in entries {
+                if !held.contains(&entry.rowid) {
                     problems.push(format!(
                         "the term {} names row {} which is not in the content",
                         String::from_utf8_lossy(term),

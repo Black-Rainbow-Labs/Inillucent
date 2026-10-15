@@ -102,8 +102,8 @@ pub(crate) use chain::{entering_predicate, HeldBefore, Listing};
 pub use params::{Params, Slots, ENGINE_PARAMETER_BASE};
 pub use run::{
     keep_partial_rows, prepare_any, rowid_seek_key, run, run_any, run_any_gathered,
-    run_any_prepared, run_any_prepared_limited, run_compound, run_prepared, run_prepared_limited,
-    take_partial_rows,
+    run_any_prepared, run_any_prepared_limited, run_any_prepared_streaming, run_compound,
+    run_prepared, run_prepared_limited, take_partial_rows,
 };
 pub use stages::prepare;
 pub use stages::{

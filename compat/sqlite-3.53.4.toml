@@ -2438,22 +2438,12 @@ source = "https://sqlite.org/lockingv3.html"
 profile = "default"
 phase = "phase 7: single-database rollback transactions and DML"
 # Was "pass", against `a_second_writer_is_refused_while_the_first_holds_the_reservation`
-# in the old engine's `faults.rs`. Re-pointed onto `inillucent_engine::connect`,
-# the same test now shows two `Connection`s opened from one in-process
-# `Database` do not hold independent transaction state at all: `BEGIN
-# IMMEDIATE` on one and a write on the other land in the *same* open
-# transaction (confirmed by probing `Connection::autocommit()` on both sides,
-# and by the second connection's write making the first's identical INSERT
-# fail on the UNIQUE constraint it had just satisfied). `ImportedDatabase`
-# holds one shared, unkeyed transaction/writer state behind
-# `Database`'s single `RefCell`, not one per session; `inillucent-txn::slot`
-# already has a real `WriterSlot` with `busy_timeout` semantics, built for the
-# Phase 3 model driver, but it is not wired to `inillucent_engine::connect` at
-# all. Per-connection writer reservation is a capability the shipping
-# engine's public connect surface genuinely does not have - not a test that
-# needs rewriting - and giving `ImportedDatabase` per-session transaction
-# state wired to a writer slot is a cross-cutting change to its connect
-# surface, not a contained fix.
+# in the old engine's `faults.rs`. Each connection of a `Database` now has an
+# engine and a transaction of its own, and
+# `a_second_writer_is_refused_busy_while_the_first_holds_the_reservation` in
+# `faults.rs` checks that the second connection's write is refused `busy`. The
+# row stays "missing" until the nightly run has recorded that test on both
+# platforms, because a "pass" row needs recorded results.
 status = "missing"
 tests = []
 

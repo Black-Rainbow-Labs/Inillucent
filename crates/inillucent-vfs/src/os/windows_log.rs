@@ -4,6 +4,11 @@
 //! process, and every write of this process went through the share**, so the length the share
 //! keeps is the length on disk.
 //!
+//! The engine also reads `quiet_token` to skip reading the meta record, which is sound only if
+//! every process that changes the meta record has the segment open before it does. A fold has,
+//! because it appends to the log first. A hot journal restore appends nothing, so it opens the
+//! segments itself (`inillucent_pool::journal::replay_hot_journal_holding`).
+//!
 //! **Why** (task-2209). A connection under `locking_mode = normal` asks the open log segment its
 //! length before every statement, to learn whether another process appended a commit beside its
 //! read. That was one `GetFileSizeEx` a statement, 53% of an autocommit point read once the read
@@ -113,6 +118,14 @@ impl LogShare {
         }
         let after = self.breaks.load(Ordering::SeqCst);
         (before == after).then_some((self.id << 32) ^ after)
+    }
+
+    /// Moves `quiet_token` on without a break, for a change of this process the oplock cannot see.
+    ///
+    /// A log that rolls leaves this segment as it is, so a second connection in this process that
+    /// shares the segment would otherwise compare equal tokens across the roll.
+    pub fn end_quiet(&self) {
+        self.breaks.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Returns the shared file.

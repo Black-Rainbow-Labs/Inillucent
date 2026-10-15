@@ -15,6 +15,146 @@ fails the build when any copy of it disagrees.
 **`INSERT ... SELECT` no longer holds every source row in memory.** The statement still reads all of its source before it writes a row, so no row it writes is read back by its own source. Source rows past 32 MiB are now appended to a temporary file as they arrive and read back in order. Into a table that holds rows or has a `UNIQUE` index, the rows are written one at a time inside the same statement, so a failure on any row puts every earlier row back and names the same constraint as before. Into an empty table the rows are built and checked twice from the file and written a chunk at a time while the indexes sort in runs; a source whose rowids do not increase takes the row by row insert. Copying 3,000,000 rows peaked at 622 MB into a table that held a row and 527 MB into an empty one, and peaks at 167 MB and 142 MB now.
 
 **`CREATE INDEX` and `REINDEX` no longer hold every entry in memory.** The entries were scanned into one arena of about 105 bytes an entry and sorted there, so an index over 5,000,000 rows peaked at 543 to 616 MB where SQLite stays near 10 MB. The arena now holds at most 32 MiB. When it fills, the entries held are sorted and written to a temporary file as a run, and the runs are merged into the tree builder a chunk at a time. A `UNIQUE` index is checked over the merge before any page is written, so a failure leaves nothing behind. An index over 3,000,000 rows peaked at 321 MB before and 132 MB after.
+**Two connections on one file see each other's commits when the log rolls to a new segment, and an
+attached file does too.** The log moves to a new segment when the open one reaches 64 MiB, and that
+writes no meta record. A connection asks whether the next segment exists, and on Windows it skips
+that question while its segment's oplock says no other process opened it. A second connection in
+the same process shares the segment's file object, so its roll left the oplock unbroken and the
+first connection read pages without the commit, and a write from those pages gave two connections
+different rows. A roll now moves the segment's token on. A file attached with `ATTACH` never asked
+about the next segment at all, so it showed a stale file in the same case; it asks now. A new test
+sets the segment size to 128 bytes so that every statement rolls.
+
+**A session that only reads no longer leaves a discarded transaction to be found at every open.**
+A writer killed inside a large transaction leaves records with no commit record, and the next open
+discards them and says so. Recovery wrote nothing about that, a session that only read did not
+fold on close, and every later open scanned the same records and printed `recovered the log` again.
+A connection that can write now folds on close after an open that discarded a transaction, so the
+second open recovers nothing.
+
+**A table another process created is found by an open connection.** This was reported for a
+connection that ran `CREATE TABLE a` and then met a table `b` made by the command line in another
+process, and it already works: a statement that fails to compile checks whether the schema moved and
+compiles again, and a column added by another process is read by the next statement. A test now runs
+those exact steps, with and without parameters.
+
+**Printing a large result and loading a large file no longer hold the whole result or the whole
+file.** `inillucent-shell` collected every row of a statement before it printed the first, and
+`SELECT a, b FROM t` over 3,000,000 rows peaked at 984 MB where `sqlite3` stays near 10 MB. The
+shell now prints the rows as the engine produces them in `list`, `csv`, `tabs`, `quote`, `ascii`,
+`tcl`, `c`, `jatom`, `line`, `insert`, `json`, `jobject`, `html` and `count` modes, and the same
+statement peaks at 67 MB. `inillucent query` kept every row to cut the list to `--limit` and peaked
+at 896 MB with the default limit; it keeps the rows it prints and counts the rest, so `total` is
+unchanged and the peak is 71 MB. `.import` read and parsed the whole file before it inserted a row
+(407 MB for 1,000,000 rows); it reads a block of the file at a time and inserts at most 20,000 rows
+in one statement, and the same file peaks at 70 MB. A sorted result still needs the memory of the
+sort. The modes that size each column to the widest value (`column`, `table`, `box`, `markdown`,
+`qbox`, `psql`, `split`) and `--limit 0` of `inillucent query` hold the result, as they must.
+`Connection::query_each` in the Rust driver hands each row to a `RowSink` as it is produced.
+
+**A process that used `embed()`, or asked for a CUDA card that would not start, no longer crashes as
+it exits.** On Windows about 30 of 100 runs of `INILLUCENT_EMBED_DEVICE=cuda:99 inillucent query
+"SELECT length(embed('a word'))"` printed the refusal and then ended with `STATUS_ACCESS_VIOLATION`
+or `STATUS_STACK_BUFFER_OVERRUN`, and a process that dropped a session ended the same way about one
+run in six. The `ort` crate released ONNX Runtime's environment while the process was exiting, after
+other libraries had started to unload, and the release read freed memory. The engine now holds one
+reference to the environment from the moment it first builds a session, on every operating system,
+so that release is never the last one. `inillucent embed` no longer keeps finished sessions in a
+static to avoid the drop. The idle reaper leaves a session alone once the process has started to
+exit. A new C call, `inillucent_release_models` (ABI 1.5.0), drops the loaded embedder and reranker
+sessions, and the Node and Python packages call it when the process exits. The macOS abort in Node
+(`mutex lock failed: Invalid argument`, exit code 134) has the same cause; the change is made for
+Apple targets as well, and it has not been run on a Mac.
+
+**Each connection of one `Database` has a transaction of its own.** `Database::session` in Rust,
+`Database.connect()` in Python and `inillucent_connect` in C returned connections that shared one
+transaction. A `BEGIN` on one was joined by the other, the other read its uncommitted rows, and a
+write through the second was undone by the first one's `ROLLBACK`, so an acknowledged write was lost.
+The first connection still runs on the engine the open made. Every later connection runs on an engine
+of its own over the same file, which takes the file lock the way a second process does: it reads only
+what is committed, and a second writer is refused with `busy` after the busy timeout. A function, a
+collation, an authorizer or a pragma set on one connection is no longer set on another. The C library
+frees a connection's engine when its last handle is freed. A program that opened a connection for every
+statement now pays the cost of opening an engine each time and should keep its connections.
+
+**Every call on a Python `Database` takes one lock the database owns.** The Python binding let the
+interpreter lock go while the engine ran, so two threads could be inside one connection together. A
+second thread now waits for the first call to finish. `Connection.cancel()` does not take the lock.
+
+**An FTS5 table can take its content from a view, and an external content table scans its owner.**
+`CREATE VIRTUAL TABLE f USING fts5(body, content='v', content_rowid='id')` with `v` a view returned
+no rows from `SELECT * FROM f`, and `rebuild` indexed nothing, because the module read the owner
+through a tree and a view has none. The rows of the view are now read with a query, as SQLite does,
+for a scan, for a lookup by rowid, for `highlight()` and `snippet()`, and for `rebuild`. A scan of
+any external content table, FTS3, FTS4 and FTS5, also reads the owner's rows instead of the rows
+the index has been told about, so it answers before the first `rebuild`, as SQLite does.
+
+**A commit to an FTS5 table writes what its rows add, not the lists of every word they contain.**
+A load that committed each statement read the whole list of each word a row contained and wrote it
+back, so a word in every row was rewritten for every row and the work grew as the square of the rows. The index now writes each commit's postings as a segment of its own and merges
+small segments into larger ones, so each posting is written a number of times that grows with the
+logarithm of the rows. A deleted row is hidden by a marker in a newer segment until a merge drops
+it, and `INSERT INTO t(t) VALUES('optimize')` merges everything into one run. An index an earlier
+build wrote is read as before and is marked as layout 3 on its first write, so a build that does
+not read segments refuses it by name. `SELECT count(*) FROM t_idx` after deleting every row is no
+longer 0 until `optimize` runs.
+
+**FTS3 and FTS4 `MATCH` reads SQLite's default query language.** `MATCH 'x NOT y'` was an
+exclusion here and is a search for the three words `x`, `NOT` and `y` in SQLite. `AND` is a word
+too. `NEAR` and `NEAR/n` were handed to the FTS5 parser, which needs the `NEAR(a b, n)` spelling, so
+`x NEAR/3 y` matched nothing. A bare `NEAR` is `NEAR/10`. A `NEAR` with no term on one side is the
+error `malformed MATCH expression`. A `-` in front of a quoted phrase is only a separator.
+
+**A checkpoint makes the data pages durable before it writes the meta record.** The checkpoint
+that follows a log fold wrote the pages and the shadow meta slot and synced once for both, so a
+power loss inside that sync could leave the new meta record beside a torn catalog page that the log
+no longer covered, and the next open refused the file. The pages now have a sync of their own, which
+makes a fold sync the data file three times instead of twice. A test cuts the power at every sync of
+a `DELETE` followed by `PRAGMA wal_checkpoint`; 8 of 168 cuts damaged the file before, none after.
+
+**A reader on Windows notices a rollback journal that another process put back.** A reader that
+holds the oplock on its log segment skips reading the meta record, and a journal restore changes the
+record without opening the segment, so the reader went on answering from pages the restore had taken
+away. The process that restores a journal now opens the log segments first and holds them until it
+is done.
+
+**A row of 2,000 integer columns fits a 32 KiB page.** A row of about 1,940 integer columns or more
+failed with `a row of N columns does not fit one page`, where SQLite allows 2,000. A leaf spends eight
+bytes on each column's directory entry and the tagged form of an integer took nine. A row whose numbers
+take more than half a page in that form is now written with each integer in the fewest bytes that hold
+it: two bytes under 128, three under 32,768, five under 2,147,483,648. That holds about 3,200 such
+columns. A row of integers that need eight bytes each still holds about 1,925, and a longer one is
+refused as before. The first wide row moves the file to format 4, with the `FormatRaised` log record, and
+a release that stops at format 3 refuses the file by name. Tables with narrower rows, and files that
+hold none, are written exactly as before.
+
+**`ALTER TABLE ... ADD COLUMN` takes time that does not depend on the number of rows.** It read every
+row, built a new tree from them and freed the old one: 783 ms for `ADD COLUMN e DEFAULT 5` on 800,000
+rows, where SQLite takes 19, and 1,841 ms with a `CHECK`. It now writes the catalog row and no leaf
+when the default is a literal. A leaf written before the column existed reads the default for it, and
+is rewritten with the column the first time a write lands in it, one leaf at a time. A read writes
+nothing, a delete widens nothing, and a table with no row, a statement inside a transaction and a
+default the engine has to evaluate take the old path. `CHECK` is still run over the existing rows,
+as SQLite runs it. The first such column moves the file to **format 4**, with a log record of its own,
+`FormatRaised`: a release that stops at format 3 refuses the file with
+`this database is format version 4 and this build reads version 3`, and refuses a log that holds the
+record by kind. A file that never gains a column on a table with rows stays at the format it had.
+`docs/relational-architecture.md` has the details.
+
+**`VACUUM aux` shortens the file of an attached database.** It used to fold the log and leave the
+file at its old length. A delete that left every leaf a tenth full freed one page of 147, so the
+free map had nothing to give back either. `VACUUM aux` now packs each table and index of the
+attached file into new trees in the same file and cuts the file after the commit. It does not
+rename a new file over the old one, so another process that has the file attached keeps working.
+
+**`ATTACH` takes any expression as its file name.** `ATTACH ?1 AS x`, `ATTACH 'a' || 'b' AS x` and
+`ATTACH (SELECT path FROM p) AS x` exited 3 with `unsupported`. The engine now evaluates the
+expression when the statement runs, with the statement's bound parameters, and reads the value as
+text as SQLite does, so a NULL names a private temporary database. `--root` confines the evaluated
+name the same way it confines a literal one. `VACUUM INTO ?1` takes its parameter the same way.
+The `attach_computed_path` row of `inillucent capabilities` is now `yes`. The examples of the
+`unsupported` status in the documentation, the skills and the conformance suite use
+`EXPLAIN EXPLAIN SELECT 1`.
 
 **`ROLLBACK` restores everything a transaction changed, including after `DROP` and `ALTER TABLE`.**
 Bug hunt 10 found rollbacks that lost or kept rows. With foreign keys on, `BEGIN; DROP TABLE p;

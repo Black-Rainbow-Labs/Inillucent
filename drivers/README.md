@@ -70,10 +70,9 @@ application that uses the driver does not change when crates below the engine mo
 1. **Handle `unsupported` on its own.** The engine returns `unsupported` (`INILLUCENT_UNSUPPORTED` in
    C, `Status::Unsupported` in Rust) for a construct it has not built. A mistyped statement gets a
    different status, such as `syntax`. A binding that turns both into one general error cannot tell
-   "not built yet" from "wrong". For example, `ATTACH ? AS other`
-   returns `unsupported`, because `ATTACH` takes its file name as a string literal and not as a
-   parameter. The 416 case differential probe, which runs each case on inillucent and on the pinned
-   SQLite 3.53.4, has no case that returns `unsupported`. Write the `unsupported` branch anyway,
+   "not built yet" from "wrong". For example, `EXPLAIN EXPLAIN SELECT 1`
+   returns `unsupported`, because an `EXPLAIN` of another `EXPLAIN` is not built. The 416 case
+   differential probe, which runs each case on inillucent and on the pinned SQLite 3.53.4, has no case that returns `unsupported`. Write the `unsupported` branch anyway,
    because the capability table lists 12 constructs the engine refuses.
 2. **Read the capability table before you write unusual SQL.** The table lists what the engine can
    do, with a sentence about each row. See [The capability table](#the-capability-table).
@@ -133,6 +132,33 @@ match connection.query_all(statement, &[]) {
 }
 ```
 
+A result too large to hold is read with `query_each`, which hands each row to a `RowSink` while the
+engine produces the next one:
+
+```rust
+use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
+use inillucent_driver::{Result, RowSink, Value};
+
+struct Total(i64);
+
+impl RowSink for Total {
+    fn row(&mut self, row: &[Value]) -> Result<ControlFlow<()>> {
+        if let Some(Value::Integer(id)) = row.first() {
+            self.0 += id;
+        }
+        Ok(ControlFlow::Continue(())) // ControlFlow::Break(()) stops the statement
+    }
+}
+
+let total = Rc::new(RefCell::new(Total(0)));
+let done = connection.query_each("SELECT id FROM people", &[], &total)?;
+println!("{} rows, ids add up to {}", done.total, total.borrow().0);
+```
+
+The sink is held in an `Rc<RefCell<..>>` so that you keep a handle on it and read what it collected
+after the call. It must not use the connection the statement is running on. `Streamed::total` is
+exact, counted as the rows go by.
+
 `Database::session` returns a `Connection`. The older name `Database::connect` still works and is
 deprecated.
 
@@ -170,10 +196,17 @@ integers and back.
 |---|---|
 | **Values are typed.** | A value is one of `Null`, `Integer`, `Real`, `Text` or `Blob`. The driver does not turn numbers into text. |
 | **`Null` is its own variant.** | `Value::Null` and an empty `Value::Text` are different values. |
-| **`total` is exact.** | The engine builds the whole result before it returns. `limit` caps the rows handed back. `total` counts every row the statement produced, and `more` is true when `limit` left rows out. A query over a large table costs the whole result, so put a `LIMIT` in the SQL when that matters. |
+| **`total` is exact.** | `limit` caps the rows `query` hands back. `total` counts every row the statement produced, and `more` is true when `limit` left rows out. `query` and `query_all` hold every row the statement produced until they return, so a query over a large table costs the whole result: put a `LIMIT` in the SQL, or read the rows with `query_each`, which hands each row to a sink as it is produced and holds none. A compound query, a window function and a write with `RETURNING` are not one pipeline, so `query_each` collects them first and then hands the rows over. The C library's `step` and `inillucent_rows_json` still build the whole result. |
 | **A batch is one transaction, checked before the commit.** | `Connection::transaction(work, check)` runs every statement, passes the changed row counts to `check`, and commits only when `check` returns `Ok`. Any failure rolls back all of it. `Connection::begin` returns a `Transaction` you drive one statement at a time. Dropping a `Transaction` without `commit` rolls it back. |
 | **One file has one buffer pool, and the engine runs on one thread.** | A `Database` is neither `Send` nor `Sync`. |
 | **Read only is enforced by the driver.** | With `OpenOptions::read_only` set, the driver refuses any statement that does not bind to a query, including a `PRAGMA`. The binder decides this, so whitespace or a comment in the SQL does not change the result. The file is still open for writing, so the `readonly_open` capability says `partial`. |
+
+A query that fails on one row still returns `Err`, and `Error::partial` holds the rows it produced before
+the failure. SQLite returns every row ahead of the failing one and then reports the error, and a program
+that reads rows until a failure and reports how far it got needs those rows. `partial` is a `Rows` cut to
+the same `limit` as a success. It is `None` when the failure came before the first row and for a
+statement that is not a query, so a caller that ignores the field behaves as before. The C library does
+not carry the rows yet: an `inillucent_error` has the status, the message and the offset.
 
 `Database::open` uses these defaults from `OpenOptions`:
 
@@ -346,7 +379,8 @@ order is an error your code can see, and the process does not crash.
 
 One file has one buffer pool, and the engine runs on one thread. Keep an `inillucent_db` and every
 handle made from it on one thread, or guard every call with a lock your binding owns. The C library
-has no lock inside it. `inillucent_cancel` is the one call that is safe from another thread while a
+has no lock inside it, and the Python binding takes one lock per `Database` around every call except
+`cancel`, which is the model to copy. `inillucent_cancel` is the one call that is safe from another thread while a
 statement runs. It sets a flag and touches nothing else. In Rust, `Database::cancel_handle()` returns
 a `CancelHandle` that is `Send` and `Sync`: take it before the statement starts, move it to another
 thread and call `cancel()` there. `Connection::cancel()` can only be called between statements,
@@ -360,11 +394,18 @@ asks: a statement on one session does not move another session's numbers. In C,
 `inillucent_connect` opens a session and the `inillucent_conn` handle keeps it. Every call on that
 handle runs in the same session.
 
-Two connections of one `Database` share one transaction. A `BEGIN` on either is joined by the
-other, and a write through the first is undone by a `ROLLBACK` on the second. Sessions separate
-`temp.` tables, `ATTACH`, pragmas and the counters. They do not separate transactions. An
-application that needs isolated connections opens a second `Database` on the same file, which takes
-the file lock the way a second process does.
+Each connection of one `Database` has a transaction of its own. The first connection runs on the
+engine the open made. Every later connection runs on an engine of its own, opened over the same file
+when the connection runs its first statement, and that engine takes the file's locks the way a second
+process does. A `BEGIN` on one connection is not joined by another. The other connection reads only
+what is committed. A second writer waits for `busy_timeout` and then fails with `INILLUCENT_BUSY`,
+and a write through one connection is kept when another connection rolls back. In SQLite and in
+Python's `sqlite3` two connections behave the same way. A connection also has its own `temp.` tables,
+`ATTACH`, pragmas, functions and counters. Opening that engine costs what opening a second `Database`
+on the file costs, so a program keeps its connections instead of opening one per statement. In C,
+`inillucent_conn_free` releases the connection's engine when the last handle on the connection, its
+statements and its transactions is freed, and a transaction the connection left open is rolled back
+then. In Rust, `Database::release_session` does the same for a session number.
 
 A Rust caller that holds a connection for a long time needs one more step. `Connection<'d>` borrows
 the `Database`, so one Rust struct cannot hold both. Such a caller holds the `Database`, makes a
@@ -463,15 +504,27 @@ error wrongly, and both sides would still compile.
 | Stability | Promise |
 |---|---|
 | stable | The signature will not change, and the symbol will not be removed. |
-| provisional | The symbol exists and may change in a minor version. Fourteen symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free`, `inillucent_py_init_threads`, `inillucent_py_stmt_execute`, `inillucent_py_execute` and `napi_register_module_v1` under "Python objects and the Node addon". |
+| provisional | The symbol exists and may change in a minor version. Fifteen symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free`, `inillucent_py_init_threads`, `inillucent_py_stmt_execute`, `inillucent_py_execute` and `napi_register_module_v1` under "Python objects and the Node addon". `inillucent_release_models` drops the loaded embedder and reranker sessions, and is described under "Releasing the embedding model before exit". |
 
-The ABI version is 1.4.0, and `inillucent_abi_version()` returns 1004000. Version 1.1.0 added
+The ABI version is 1.5.0, and `inillucent_abi_version()` returns 1005000. Version 1.1.0 added
 `inillucent_open_with_key`, version 1.2.0 added `inillucent_open_with_timeout`, version 1.3.0
 added `inillucent_rows_json`, `inillucent_bind_json`, `inillucent_stmt_execute_many`,
 `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`,
 `inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1`, and
 version 1.4.0 added `inillucent_py_init_threads`, `inillucent_py_stmt_execute` and
-`inillucent_py_execute`. A binding written against 1.0.0 finds every symbol it calls.
+`inillucent_py_execute`, and version 1.5.0 added `inillucent_release_models`. A binding written against 1.0.0 finds every symbol it calls.
+
+## Releasing the embedding model before exit
+
+A process that called `embed()` holds ONNX Runtime sessions, and ONNX Runtime has threads and C++
+destructors of its own. On macOS a process that exits while a session is loaded could abort with
+`mutex lock failed: Invalid argument` and exit code 134, because those destructors ran while a
+session's threads were still running. `inillucent_release_models()` drops the loaded embedder and
+reranker sessions, joins their threads, and returns. Call it once just before the process exits. It
+takes no arguments, can be called when nothing is loaded and in a library built without embedding,
+and a later `embed()` loads the model again. The Node package calls it from the `exit` event, and
+the Python package registers it with `atexit` when the library has it. A binding for another
+language should do the same from its own exit hook.
 
 ## Building the C library
 

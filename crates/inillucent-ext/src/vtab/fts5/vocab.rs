@@ -279,26 +279,15 @@ impl VirtualCursor for VocabCursor {
         // reporting an empty vocabulary for an index full of terms.
         super::layout::readable_once(context, &self.shadows, &self.target)?;
         self.columns = column_names(context, &self.target);
-        // `%_idx(segid, term, doclist)`, keyed on the first two - or, for a
-        // row an older build wrote and nothing has rewritten since, `doclist`
-        // is still the page number that build left it under. `resolve_doclist`
-        // tells the two apart.
-        let mut dictionary: Vec<(Vec<u8>, Vec<Value<'static>>)> = Vec::new();
-        self.shadows.scan_keyed(context, b"idx", 2, |values| {
-            let term = match values.get(1) {
-                Some(Value::Text(text)) => text.utf8_bytes().into_owned(),
-                Some(Value::Blob(blob)) => blob.raw().to_vec(),
-                _ => return Ok(true),
-            };
-            dictionary.push((term, values.to_vec()));
-            Ok(true)
-        })?;
-        for (term, row) in dictionary {
-            // **Refused rather than skipped** (task-2053). A term whose doclist
-            // does not resolve was dropped from the vocabulary silently, so a
-            // table whose whole job is to report what the index holds under-
-            // reported it and said nothing.
-            let doclist = super::require_doclist(context, &self.shadows, &term, &row)?;
+        // `%_idx(segid, term, doclist)` is keyed by the segment and then the term, so a term
+        // has a row in each segment that holds it. `scan_terms` lays them over one another,
+        // oldest first, and answers the terms that still have a row. It refuses a row whose
+        // doclist does not resolve (task-2053), because a table whose whole job is to report
+        // what the index holds would otherwise under-report it and say nothing.
+        let structure = super::segment::read_structure(context, &self.shadows)?;
+        let terms = super::segment::scan_terms(context, &self.shadows, None, &structure, None)?;
+        for (term, entries) in terms {
+            let doclist = super::doclist::encode_doclist(&entries);
             self.expand(&term, &doclist);
         }
         Ok(())

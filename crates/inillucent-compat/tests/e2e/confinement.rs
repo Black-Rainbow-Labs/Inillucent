@@ -426,6 +426,80 @@ fn attaching_a_database_outside_the_root_is_refused() {
     );
 }
 
+/// `ATTACH` with a file name that is computed is confined the same way as a literal one.
+///
+/// A bound parameter and a concatenation are evaluated when the statement runs,
+/// after the binder has seen only the expression text. If the check ran on the
+/// text, a computed name would reach any file on the disk. The second statement
+/// shows the same expressions attach a file inside the root, so the refusal is
+/// about the path and not about the expression form.
+#[test]
+fn a_computed_attach_file_name_is_confined() {
+    let program = cliproc::program("inillucent");
+    let base = area("attach-computed");
+    let root = base.join("root");
+    let outside = base.join("outside");
+    let _ = std::fs::create_dir_all(&root);
+    let _ = std::fs::create_dir_all(&outside);
+    let secret_name = outside
+        .join("secret.rdb")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let params = format!("[\"{secret_name}\"]");
+    let refused = run(
+        &program,
+        &root,
+        &[
+            "--db",
+            "app.rdb",
+            "exec",
+            "ATTACH ?1 AS stolen",
+            "--params",
+            &params,
+        ],
+    )
+    .text()
+    .to_lowercase();
+    assert!(
+        refused.contains("confined") || refused.contains("outside"),
+        "a bound ATTACH file name reached a database outside the root: {refused}"
+    );
+    let joined = format!(
+        "ATTACH '{}' || 'secret.rdb' AS stolen",
+        secret_name.trim_end_matches("secret.rdb")
+    );
+    let refused = run(&program, &root, &["--db", "app.rdb", "exec", &joined])
+        .text()
+        .to_lowercase();
+    assert!(
+        refused.contains("confined") || refused.contains("outside"),
+        "a concatenated ATTACH file name reached a database outside the root: {refused}"
+    );
+    assert!(
+        !outside.join("secret.rdb").exists(),
+        "the refused attachment created a file outside the root"
+    );
+
+    let inside = run(
+        &program,
+        &root,
+        &[
+            "--db",
+            "app.rdb",
+            "exec",
+            "ATTACH ?1 AS inside",
+            "--params",
+            "[\"inside.rdb\"]",
+        ],
+    );
+    assert!(
+        inside.ok,
+        "a computed name inside the root was refused: {}",
+        inside.text()
+    );
+}
+
 /// `ATTACH DATABASE` through a junction below the root is refused.
 ///
 /// The two holes combined: a path whose text is inside the root, reached

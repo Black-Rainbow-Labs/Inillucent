@@ -173,9 +173,11 @@ impl PagedTree {
         let right_guard = pool.fetch(right)?;
         let left = LeafRef::parse(&left_guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions());
         let right = LeafRef::parse(&right_guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions());
         if left.has_extents() || right.has_extents() {
             return Ok(FromPages::HasExtents);

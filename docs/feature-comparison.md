@@ -657,7 +657,11 @@ Some FTS5 options are refused with exit code 3 instead of being accepted and ign
 `highlight()` and `snippet()` mark each phrase match, as SQLite does. `MATCH 'quick brown'` marks
 two ranges, because it is two phrases. `MATCH '"quick brown"'` marks one, because it is one phrase
 of two words. FTS3 and FTS4 tables use the same index as FTS5, with `docid`, `snippet()`,
-`offsets()` and `matchinfo()`.
+`offsets()` and `matchinfo()`. Their `MATCH` reads the query language SQLite builds them with. A
+leading `-` excludes a term, `OR` and `NEAR` or `NEAR/n` in capitals are operators, a bare `NEAR` is
+`NEAR/10`, and `AND` and `NOT` are ordinary words, so `MATCH 'x NOT y'` finds rows that hold all three
+words. An external content table takes its rows from the table or view named by `content=`, and a
+scan of the full text table reads that table or view whether or not the index holds the rows yet.
 
 A token longer than 1000 bytes is cut to its first 1000 bytes, in the index and in a query alike, so
 two tokens that share their first 1000 bytes are one token to `MATCH`. SQLite cuts at 32768 bytes.
@@ -714,9 +718,10 @@ transaction`.
 
 `VACUUM aux` and `VACUUM temp` act on the database they name and leave `main` alone.
 `VACUUM aux INTO 'copy.rdb'` writes a rebuilt copy of the attached database `aux`. `VACUUM aux`
-without `INTO` folds the log of the attached file into the file and does not rebuild it, because
-another process that has the same file attached would keep writing to the old file after a
-rename. Use `VACUUM aux INTO` and replace the file when the space matters. SQLite writes an empty
+without `INTO` packs every table and index of the attached file into new trees inside the same
+file, moves the pages above the first free page down, and cuts the file, so the file gets shorter.
+It does not rename a new file over the old one, because another process that has the same file
+attached would keep writing to the old file after a rename. SQLite writes an empty
 database for `VACUUM temp INTO`, and this engine writes a copy of the temporary tables.
 
 ### Syntax and parameters
@@ -988,8 +993,8 @@ The 24 that answer differently with no arguments:
 
 ## Constructs the probe does not reach
 
-`inillucent capabilities` lists 57 capabilities reported by the engine. 13 of them are `no`: the
-engine refuses the construct. Eight are refused with status `unsupported` and exit code 3. Five are
+`inillucent capabilities` lists 57 capabilities reported by the engine. 12 of them are `no`: the
+engine refuses the construct. Seven are refused with status `unsupported` and exit code 3. Five are
 refused with status `syntax` and exit code 1: `load_extension`, `compound_ordered_by_expression`,
 `writing_to_a_view`, `returning_inside_a_trigger` and `changing_a_schema_row`. None of these is one
 of the 416 cases. Most of them run in SQLite. One, writing to a view, is refused by SQLite too, with
@@ -997,7 +1002,6 @@ the same message and exit code 1.
 
 | Capability | What is refused |
 |---|---|
-| `attach_computed_path` | `ATTACH ? AS other`: a file name that is not a string literal |
 | `match_in_an_or_reading_a_row` | a full text `MATCH` under an `OR` whose pattern reads another table's row, such as `f MATCH q.w OR rowid = 3` |
 | `load_extension` | `load_extension()`. There is no C extension interface |
 | `compound_ordered_by_expression` | a compound select ordered by an expression |

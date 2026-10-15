@@ -202,7 +202,20 @@ impl Pool {
             self.journal_page(SHADOW_PAGE)?;
         }
         self.flush()?;
-        self.sync_pages_if_asked()?;
+        // **Every data page is durable before the first meta slot is written,
+        // under the redo log too.** The log route used to write the pages and
+        // the shadow slot and then sync once for both. A power loss inside that
+        // sync could leave the shadow slot durable beside a page that was torn.
+        // The shadow slot's recovery point is past the log's images of that
+        // page, so the next open read a torn catalog page with nothing left to
+        // repair it. `checkpoint_sync_crash` cuts every sync of a DELETE plus
+        // `PRAGMA wal_checkpoint` and failed 8 of 168 cuts before this sync.
+        if route == super::meta_write::MetaRoute::Logged {
+            self.sync_pages_first.set(false);
+            self.sync_data_file()?;
+        } else {
+            self.sync_pages_if_asked()?;
+        }
         // Every page this checkpoint wrote has now raised the high water, so
         // the number recorded here bounds the stamps the file actually holds
         // rather than the ones it held a checkpoint ago. It never goes

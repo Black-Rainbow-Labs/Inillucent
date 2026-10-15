@@ -16,6 +16,7 @@
 //! `tests/selection.toml`. `selection::discover` finds a module file with no
 //! row, so `no_test_hides_outside_the_map` names one that was forgotten.
 
+mod add_column;
 mod advanced_sql;
 mod attach;
 mod bulk_insert;
@@ -46,6 +47,7 @@ mod numeric_text;
 mod operator_spill;
 mod oracle;
 mod ordering;
+mod partial_rows;
 mod planner;
 mod pragma;
 mod registers;

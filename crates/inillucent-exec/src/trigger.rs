@@ -684,6 +684,7 @@ fn run_body(
             let params = folded.as_ref().unwrap_or(params);
             // The clause this statement runs with is what the triggers it
             // fires are handed, as SQLite does; see `Depth`.
+            let body_root = insert.table.root;
             let changes = dml::insert_at(
                 &insert,
                 target,
@@ -696,6 +697,7 @@ fn run_body(
             if let Some(rowid) = changes.last_rowid {
                 firing.params.set_last_insert_rowid(rowid);
             }
+            target.report_body_changes(body_root, changes);
             Ok(())
         }
         BoundTriggerStatement::Update(update) => {
@@ -718,13 +720,14 @@ fn run_body(
                 .collect();
             let folded = crate::subquery::fold_expressions(&assigned, target.catalog(), params)?;
             let params = folded.as_ref().unwrap_or(params);
-            dml::update_at(
+            let changes = dml::update_at(
                 &update,
                 target,
                 params,
                 &keys,
                 Depth(depth.0, update.on_conflict),
             )?;
+            target.report_body_changes(update.table.root, changes);
             Ok(())
         }
         BoundTriggerStatement::Delete(delete) => {
@@ -739,7 +742,8 @@ fn run_body(
             let keys = keys_for_delete(&delete, target, params)?;
             // A `DELETE` has no conflict clause to pass on, so the triggers it
             // fires start again from their own statements' clauses.
-            dml::delete_at(&delete, target, params, &keys, Depth(depth.0, None))?;
+            let changes = dml::delete_at(&delete, target, params, &keys, Depth(depth.0, None))?;
+            target.report_body_changes(delete.table.root, changes);
             Ok(())
         }
     }
@@ -822,7 +826,8 @@ fn module_write(
 /// Returns the keys an `UPDATE` in a body will change.
 ///
 /// The same query the engine builds for a typed `UPDATE`: the statement's own
-/// `WHERE` over the statement's own table, projecting the table's key. Building
+/// `WHERE` over the statement's own table (and any `FROM` terms), projecting the
+/// table's key and, for an `UPDATE ... FROM`, each assigned value. Building
 /// it here rather than repeating a scan is what gives a cascade the index.
 ///
 /// @param statement - the substituted update
@@ -834,17 +839,35 @@ fn keys_for_update(
     params: &Params,
 ) -> DbResult<Vec<Row>> {
     let layout = layout_for(target, &statement.table)?;
-    let mut select = dml::keys_query(
+    // An `UPDATE ... FROM` has joined terms its assignments refer to, so the
+    // keys query carries them and projects each assigned value beside the key,
+    // which `dml::update_at` reads back out of the row, as the top level does.
+    let assigned: Vec<BoundExpr> = match statement.from.is_empty() {
+        true => Vec::new(),
+        false => statement
+            .assignments
+            .iter()
+            .map(|assignment| assignment.value.clone())
+            .collect(),
+    };
+    let mut select = dml::keys_query_joined(
         &statement.table,
         statement.source,
         statement.filter.as_ref(),
         statement.limit.as_ref(),
         statement.offset.as_ref(),
         &layout,
+        &statement.from,
+        &assigned,
     )?;
     select.order_by = statement.order_by.clone();
     dml::hint_target(&mut select, &statement.index_hint, &statement.index_exprs);
-    run_select(&select, target, params)
+    let keys = run_select(&select, target, params)?;
+    // SQLite changes a target row once however many joined rows match it.
+    Ok(match statement.from.is_empty() {
+        true => keys,
+        false => dml::one_row_per_target(keys, assigned.len()),
+    })
 }
 
 /// Returns the keys a `DELETE` in a body will remove.

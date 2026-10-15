@@ -344,8 +344,17 @@ impl<'p> LeafMut<'p> {
             )));
         }
         let mut encoded = Vec::new();
-        for value in row {
-            value.encode_tagged(&mut encoded);
+        // A row too wide for the ordinary encoding to fit a leaf is written with its integers
+        // in the fewest bytes; see `Datum::encode_tagged_compact`. The rule is the row's and
+        // the page's, so a replay that writes the logged bytes and a build that encodes
+        // the values agree.
+        match Datum::row_is_wide(row, self.page.len()) {
+            true => row
+                .iter()
+                .for_each(|value| value.encode_tagged_compact(&mut encoded)),
+            false => row
+                .iter()
+                .for_each(|value| value.encode_tagged(&mut encoded)),
         }
         let leaf = LeafRef::parse(self.page)?;
         let key = row.get(..leaf.key_columns()).unwrap_or(row);
@@ -1429,8 +1438,9 @@ fn columns_end(page: &[u8]) -> DbResult<usize> {
 fn columns_end_of(leaf: &LeafRef<'_>) -> DbResult<usize> {
     let page = leaf.bytes();
     let stride = leaf.directory_entry_size();
-    let mut end = leaf_header::DIRECTORY.saturating_add(leaf.column_count().saturating_mul(stride));
-    for index in 0..leaf.column_count() {
+    let mut end =
+        leaf_header::DIRECTORY.saturating_add(leaf.physical_column_count().saturating_mul(stride));
+    for index in 0..leaf.physical_column_count() {
         let entry = leaf_header::DIRECTORY.saturating_add(index.saturating_mul(stride));
         let start = page::read_u32(page, entry.saturating_add(4))? as usize;
         // The column directory's own width, not the physical type's: an integer

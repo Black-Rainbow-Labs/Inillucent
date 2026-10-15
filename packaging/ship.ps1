@@ -1404,6 +1404,16 @@ function Test-SiteVersion {
     $installProblem = Test-InstallPage -Text $install -Version $Version
     if ($installProblem) { return $installProblem }
 
+    # The page an agent reads first. The release rewrites nothing in it, so it may name no version.
+    try {
+        $llms = (Invoke-WebRequest -Uri 'https://inillucent.com/llms.txt' -UseBasicParsing -TimeoutSec 30).Content
+        if ($llms -is [byte[]]) { $llms = [System.Text.Encoding]::UTF8.GetString($llms) }
+    } catch {
+        return "inillucent.com/llms.txt could not be read: $($_.Exception.Message)"
+    }
+    $llmsProblem = Test-LlmsPage -Text $llms -Version $Version
+    if ($llmsProblem) { return $llmsProblem }
+
     try {
         $sums = (Invoke-WebRequest -Uri "$base/SHA256SUMS" -UseBasicParsing -TimeoutSec 30).Content
     } catch {

@@ -67,6 +67,7 @@ pub mod error;
 pub mod introspect;
 pub mod rows;
 pub mod shared;
+pub mod stream;
 pub mod value;
 pub mod wire;
 
@@ -81,9 +82,16 @@ use inillucent_engine::connect::{Database as EngineDatabase, Statement as Engine
 
 pub use capability::{capability, supports, Capability, Support, CAPABILITIES};
 pub use error::{Error, Result, Status};
+/// The engine's own row consumer and the borrowed value it is handed, for the shell, which
+/// streams the rows of a statement it prepared on the engine's statement.
+pub use inillucent_engine::connect::{Flow, RowConsumer};
+pub use inillucent_engine::Datum;
+/// Drops the embedder's and the reranker's loaded model sessions; see `inillucent_search::release_models`.
+pub use inillucent_engine::release_models;
 pub use introspect::{Item, Kind, Table};
 pub use rows::Rows;
 pub use shared::{SharedConnection, SharedDatabase, SharedTransaction};
+pub use stream::{RowSink, Streamed};
 pub use value::{Column, Value, ValueKind};
 
 /// What one statement may spend, and the default ceiling on the plan cache.
@@ -593,12 +601,19 @@ impl Database {
     /// wants [`Database::session_as`], or every `CREATE TEMP TABLE` is gone by
     /// the next statement.
     ///
-    /// **It is called `session` and not `connect` because that is what it
-    /// returns (task-1961, A5).** Two of these share one transaction - a
-    /// `BEGIN` on either is joined by the other, and a write through the second
-    /// is undone by the first one's `ROLLBACK` - and `connect` reads as denying
-    /// exactly that to anyone arriving from SQLite or rusqlite. `connect` is
-    /// kept as a deprecated alias for one release.
+    /// **Each one has its own transaction.** The first connection runs on the
+    /// engine the open made. Every later one runs on an engine of its own, opened
+    /// over the same file on its first statement, so a `BEGIN` on one is not
+    /// joined by another, the other reads only what is committed, and a second
+    /// writer is refused with [`Status::Busy`] after the busy timeout, as a
+    /// second process is. A function, a collation or a pragma set on one
+    /// connection is not set on another. Opening that engine costs what opening
+    /// a second `Database` on the file costs, so keep a connection, and call
+    /// [`Database::release_session`] when one is finished with.
+    ///
+    /// **It is called `session` because it also scopes `temp` and `ATTACH`
+    /// (task-1961, A5).** `connect` is kept as a deprecated alias for one
+    /// release.
     pub fn session(&self) -> Connection<'_> {
         Connection {
             database: self,
@@ -610,12 +625,21 @@ impl Database {
     /// Returns a connection to this database.
     ///
     /// Renamed [`Database::session`] in task-1961.
-    #[deprecated(
-        since = "0.1.3",
-        note = "renamed `session`: two of these share one transaction"
-    )]
+    #[deprecated(since = "0.1.3", note = "renamed `session`")]
     pub fn connect(&self) -> Connection<'_> {
         self.session()
+    }
+
+    /// Ends a connection's session and frees the engine it ran on.
+    ///
+    /// For a caller that closes connections: the C library calls it when the
+    /// last handle on a connection is freed. The first connection's engine is
+    /// the database's own and is kept. A transaction the session left open is
+    /// rolled back.
+    ///
+    /// @param session - the number [`Connection::session`] returned
+    pub fn release_session(&self, session: u64) {
+        self.engine.release_session(session);
     }
 
     /// Returns a connection that continues an earlier one's session.
@@ -1195,7 +1219,7 @@ impl Connection<'_> {
             started,
             self.database.options.diagnostics,
         )
-        .map_err(|error| self.database.classify(&error))
+        .map_err(|failure| failure.classified(|error| self.database.classify(error)))
     }
 
     /// Refuses a statement that is not a query, for a read-only connection.
@@ -1783,7 +1807,7 @@ impl Statement<'_> {
         self.engine.reset();
         let diagnostics = self.connection.database.options.diagnostics;
         collect(&mut self.engine, &self.sql, limit, started, diagnostics)
-            .map_err(|error| self.connection.database.classify(&error))
+            .map_err(|failure| failure.classified(|error| self.connection.database.classify(error)))
     }
 
     /// Runs the statement once for each list of values, adding the rows each
@@ -1935,10 +1959,34 @@ fn bind_all(statement: &mut EngineStatement<'_>, params: &[Value]) -> Result<()>
     Ok(())
 }
 
+/// A statement that failed, with the rows it produced first.
+struct CollectFailure {
+    /// What the engine said.
+    error: inillucent_engine::DbError,
+    /// The rows produced before the failure, when there were any.
+    ///
+    /// Boxed so the `Err` of `collect` stays small.
+    partial: Option<Box<Rows>>,
+}
+
+impl CollectFailure {
+    /// Turns the failure into the driver's error, carrying the rows before it.
+    ///
+    /// @param classify - how the open database classifies an engine error
+    fn classified(self, classify: impl FnOnce(&inillucent_engine::DbError) -> Error) -> Error {
+        let mut error = classify(&self.error);
+        error.partial = self.partial;
+        error
+    }
+}
+
 /// Steps a statement to the end and collects what it produced.
 ///
 /// **The limit cuts what is handed back, never what is produced**, so `total` is
 /// the exact count and `more` is a fact. See [`rows`].
+///
+/// A statement that fails after producing rows hands those rows back with the
+/// failure, because SQLite returns every row before the one that raised it.
 ///
 /// @param statement - the engine statement
 /// @param sql - the statement's text, for the tag
@@ -1951,11 +1999,20 @@ fn collect(
     limit: usize,
     started: Instant,
     diagnostics: bool,
-) -> std::result::Result<Rows, inillucent_engine::DbError> {
+) -> std::result::Result<Rows, CollectFailure> {
     let _ = diagnostics;
     let mut kept: Vec<Vec<Value>> = Vec::new();
     let mut total = 0usize;
-    while statement.step()? {
+    loop {
+        match statement.step() {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                let partial = (total > 0)
+                    .then(|| Box::new(rows_collected(statement, sql, limit, started, kept, total)));
+                return Err(CollectFailure { error, partial });
+            }
+        }
         total = total.saturating_add(1);
         if kept.len() < limit {
             // Taken rather than copied: the statement does not read the row
@@ -1969,6 +2026,25 @@ fn collect(
             );
         }
     }
+    Ok(rows_collected(statement, sql, limit, started, kept, total))
+}
+
+/// Builds the result of a statement from the rows it produced.
+///
+/// @param statement - the engine statement, already stepped
+/// @param sql - the statement's text, for the tag
+/// @param limit - how many rows were to be kept
+/// @param started - when the call began
+/// @param kept - the rows kept
+/// @param total - how many rows the statement produced
+fn rows_collected(
+    statement: &EngineStatement<'_>,
+    sql: &str,
+    limit: usize,
+    started: Instant,
+    kept: Vec<Vec<Value>>,
+    total: usize,
+) -> Rows {
     let columns: Vec<Column> = statement
         .columns()
         .iter()
@@ -1986,7 +2062,7 @@ fn collect(
         Some(count) if columns.is_empty() => count as usize,
         _ => total,
     };
-    Ok(Rows {
+    Rows {
         columns,
         rows: kept,
         affected,
@@ -1994,7 +2070,7 @@ fn collect(
         more: total > limit,
         elapsed: started.elapsed(),
         tag: rows::tag_for(sql, counted),
-    })
+    }
 }
 
 /// Reads a cell as text, answering the empty string for anything else.

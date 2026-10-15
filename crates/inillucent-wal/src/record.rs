@@ -368,6 +368,21 @@ pub enum Body<'a> {
         /// The version the file now has.
         version: u32,
     },
+    /// The file moved to format 4.
+    ///
+    /// **A kind of its own so that a release that only knows format 3 refuses the
+    /// log by kind.** [`Body::Format`] is known to every release since 2.5.0 and
+    /// those would read `version: 4`, raise their in memory number and go on
+    /// replaying records they cannot read. This one meets "a log record has kind
+    /// 22, which this format does not define" in them, which is a refusal that
+    /// names what happened. Written once per file, before the first page that
+    /// only format 4 reads: a leaf with fewer columns than its table, or a row
+    /// stored in the compact integer encoding. It belongs to no transaction, for
+    /// the reason [`Body::Format`] gives, and replay raises the in memory version.
+    FormatRaised {
+        /// The version the file now has.
+        version: u32,
+    },
     /// A page moved from one number to another, and one field that named it now
     /// names the new number.
     ///
@@ -476,6 +491,7 @@ impl Body<'_> {
             Body::Pad { .. } => kind::PAD,
             Body::BulkBuilt { .. } => kind::BULK_BUILT,
             Body::Format { .. } => kind::FORMAT,
+            Body::FormatRaised { .. } => kind::FORMAT_RAISED,
             Body::Relink { .. } => kind::RELINK,
             Body::PageCount { .. } => kind::PAGE_COUNT,
         }
@@ -562,6 +578,13 @@ pub mod kind {
     ///
     /// Kind 21, with the same compatibility as [`RELINK`].
     pub const PAGE_COUNT: u8 = 21;
+    /// [`super::Body::FormatRaised`].
+    ///
+    /// A log written before it holds no record of this kind, so an older log reads
+    /// unchanged, and a release that stops at format 3 refuses a log holding one
+    /// with "a log record has kind 22, which this format does not define". A log
+    /// holds one only when the file moved to format 4, and a clean close folds it.
+    pub const FORMAT_RAISED: u8 = 22;
 }
 
 /// One decoded log record.
@@ -618,6 +641,7 @@ impl<'a> Record<'a> {
             | Body::CatalogChange { .. }
             | Body::BulkBuilt { .. }
             | Body::Format { .. }
+            | Body::FormatRaised { .. }
             | Body::Pad { .. } => PageList::none(),
             // **Many pages, so none here.** Recovery decides each entry's page
             // itself; see `entries_to_apply` in `recover.rs`.
@@ -957,7 +981,7 @@ fn encode_body(body: &Body<'_>, out: &mut Vec<u8>) -> DbResult<()> {
             out.extend_from_slice(&first.to_le_bytes());
             out.extend_from_slice(&count.to_le_bytes());
         }
-        Body::Format { version } => {
+        Body::Format { version } | Body::FormatRaised { version } => {
             out.extend_from_slice(&version.to_le_bytes());
         }
         Body::Relink { from, to, site } => {
@@ -1105,6 +1129,9 @@ fn decode_body(kind: u8, payload: &[u8]) -> DbResult<(Body<'_>, usize)> {
             count: cursor.u64()?,
         },
         kind::FORMAT => Body::Format {
+            version: cursor.u32()?,
+        },
+        kind::FORMAT_RAISED => Body::FormatRaised {
             version: cursor.u32()?,
         },
         kind::RELINK => Body::Relink {
@@ -1530,6 +1557,7 @@ mod tests {
                 count: 191,
             },
             Body::Format { version: 3 },
+            Body::FormatRaised { version: 4 },
             Body::Relink {
                 from: 90,
                 to: 12,
@@ -1605,6 +1633,27 @@ mod tests {
         // move a page and lower the file's end.
         assert_eq!(kind::RELINK, 20);
         assert_eq!(kind::PAGE_COUNT, 21);
+        assert_eq!(kind::FORMAT_RAISED, 22);
+    }
+
+    /// The record that raises the format to 4 has kind 22, round trips, names no
+    /// page, and is refused when a byte is missing.
+    #[test]
+    fn the_format_raised_record_round_trips() {
+        let body = Body::FormatRaised { version: 4 };
+        assert_eq!(body.kind(), 22);
+        let bytes = encoded(body);
+        let record = Record::decode(&bytes)
+            .expect("the record decodes")
+            .expect("a whole record");
+        assert_eq!(record.body, body);
+        assert!(record.pages().as_slice().is_empty());
+        for cut in 0..bytes.len() {
+            assert!(
+                !matches!(Record::decode(bytes.get(..cut).unwrap()), Ok(Some(_))),
+                "a record cut at {cut} decoded"
+            );
+        }
     }
 
     /// The format record has kind 19, round trips, names no page, and is

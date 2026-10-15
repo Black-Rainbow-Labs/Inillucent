@@ -201,6 +201,11 @@ A failure has `"ok": false`, a `status` and a `message`:
 }
 ```
 
+A query that fails on one row of a result has produced the rows before it, as SQLite has. Those rows
+are in the failure's `columns`, `rows`, `row_count`, `total` and `more` members, and `text` holds the
+table followed by the error line. A failure that came before the first row has none of those members.
+Without `--output json` the rows go to standard output and the error to standard error.
+
 A script should read these fields and branch on `status`. The `text` field is for people.
 
 ## Exit codes
@@ -210,7 +215,7 @@ A script should read these fields and branch on `status`. The `text` field is fo
 | `0` | The command succeeded. | a query that returned rows |
 | `1` | The command ran and failed. | bad SQL, a constraint, a missing table, a file that cannot be read |
 | `2` | The command line could not be acted on. | a mistyped command, an unknown option |
-| `3` | The engine has not built that feature yet. | `ATTACH ? AS other`, a file name that is a parameter and not a string literal |
+| `3` | The engine has not built that feature yet. | `EXPLAIN EXPLAIN SELECT 1`, an `EXPLAIN` of another `EXPLAIN` |
 
 Exit code 3 means "not built yet". A script can check for it without reading the message. Rewording
 the SQL will not help. Over MCP and the language bindings, the same case has the status

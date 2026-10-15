@@ -218,16 +218,17 @@ fn an_autocommit_statement_syncs_once() {
     );
 }
 
-/// A fold syncs the data file twice, writes each dirty page once, and has an
-/// after image of every one of them in the log first.
+/// A fold syncs the data file three times, writes each dirty page once, and has
+/// an after image of every one of them in the log first.
 ///
 /// The second of task-2000's testing strategy, and the three halves of design 1a
 /// in one assertion: the images are what make an interrupted in place write
-/// repairable, the two syncs are the durability order - pages, then the record
-/// that says the pages are there - and one write a page is the change design 2
+/// repairable, the three syncs are the durability order - pages, then the shadow
+/// meta slot, then the primary slot, so no meta record is durable beside a page
+/// that is not - and one write a page is the change design 2
 /// depends on not having to undo.
 #[test]
-fn a_fold_syncs_twice_and_writes_each_page_once() {
+fn a_fold_syncs_three_times_and_writes_each_page_once() {
     let vfs = simulator(9_002);
     let mut engine =
         ImportedDatabase::create_on(Arc::clone(&vfs) as Arc<dyn Vfs>, path(), PAGE_SIZE, FRAMES)
@@ -249,9 +250,9 @@ fn a_fold_syncs_twice_and_writes_each_page_once() {
     };
     let asked = asked_since(&vfs, from);
     assert_eq!(
-        asked.file_syncs, 2,
-        "a fold syncs the data file twice - once behind the pages, once behind \
-         the meta record - and this took {}",
+        asked.file_syncs, 3,
+        "a fold syncs the data file three times - behind the pages, behind the \
+         shadow meta slot and behind the primary slot - and this took {}",
         asked.file_syncs
     );
     assert!(

@@ -89,9 +89,14 @@ Any other type raises `TypeError`.
 
 ### Threads
 
-The engine is single threaded, and the driver has no lock inside. Use a `Database` and everything
-opened from it on one thread, or serialize every call yourself. `Connection.cancel()` is the one call
-meant to come from another thread.
+The engine is single threaded, and the interpreter lock is let go while a statement runs. So that two
+threads are never inside one database together, every call on a `Database`, and on the connections,
+statements and transactions opened from it, takes one lock that the `Database` owns. A second thread
+waits until the first call returns and then runs. `Connection.cancel()` is the one call that does not
+take the lock, because it exists to be made from another thread while a statement runs. The lock covers
+one call. A `Transaction` that stays open between calls does not stop another thread's statements on
+the same connection from running inside it, so give each thread its own connection, or keep a
+transaction on one thread.
 
 ## Encrypted databases
 
@@ -221,7 +226,7 @@ reads this table and fails if a name in the first column is not declared in the 
 | what | one line |
 |---|---|
 | `Database(path, create=True, read_only=False, diagnostics=False)` | opens a database file. `path` is a `str`, `bytes` or any `os.PathLike`, and a path holding a NUL character raises `ValueError`. `create=True` makes the file when it is missing. A missing file opened with `read_only=True` raises `DriverError` with the status `NOT_FOUND`, whatever `create` says. A file that is not a database, has a newer format or needs a key is refused here; a damaged log is reported by the first statement, which is when the log is read. |
-| `Database.connect()` | returns a new `Connection`. Each connection is its own session, and `temp.` tables and `ATTACH` belong to one session. **Two connections of one `Database` share one transaction.** A write through one is undone by a `ROLLBACK` on the other. An application that needs isolated connections opens a second `Database` on the same file, which takes the file lock the way a second process does. |
+| `Database.connect()` | returns a new `Connection`. Each connection is its own session, and `temp.` tables and `ATTACH` belong to one session. **Each connection has a transaction of its own.** A `BEGIN` on one is not joined by another, the other reads only what is committed, a second writer waits for the busy timeout and then raises `DriverError` with the status `BUSY`, and a write through one connection is kept when another rolls back, as in Python's `sqlite3`. A connection other than the first runs on an engine of its own, opened over the file on its first statement, so keep a connection instead of opening one for each statement. `Connection.close()` releases that engine. |
 | `Database.path` | a property: the path of the database file. |
 | `Database.checkpoint()` | copies everything written so far into the database file. |
 | `Database.integrity_check()` | checks every table and index, and raises on the first problem. |

@@ -316,6 +316,37 @@ impl ExternalEntries {
     }
 }
 
+/// Returns the failure a `CREATE UNIQUE INDEX` reports when two rows share a key.
+///
+/// @param owner - the table, for the message
+/// @param index - the index, for the message
+pub(crate) fn unique_violation(
+    owner: &inillucent_sql::catalog_view::TableInfo,
+    index: &inillucent_sql::catalog_view::IndexInfo,
+) -> inillucent_base::DbError {
+    let columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|key| {
+            let name = key
+                .column
+                .and_then(|at| owner.column(at))
+                .map(|column| String::from_utf8_lossy(&column.name).into_owned())
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}.{}", String::from_utf8_lossy(&owner.name), name)
+        })
+        .collect();
+    // `SQLITE_CONSTRAINT_UNIQUE` (2067), which is what SQLite reports
+    // when the rows already there break the new index; `refusal`
+    // answered `SQLITE_MISUSE` (21).
+    let said = format!("UNIQUE constraint failed: {}", columns.join(", "));
+    inillucent_base::DbError::new(inillucent_base::ExtendedCode(
+        inillucent_sql::dml::codes::UNIQUE,
+    ))
+    .with_message(said.clone())
+    .with_detail(said)
+}
+
 /// Orders two entries the way the tree compares them: column by column under the key's collations,
 /// reversing a descending column.
 ///

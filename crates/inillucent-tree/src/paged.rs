@@ -279,7 +279,10 @@ pub struct PagedTree {
     /// and leaves an unknown one for the pages to answer.
     pub(crate) shape: std::cell::Cell<Option<(u16, PageId)>>,
     /// The column directory.
-    columns: Vec<ColumnSpec>,
+    pub(crate) columns: Vec<ColumnSpec>,
+    /// What a leaf written before the tree gained a column reads as for that
+    /// column. Empty for a tree that never has; see [`PagedTree::set_shape`].
+    pub(crate) pad: crate::leaf::TreePad,
     /// How many leading columns form the key.
     key_columns: usize,
     /// The database's page size in bytes.
@@ -556,6 +559,7 @@ impl PagedTree {
             root,
             shape: std::cell::Cell::new(None),
             columns,
+            pad: crate::leaf::TreePad::default(),
             key_columns,
             page_size: pool.page_size(),
             encoding,
@@ -922,6 +926,7 @@ impl PagedTree {
                 if let Some(image) = self.merged_copy(pool, page, &leaf)? {
                     let packed = LeafRef::parse(&image)?
                         .with_collations(&self.collations)
+                        .with_pad(&self.pad)
                         .with_directions(&self.directions)
                         .with_pool(pool);
                     return visit(&packed);
@@ -1134,6 +1139,7 @@ impl PagedTree {
             if page::kind_of(&guard)? == PageKind::Leaf {
                 let leaf = LeafRef::parse(&guard)?
                     .with_collations(&self.collations)
+                    .with_pad(&self.pad)
                     .with_directions(&self.directions)
                     .with_pool(pool);
                 return self.with_leaf_extents(pool, None, leaf, |leaf| visit(leaf));

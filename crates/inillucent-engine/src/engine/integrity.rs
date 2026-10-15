@@ -126,7 +126,93 @@ impl crate::ImportedDatabase {
         // It is the last of the three because it is the one `quick_check`
         // leaves out, and it is left out because it is the expensive one: two
         // walks and a merge per index, where the two above read each page once.
-        self.check_indexes_agree()
+        self.check_indexes_agree()?;
+        self.check_search_tables_agree()
+    }
+
+    /// Reports an `inillucent_search` table, or a vector index built on one, that disagrees with
+    /// what it indexes.
+    ///
+    /// **Two comparisons, both of them counts.** The module's own check compares the table's
+    /// rows with the vectors the index holds (the live segments with the delta log on top), so a
+    /// row the index lost is reported. For a table that is a vector index on another table
+    /// (`CREATE INDEX ... USING inillucent_hnsw`), the rows the index keeps are then compared
+    /// with the source table's rows whose vector is not NULL. A rolled back `DROP TABLE` once
+    /// left later rows out of such an index while this check answered `ok`, because it walked
+    /// trees and the free map and never looked at a module's content.
+    ///
+    /// Only the `inillucent_search` module is asked. The other modules keep their own check for
+    /// their own commands.
+    fn check_search_tables_agree(&self) -> DbResult<()> {
+        let mut names: Vec<&Vec<u8>> = self.session_state.virtual_tables.keys().collect();
+        names.sort_unstable();
+        for name in names {
+            let Some(connected) = self.session_state.virtual_tables.get(name) else {
+                continue;
+            };
+            if !connected
+                .arguments
+                .module
+                .eq_ignore_ascii_case(b"inillucent_search")
+            {
+                continue;
+            }
+            let shown = String::from_utf8_lossy(&connected.arguments.table).into_owned();
+            if let inillucent_exec::physical::ModuleIntegrity::Report(report) =
+                self.module_integrity(name)?
+            {
+                return Err(refusal("integrity check failed")
+                    .with_detail(format!("search table {shown}: {report}")));
+            }
+            self.check_index_against_source(&connected.arguments, &shown)?;
+        }
+        Ok(())
+    }
+
+    /// Compares a vector index's rows with the non NULL vectors of the table it indexes.
+    ///
+    /// A table with no `source` argument is not an index on another table, so there is nothing
+    /// to compare it with and this does nothing.
+    ///
+    /// @param arguments - what the index's virtual table was connected with
+    /// @param shown - the index's name, for the message
+    fn check_index_against_source(
+        &self,
+        arguments: &inillucent_sql::vtab::ModuleArguments,
+        shown: &str,
+    ) -> DbResult<()> {
+        let (Some(source), Some(column)) = (
+            crate::argument_of(&arguments.arguments, b"source"),
+            crate::argument_of(&arguments.arguments, b"source_column"),
+        ) else {
+            return Ok(());
+        };
+        let quote = |text: &[u8]| String::from_utf8_lossy(text).replace('"', "\"\"");
+        let in_table = self.count_rows(&format!(
+            "SELECT count(*) FROM \"{}\" WHERE \"{}\" IS NOT NULL",
+            quote(&source),
+            quote(&column)
+        ))?;
+        let content = crate::vtab::shadow_table_name(&arguments.table, b"content");
+        let in_index = self.count_rows(&format!("SELECT count(*) FROM \"{}\"", quote(&content)))?;
+        if in_table != in_index {
+            return Err(refusal("integrity check failed").with_detail(format!(
+                "wrong # of entries in index {shown}: the index holds {in_index} vectors and {} has {in_table}",
+                String::from_utf8_lossy(&source)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Runs a query that returns one integer and returns it.
+    ///
+    /// @param sql - a `SELECT count(*)` statement
+    fn count_rows(&self, sql: &str) -> DbResult<i64> {
+        let (rows, _) = self.run(sql)?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(OwnedDatum::Int(count)) => Ok(*count),
+            _ => Err(refusal("a count returned something other than an integer")),
+        }
     }
 
     /// Writes one entry straight into an index tree, past the write path.

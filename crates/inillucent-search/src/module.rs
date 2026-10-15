@@ -1672,8 +1672,32 @@ impl VirtualTable for SearchTable {
                 "the row count says {recorded} and the table holds {counted}"
             ));
         }
-        for entry in self.store.deltas_above(context, covered)? {
-            if entry.op == Op::Put && self.store.read_row(context, entry.id)?.is_none() {
+        // The index is compared with the rows by count. A row the index lost shows here, and so
+        // does an index entry for a row that is gone: the shadow tables are ordinary tables, and
+        // a rolled back statement once left rows out of the index while every tree was sound.
+        if problems.is_empty() {
+            match self.cache.live_rows(context, &self.store, &self.options) {
+                Ok(indexed) if i64::try_from(indexed).ok() != Some(counted) => {
+                    problems.push(format!(
+                        "the index holds {indexed} vectors and the table holds {counted} rows"
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => problems.push(format!("the index cannot be read: {error}")),
+            }
+        }
+        // Only the last entry for a row says whether the row should exist: an insert followed by
+        // a delete leaves a Put in the log and no row, and that is a healthy table.
+        let log = self.store.deltas_above(context, covered)?;
+        let mut last_put: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
+        for entry in &log {
+            last_put.insert(entry.id, entry.op == Op::Put);
+        }
+        for entry in log {
+            if entry.op == Op::Put
+                && last_put.get(&entry.id).copied().unwrap_or(false)
+                && self.store.read_row(context, entry.id)?.is_none()
+            {
                 problems.push(format!(
                     "the log says row {} was written and it is not there",
                     entry.id

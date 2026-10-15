@@ -232,7 +232,7 @@ impl Redo for PageStore {
             Body::BulkBuilt { .. } => {}
             // The file's format version, which a page store does not have.
             // See `Body::Format`.
-            Body::Format { .. } => {}
+            Body::Format { .. } | Body::FormatRaised { .. } => {}
             // A page that moved is named by a field in some other page, which a
             // page store with no tree cannot interpret. See `Body::Relink`.
             Body::Relink { .. } => {}

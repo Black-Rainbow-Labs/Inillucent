@@ -80,6 +80,26 @@ impl<'p> LeafRef<'p> {
         }
     }
 
+    /// Returns the same leaf, reading the columns the tree has gained since it was written.
+    ///
+    /// A leaf with as many columns as the tree is returned unchanged. A shorter
+    /// one answers every column past its own from the pad: a column read gives
+    /// the tree's default for it, a delta row has it appended, and
+    /// [`LeafRef::column_count`] says the tree's width. What the page holds, and
+    /// what walks the page, still use [`LeafRef::physical_column_count`].
+    ///
+    /// @param pad - the tree's columns and what a leaf without them reads as
+    pub fn with_pad(self, pad: &'p TreePad) -> LeafRef<'p> {
+        if pad.width() <= self.page_columns {
+            return self;
+        }
+        LeafRef {
+            width: pad.width(),
+            pad: Some(pad),
+            ..self
+        }
+    }
+
     /// Returns the collation of one key column.
     ///
     /// @param index - the key column's position

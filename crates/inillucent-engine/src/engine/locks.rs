@@ -325,6 +325,10 @@ impl ImportedDatabase {
     ///   process appended to this segment, which opens it. A roll with nothing to append is a
     ///   checkpoint's, and a checkpoint moves the meta record, which `the_meta_moved` asks of the
     ///   file on every statement regardless, and then deletes this segment.
+    /// - A second connection in this process shares this segment's file object, so its open does
+    ///   not break the oplock, and a roll that finds everything already written leaves the segment
+    ///   untouched. `Wal::roll_now` calls `VfsFile::end_quiet` for that case, which moves the
+    ///   token without a break.
     ///
     /// While this process holds the batch oplock on the segment, no other handle to it exists,
     /// and any open breaks it; the watcher moves the token before it lets that open proceed
@@ -590,7 +594,12 @@ impl ImportedDatabase {
             return Ok(false);
         }
         let tail = held.wal.tail_of_open_segment()?;
-        Ok(tail.sequence != held.wal.sequence() || tail.next_lsn != held.wal.written_end())
+        // **And whether the log rolled on past the open segment**, for the reason
+        // `the_log_moved` gives: a roll writes no meta record and leaves the segment this
+        // connection had open at the length it last saw.
+        Ok(tail.sequence != held.wal.sequence()
+            || tail.next_lsn != held.wal.written_end()
+            || held.wal.next_segment_exists()?)
     }
 
     /// Puts back the pages a dead process left in one attached file.
@@ -623,7 +632,8 @@ impl ImportedDatabase {
             ));
         }
         held.database.end_access()?;
-        let replayed = inillucent_pool::journal::replay_hot_journal(held.vfs.as_ref(), &db_path);
+        let replayed =
+            crate::recovery::replay_hot_journal_holding_the_log(held.vfs.as_ref(), &db_path);
         let retaken = match writing {
             true => held.database.begin_write_within(true),
             false => held.database.begin_read(),
@@ -839,8 +849,10 @@ impl ImportedDatabase {
             ));
         }
         self.storage.database.end_access()?;
-        let replayed =
-            inillucent_pool::journal::replay_hot_journal(self.storage.vfs.as_ref(), &db_path);
+        let replayed = crate::recovery::replay_hot_journal_holding_the_log(
+            self.storage.vfs.as_ref(),
+            &db_path,
+        );
         let retaken = match writing {
             true => self.storage.database.begin_write_within(true),
             false => self.storage.database.begin_read(),
@@ -1288,8 +1300,19 @@ impl ImportedDatabase {
         // closed without folding it either, because a reader appends nothing.
         // `since_checkpoint` counts only what this connection appended, so a
         // read-only session still releases without taking the file exclusively.
+        //
+        // **And of the log the open found, when it ended with a transaction that never
+        // committed.** Recovery discards such a tail and writes nothing about having done so: the
+        // discarded records stay in the log below the recovery point, and every later open scans
+        // them again and prints "recovered the log" until some session writes and folds. A
+        // session that only reads holds nothing dirty and appended nothing, so the questions
+        // above answered "nothing held" and the tail was rescanned on every open (a session that
+        // ran refused statements inside a transaction left a database like that). The fold moves
+        // the recovery point past the tail, and it takes the brief path below, so a reader still
+        // does not wait for a writer.
         let holding = self.holds_what_the_file_does_not(&self.storage.database)
             || self.storage.wal.since_fold() > 0
+            || self.recovery_discarded_a_tail()
             || self.session_state.attached.iter().any(|held| {
                 held.path.is_some()
                     && (self.holds_what_the_file_does_not(&held.database)
@@ -1324,6 +1347,15 @@ impl ImportedDatabase {
             Err(error) if error.code() == inillucent_base::error::PrimaryCode::Busy => Ok(()),
             other => other,
         }
+    }
+
+    /// Reports whether the recovery this connection's open ran threw away an uncommitted tail.
+    ///
+    /// Only an open that could write answers yes: a read only connection cannot fold, so it
+    /// recovers again at its next open, as a SQLite connection to a write ahead log it cannot
+    /// write does.
+    fn recovery_discarded_a_tail(&self) -> bool {
+        !self.storage.read_only && self.storage.recovery.losers > 0
     }
 
     /// Takes the write lock, folds, and lets the lock go: the close's fold.

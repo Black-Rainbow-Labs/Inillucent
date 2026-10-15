@@ -501,6 +501,19 @@ impl PagedTree {
         let collations = collations_of(&columns, key_columns);
         let directions = directions_of(&columns, key_columns);
         let builder = LeafBuilder::new(page_size, tree_id, columns.clone(), key_columns)?;
+        // A row of many integers is written in the compact encoding, which only format 4
+        // reads. Rows are looked at only for a table wide enough that one could be.
+        if columns.len().saturating_mul(9) > page_size / 2 {
+            let wide = (0..rows.len()).any(|at| {
+                let row: Vec<Datum<'d>> = (0..columns.len()).map(|c| rows.value(at, c)).collect();
+                Datum::row_is_wide(&row, page_size)
+            });
+            if wide && database.raise_format(inillucent_pool::meta::FORMAT_FOUR) {
+                if let Some(log) = log.as_deref_mut() {
+                    log.log_format(inillucent_pool::meta::FORMAT_FOUR)?;
+                }
+            }
+        }
         crate::keylimit::refuse_rows_with_a_key_over_the_limit(
             rows,
             key_columns,

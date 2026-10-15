@@ -97,9 +97,9 @@ pub use capi::value::*;
 /// `inillucent_open_with_timeout`, 1.3.0 added `inillucent_rows_json`,
 /// `inillucent_bind_json` and `inillucent_stmt_execute_many`, and 1.4.0 added
 /// `inillucent_py_stmt_execute`, `inillucent_py_execute` and
-/// `inillucent_py_init_threads`. A new symbol is a minor version: a binding
+/// `inillucent_py_init_threads`, and 1.5.0 added `inillucent_release_models`. A new symbol is a minor version: a binding
 /// written against 1.0.0 still finds every symbol it calls.
-pub const ABI_VERSION: u32 = 1_004_000;
+pub const ABI_VERSION: u32 = 1_005_000;
 
 // —— status codes, which the header freezes ————————————————————————
 
@@ -307,6 +307,18 @@ pub extern "C" fn inillucent_version() -> *const c_char {
         },
         std::ptr::null(),
     )
+}
+
+/// Drops the loaded embedder and reranker sessions, so a program can release ONNX Runtime's
+/// threads from its own code before it exits.
+///
+/// A process that used `embed()` and then exited could abort on macOS, because ONNX Runtime's own
+/// C++ destructors ran while a session's threads were still running. A wrapper calls this just
+/// before the process ends. It is safe to call at any time, when nothing is loaded, and in a build
+/// without embedding, where it does nothing. A later `embed()` loads the model again.
+#[no_mangle]
+pub extern "C" fn inillucent_release_models() {
+    guarded_value(inillucent_driver::release_models, ());
 }
 
 /// Returns how many capabilities this build declares.

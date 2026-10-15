@@ -109,6 +109,14 @@ pub(crate) struct WriteView<'a> {
     /// statement, each checked again when it ends. See
     /// `WriteTarget::defer_key_check`.
     pub(crate) pending_keys: std::cell::RefCell<Vec<Vec<u8>>>,
+    /// The root of the first table this statement wrote that has a vector index on it.
+    ///
+    /// A statement's row images are not labelled with the table they came from, so the engine
+    /// needs this to apply them to that table's indexes and to no other table's. Set by
+    /// `captures`, which every write asks before it stores its first row.
+    pub(crate) captured_root: std::cell::Cell<Option<u32>>,
+    /// What trigger bodies wrote, each with the root of the table it was written to.
+    pub(crate) body_changes: Vec<(u32, Changes)>,
     /// Whether the statement is a single row `INSERT ... VALUES` with no
     /// triggers of its own. See `WriteTarget::defer_key_check`.
     pub(crate) single_row: std::cell::Cell<bool>,
@@ -173,6 +181,7 @@ impl WriteView<'_> {
             .with_unsupported(format!("reading {name} inside a write")));
         }
         let reach = crate::vtab::ScanReach {
+            view: None,
             modules: self.modules,
             registry: self.registry,
             pool: self.database.pool(),
@@ -277,7 +286,17 @@ impl WriteTarget for WriteView<'_> {
     }
 
     fn captures(&self, root: u32) -> bool {
-        self.indexed.contains_key(&root)
+        let indexed = self.indexed.contains_key(&root);
+        if indexed && self.captured_root.get().is_none() {
+            self.captured_root.set(Some(root));
+        }
+        indexed
+    }
+
+    fn report_body_changes(&mut self, root: u32, changes: Changes) {
+        if self.indexed.contains_key(&root) {
+            self.body_changes.push((root, changes));
+        }
     }
 
     fn defer_module_write(&mut self, write: inillucent_exec::dml::ModuleWrite) -> DbResult<()> {
@@ -439,7 +458,10 @@ impl TreeLog for WalLog<'_> {
         // Owned by no transaction, so recovery replays it even when this
         // transaction is abandoned; see `TreeLog::log_format`.
         self.wrote = true;
-        self.wal.append(0, Body::Format { version })
+        match version > inillucent_pool::meta::FORMAT_VERSION {
+            true => self.wal.append(0, Body::FormatRaised { version }),
+            false => self.wal.append(0, Body::Format { version }),
+        }
     }
 
     fn log_insert_row(&mut self, tree: u64, page: u64, row: &[u8]) -> DbResult<u64> {

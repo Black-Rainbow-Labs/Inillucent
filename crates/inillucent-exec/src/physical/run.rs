@@ -133,6 +133,56 @@ pub fn run_prepared_limited(
     let collected = std::mem::take(&mut *rows.borrow_mut());
     Ok((collected, shape))
 }
+/// Runs any planned query with every row handed to a consumer as it is produced.
+///
+/// **A query that is one pipeline streams; a compound or a windowed query does not.** Neither is
+/// one pipeline (see [`run_any_prepared_limited`]), so their rows are collected and then handed
+/// over, which is what they cost before and is not worse. The consumer is returned whatever the
+/// outcome, with the result of the run beside it.
+///
+/// @param plan - the planner's output
+/// @param catalog - where the trees and layouts come from
+/// @param prepared - the structural choice
+/// @param params - the values bound to `?1`, `?2`, ...
+/// @param consumer - what takes each row
+pub fn run_any_prepared_streaming(
+    plan: &PhysicalPlan,
+    catalog: &dyn TreeCatalog,
+    prepared: &Prepared,
+    params: &Params,
+    mut consumer: Box<dyn crate::ops::RowConsumer>,
+) -> (DbResult<()>, Box<dyn crate::ops::RowConsumer>) {
+    if !plan.compounds.is_empty() || !plan.select.windows.is_empty() {
+        let handed = match run_any_prepared(plan, catalog, prepared, params) {
+            Ok((rows, _)) => crate::ops::hand_over(&rows, consumer.as_mut()),
+            // The rows a failing query had produced come out before the failure, as they do
+            // when the rows are collected and the statement is stepped.
+            Err(error) => {
+                let delivered = take_partial_rows();
+                match crate::ops::hand_over(&delivered, consumer.as_mut()) {
+                    Ok(()) => Err(error),
+                    Err(refused) => Err(refused),
+                }
+            }
+        };
+        return (handed, consumer);
+    }
+    let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let cell: crate::ops::Streaming = std::rc::Rc::new(std::cell::RefCell::new(Some(consumer)));
+    let sink = Box::new(CollectInto::new(rows).with_streaming(std::rc::Rc::clone(&cell)));
+    let ran = build_prepared(plan, catalog, prepared, params, sink)
+        .and_then(|(mut pipeline, _)| pipeline.run());
+    let consumer = cell.borrow_mut().take();
+    match consumer {
+        Some(consumer) => (ran, consumer),
+        None => (
+            Err(inillucent_base::error::misuse(
+                "a streamed statement lost its consumer",
+            )),
+            Box::new(crate::ops::NoConsumer),
+        ),
+    }
+}
 /// Runs a compound query: two or more arms joined by a set operator.
 ///
 /// **Each arm is an ordinary plan and is run as one.** The set operation is
@@ -193,8 +243,15 @@ pub fn run_compound_into(
     let params = folded.as_ref().unwrap_or(params);
     let collations = compound_collations(plan);
     let spill = catalog.spill();
+    let streams = compound_streams(plan);
     let gathering = new_gathering(&spill);
-    let shape = run_arm_into(plan, catalog, params, collecting(&gathering))?;
+    let shape = match run_arm_into(plan, catalog, params, collecting(&gathering)) {
+        Ok(shape) => shape,
+        Err(error) => {
+            stash_partial(&gathering);
+            return compound_failure_into(plan, params, streams, error, sink);
+        }
+    };
     let mut rows = take_gathered(&gathering)?;
     for (op, arm) in &plan.compounds {
         if !arm.compounds.is_empty() {
@@ -203,12 +260,75 @@ pub fn run_compound_into(
             // is what the physical pass does with a shape it has not seen.
             return unsupported("a compound query nested inside a compound arm");
         }
-        rows = combine(kind_of(*op), &collations, rows, arm, catalog, params)?;
+        rows = match combine(kind_of(*op), &collations, rows, arm, catalog, params) {
+            Ok(combined) => combined,
+            Err(error) => return compound_failure_into(plan, params, streams, error, sink),
+        };
     }
-    let mut tail = compound_tail(&plan.select, params, catalog, sink)?;
+    let mut tail = compound_tail(&plan.select, params, catalog.spill(), sink)?;
     feed_rows(rows, tail.as_mut())?;
     tail.finish()?;
     Ok(shape)
+}
+/// Says whether a compound hands its rows out as each arm produces them.
+///
+/// **Only `UNION ALL` with no `ORDER BY` does.** SQLite sends the rows of each
+/// arm of such a compound to the caller as they are found, so an arm that fails
+/// has already returned the rows before it. `UNION`, `EXCEPT` and `INTERSECT`
+/// build a table of the whole answer first, and a sorted compound sorts it first,
+/// so a failure there returns no rows at all.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+fn compound_streams(plan: &PhysicalPlan) -> bool {
+    plan.select.order_by.is_empty()
+        && plan
+            .compounds
+            .iter()
+            .all(|(op, _)| *op == inillucent_sql::ast::CompoundOp::UnionAll)
+}
+/// Reports an arm of a compound that failed, with the rows SQLite would have returned first.
+///
+/// For a compound that streams, those are the rows of the arms before the one
+/// that failed and the rows that arm produced before it failed, with the
+/// compound's `OFFSET` and `LIMIT` applied. When the `LIMIT` is already met by
+/// them, SQLite never reaches the failing row and the answer is those rows.
+/// Otherwise they are kept for [`take_partial_rows`] and the failure is returned.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+/// @param params - the bound parameters
+/// @param streams - whether the compound hands out rows as each arm produces them
+/// @param earlier - the rows of the arms that finished
+/// @param error - what the failing arm said
+fn compound_failure(
+    plan: &PhysicalPlan,
+    params: &Params,
+    streams: bool,
+    mut earlier: Vec<Vec<OwnedDatum>>,
+    error: inillucent_base::DbError,
+) -> DbResult<(Vec<Vec<OwnedDatum>>, Shape)> {
+    let tail = take_partial_rows();
+    if !streams {
+        keep_partial_rows(Vec::new());
+        return Err(error);
+    }
+    earlier.extend(tail);
+    let wanted = constant_count(plan.select.limit.as_ref(), params, Negative::NoLimit)?;
+    let skipped = constant_count(plan.select.offset.as_ref(), params, Negative::Zero)?;
+    let enough =
+        wanted.is_some_and(|wanted| earlier.len() >= skipped.unwrap_or(0).saturating_add(wanted));
+    let kept = order_compound(&plan.select, earlier, params)?;
+    if enough {
+        let names = plan.select.columns.iter().map(|column| column.name.clone());
+        return Ok((
+            kept,
+            Shape {
+                names: names.collect(),
+                operators: Vec::new(),
+            },
+        ));
+    }
+    keep_partial_rows(kept);
+    Err(error)
 }
 /// Returns the collation each result column of a compound is compared under.
 ///
@@ -534,16 +654,51 @@ fn combine(
         })
     };
     if kind.needs_right_first() {
-        run_arm_into(arm, catalog, params, arm_sink())?;
+        run_arm_into(arm, catalog, params, arm_sink())
+            .inspect_err(|_| stash_partial(&gathering))?;
         operation.borrow_mut().next_arm();
         feed_rows(left, &mut *operation.borrow_mut())?;
     } else {
         feed_rows(left, &mut *operation.borrow_mut())?;
         operation.borrow_mut().next_arm();
-        run_arm_into(arm, catalog, params, arm_sink())?;
+        run_arm_into(arm, catalog, params, arm_sink())
+            .inspect_err(|_| stash_partial(&gathering))?;
     }
     operation.borrow_mut().finish()?;
     take_gathered(&gathering)
+}
+/// Keeps the rows a collection holds for [`take_partial_rows`], after the arm feeding it failed.
+///
+/// A failing arm of a compound that streams has delivered the rows before the failure, and SQLite
+/// returns them ahead of the error. They are read back whole, which only a failure pays for.
+///
+/// @param gathering - the collection the failed run was filling
+fn stash_partial(gathering: &std::rc::Rc<std::cell::RefCell<Option<Gathering>>>) {
+    let held = take_gathered(gathering).and_then(Gathered::into_rows);
+    keep_partial_rows(held.unwrap_or_default());
+}
+/// Reports an arm of a compound that failed, into a sink, with the rows SQLite returns first.
+///
+/// The rows the arms delivered are in [`take_partial_rows`] when this is called; see
+/// [`compound_failure`] for what is done with them. When the compound's `LIMIT` is met by
+/// them the answer is those rows and no failure.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+/// @param params - the bound parameters
+/// @param streams - whether the compound hands out rows as each arm produces them
+/// @param error - what the failing arm said
+/// @param sink - where the answer goes
+fn compound_failure_into(
+    plan: &PhysicalPlan,
+    params: &Params,
+    streams: bool,
+    error: inillucent_base::DbError,
+    mut sink: Box<dyn Sink>,
+) -> DbResult<Shape> {
+    let (rows, shape) = compound_failure(plan, params, streams, Vec::new(), error)?;
+    crate::ops::emit_rows(&rows, sink.as_mut())?;
+    sink.finish()?;
+    Ok(shape)
 }
 /// Pushes rows that were collected earlier into a sink, without finishing it.
 ///
@@ -576,6 +731,24 @@ fn feed_rows(rows: Gathered, sink: &mut dyn Sink) -> DbResult<()> {
     }
     Ok(())
 }
+/// Applies a compound's own `ORDER BY`, `LIMIT` and `OFFSET` to rows already in hand.
+///
+/// @param select - the head arm's bound statement, which carries them
+/// @param rows - the rows
+/// @param params - the bound parameters
+fn order_compound(
+    select: &BoundSelect,
+    rows: Vec<Vec<OwnedDatum>>,
+    params: &Params,
+) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = Box::new(CollectInto::new(std::rc::Rc::clone(&collected)));
+    let mut tail = compound_tail(select, params, None, sink)?;
+    feed_rows(Gathered::Rows(rows), tail.as_mut())?;
+    tail.finish()?;
+    let answer = std::mem::take(&mut *collected.borrow_mut());
+    Ok(answer)
+}
 /// Returns the operators that apply a compound's own `ORDER BY`, `LIMIT` and `OFFSET` to its rows.
 ///
 /// @param select - the head arm's bound statement, which carries them
@@ -585,7 +758,7 @@ fn feed_rows(rows: Gathered, sink: &mut dyn Sink) -> DbResult<()> {
 fn compound_tail(
     select: &BoundSelect,
     params: &Params,
-    catalog: &dyn TreeCatalog,
+    spill: Option<std::rc::Rc<dyn crate::spill::Spill>>,
     collect: Box<dyn Sink>,
 ) -> DbResult<Box<dyn Sink>> {
     if select.order_by.is_empty() && select.limit.is_none() && select.offset.is_none() {
@@ -634,7 +807,7 @@ fn compound_tail(
     let head: Box<dyn Sink> = if keys.is_empty() {
         sink
     } else {
-        Box::new(Sort::new(keys, sink).spilling_to(catalog.spill()))
+        Box::new(Sort::new(keys, sink).spilling_to(spill))
     };
     Ok(head)
 }

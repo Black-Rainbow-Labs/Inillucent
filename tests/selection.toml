@@ -314,6 +314,7 @@ name = "matrix"
 module = "lists"
 tier = "matrix"
 covers = ["inillucent-compat"]
+requires = ["oracle"]
 
 [[target]]
 package = "inillucent-compat"
@@ -957,6 +958,22 @@ covers = ["inillucent-engine", "inillucent-catalog", "inillucent-sql"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "wide_rows"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-wal"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "add_column_without_rewrite"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-wal"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "auto_vacuum"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-pool", "inillucent-tree", "inillucent-wal", "inillucent-txn"]
@@ -1008,6 +1025,30 @@ name = "engine"
 module = "scratch_memory_flat"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "streaming_rows"
+tier = "engine"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-exec"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "streaming_memory"
+tier = "engine"
+covers = ["inillucent-cli", "inillucent-driver", "inillucent-engine", "inillucent-exec"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "import_memory"
+tier = "engine"
+covers = ["inillucent-cli", "inillucent-engine"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1096,6 +1137,14 @@ covers = ["inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "connection_isolation"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-wal"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "hostile"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-ext"]
@@ -1170,6 +1219,14 @@ name = "engine"
 module = "page_sizes"
 tier = "engine"
 covers = ["inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "long_index_keys_small_page"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]
 
 [[target]]
 package = "inillucent-compat"
@@ -1545,6 +1602,14 @@ kind = "test"
 name = "write_campaign"
 tier = "engine"
 
+# A tree that gained a column after its leaves were written: reads through the pad, and a
+# first write that widens one leaf.
+[[target]]
+package = "inillucent-tree"
+kind = "test"
+name = "short_leaves"
+tier = "engine"
+
 # Keys longer than the spill threshold, bulk built, written into and deleted
 # from, with separators long enough to be stored out of line.
 [[target]]
@@ -1716,6 +1781,15 @@ requires = ["oracle"]
 package = "inillucent-compat"
 kind = "test"
 name = "differential"
+module = "add_column"
+tier = "differential"
+covers = ["inillucent-engine", "inillucent-tree"]
+requires = ["oracle"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
 module = "attach"
 tier = "differential"
 covers = ["inillucent-engine"]
@@ -1843,6 +1917,22 @@ package = "inillucent-compat"
 kind = "test"
 name = "engine"
 module = "fts5_bulk_edits"
+tier = "engine"
+covers = ["inillucent-ext", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "fts5_commit_cost"
+tier = "engine"
+covers = ["inillucent-ext", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "fts5_segments"
 tier = "engine"
 covers = ["inillucent-ext", "inillucent-engine"]
 
@@ -2197,6 +2287,14 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "checkpoint_sync_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "btree_model"
 tier = "durability"
 # `every_retained_sequence_still_passes` replays `compat/corpus/btree/`, which
@@ -2273,6 +2371,30 @@ name = "durability"
 module = "multi_database_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "open_beside_a_reader"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-sim", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "journal_restore_oplock"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "shared_page_leak"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool", "inillucent-sim", "inillucent-vfs"]
 
 [[target]]
 package = "inillucent-compat"
@@ -2584,6 +2706,22 @@ covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-p
 package = "inillucent-compat"
 kind = "test"
 name = "durability"
+module = "wide_row_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "add_column_crash"
+tier = "durability"
+covers = ["inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
 module = "bulk_insert_crash"
 tier = "durability"
 covers = ["inillucent-engine", "inillucent-exec", "inillucent-txn", "inillucent-wal", "inillucent-pool", "inillucent-tree", "inillucent-sim"]
@@ -2789,6 +2927,14 @@ name = "statement"
 tier = "e2e"
 covers = ["inillucent-driver"]
 
+# The rows a failed query produced before it failed, carried on the driver's error.
+[[target]]
+package = "inillucent-driver"
+kind = "test"
+name = "partial_rows"
+tier = "e2e"
+covers = ["inillucent-driver", "inillucent-exec", "inillucent-engine"]
+
 [[target]]
 package = "inillucent-driver"
 kind = "test"
@@ -2903,6 +3049,17 @@ module = "story_nikaya_crash"
 tier = "durability"
 covers = ["inillucent-cli", "inillucent-engine", "inillucent-txn", "inillucent-wal", "inillucent-pool"]
 
+# A runtime error in the middle of a result: the rows before it are returned first, graded
+# against the pinned SQLite shell and read through the command line, MCP and the shell.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "differential"
+module = "partial_rows"
+tier = "differential"
+covers = ["inillucent-sql", "inillucent-exec", "inillucent-engine", "inillucent-cli"]
+requires = ["oracle"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"
@@ -2959,6 +3116,17 @@ covers = ["inillucent-engine", "inillucent-search"]
 # the connection its module back. The FTS5 table refused every statement, and
 # rows written after the rollback never reached the vector index (task-2264).
 
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "vector_index_agreement"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-search"]
+# A statement is applied to the vector indexes of its own table only, confidence() on a
+# cosine table does not depend on the length of the query vector, and integrity_check
+# reports an index whose vector count differs from its table (task-2110).
+
 # One writer, four readers and a checkpoint under them (task-2036). Nothing in
 # the tree ran a reader *while* a writer was working, and a checkpoint under a
 # reader is the second cause task-1987 had.
@@ -2967,6 +3135,28 @@ package = "inillucent-compat"
 kind = "test"
 name = "durability"
 module = "process_readers"
+tier = "durability"
+covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
+# Two connections on one file while the log rolls to a new segment after every
+# record and no fold happens: each sees the other's commits, and a write goes
+# after the last record of the whole log.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "log_roll_between_connections"
+tier = "durability"
+covers = ["inillucent-driver", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
+
+# A writer killed in the middle of a transaction bigger than the log's spill
+# size leaves uncommitted records in the log. A session that only reads
+# discards them once, and the open after it recovers nothing.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "durability"
+module = "recovery_discard_runs_once"
 tier = "durability"
 covers = ["inillucent-cli", "inillucent-engine", "inillucent-wal", "inillucent-pool", "inillucent-vfs"]
 
@@ -3828,3 +4018,11 @@ name = "nightly"
 module = "free_map_page_at_the_end"
 tier = "nightly"
 covers = ["inillucent-engine", "inillucent-pool", "inillucent-tree"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "vacuum_attached_database"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-tree", "inillucent-pool"]

@@ -130,7 +130,7 @@ impl ImportedDatabase {
     /// @param at - the database the table is in
     /// @param table - the indexed table's name
     /// @param name - the index's name
-    fn rebuild_index(&mut self, at: usize, table: &[u8], name: &[u8]) -> DbResult<()> {
+    pub(crate) fn rebuild_index(&mut self, at: usize, table: &[u8], name: &[u8]) -> DbResult<()> {
         let folded = table.to_ascii_lowercase();
         let owner = self
             .schema

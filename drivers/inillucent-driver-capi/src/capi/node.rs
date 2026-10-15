@@ -254,13 +254,14 @@ unsafe fn register(env: Opaque, exports: Opaque) -> Opaque {
     let Some(api) = NAPI.get_or_init(|| resolve()).as_ref() else {
         return exports;
     };
-    let entries: [(&CStr, Callback); 6] = [
+    let entries: [(&CStr, Callback); 7] = [
         (c"open", js_open),
         (c"connect", js_connect),
         (c"query", js_query),
         (c"batch", js_batch),
         (c"disconnect", js_disconnect),
         (c"close", js_close),
+        (c"releaseModels", js_release_models),
     ];
     for (name, body) in entries {
         let mut function = std::ptr::null_mut();
@@ -299,6 +300,7 @@ guarded_entry!(js_query, query_body);
 guarded_entry!(js_batch, batch_body);
 guarded_entry!(js_disconnect, disconnect_body);
 guarded_entry!(js_close, close_body);
+guarded_entry!(js_release_models, release_models_body);
 
 /// The table, which `napi_register_module_v1` has resolved before any of the
 /// functions it registered can be called.
@@ -780,6 +782,21 @@ unsafe fn close_body(env: Opaque, info: Opaque) -> Opaque {
         return throw_failure(api, env, status, error);
     }
     note(address, true, false);
+    let mut nothing = std::ptr::null_mut();
+    (api.get_undefined)(env, &mut nothing);
+    nothing
+}
+
+/// `releaseModels()`: drops the loaded embedder and reranker sessions.
+///
+/// The JavaScript wrapper calls it from Node's `exit` event, so ONNX Runtime's threads are
+/// joined by this call and not by an exit handler that can run after ONNX Runtime's own
+/// destructors, which aborted the process on macOS.
+unsafe fn release_models_body(env: Opaque, _info: Opaque) -> Opaque {
+    let Some(api) = napi() else {
+        return std::ptr::null_mut();
+    };
+    inillucent_release_models();
     let mut nothing = std::ptr::null_mut();
     (api.get_undefined)(env, &mut nothing);
     nothing

@@ -377,20 +377,22 @@ fn copied_onto_freed_pages(mode: &str, frames: usize, seed: u64) -> CrashSnapsho
             "PRAGMA journal_mode={mode};
              PRAGMA synchronous=full;
              CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
-             CREATE TABLE copied(a INTEGER PRIMARY KEY, b TEXT, c TEXT);
+             CREATE TABLE copied(a INTEGER PRIMARY KEY, b TEXT);
              CREATE INDEX copied_b ON copied(b);"
         ),
     )
     .expect("the schema builds");
     run(&mut engine, &source_rows()).expect("the rows insert");
-    // A previous life for the pages: wide values in a column no index covers,
-    // so the table holds extent pages as well as leaves, written row by row
-    // and then deleted.
+    // A previous life for the pages: wide values in the indexed column, so the
+    // index holds extent pages for its keys as well as leaves, written row by
+    // row and then deleted. At a 4 KiB page a 3,000 byte key is stored out of
+    // line; before that was done the index tree grew past the descent limit and
+    // this script failed with "a descent walked more than 64 levels".
     let mut earlier = String::from("BEGIN;\n");
     for nth in 1..=600 {
         let width = if nth % 5 == 0 { 3_000 } else { 200 };
         earlier.push_str(&format!(
-            "INSERT INTO copied VALUES({nth}, 'old-{nth:08}', '{}');\n",
+            "INSERT INTO copied VALUES({nth}, '{}');\n",
             "z".repeat(width)
         ));
     }

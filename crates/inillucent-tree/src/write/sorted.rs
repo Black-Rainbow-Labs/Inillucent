@@ -301,6 +301,7 @@ impl PagedTree {
         let guard = pool.fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions())
             .with_pool(pool);
         // A row is copied out only when the leaf holds an out-of-line value,
@@ -541,6 +542,7 @@ impl PagedTree {
         };
         if let Some(page) = *near {
             if self.is_own_leaf(database.pool(), page)
+                && !self.leaf_is_short(database.pool(), page)?
                 && self.update_run(database, log, page, keys, rewrite, run)?
             {
                 return Ok(());
@@ -548,6 +550,7 @@ impl PagedTree {
         }
         let encoded = self.encode_key(first);
         let (page, _) = self.leaf_for(database.pool(), &encoded)?;
+        let page = self.leaf_ready_for_write(database, log, page, first)?;
         *near = Some(page);
         if !self.update_run(database, log, page, keys, rewrite, run)? {
             // The first key's own leaf does not hold it, so the tree does not.
@@ -649,6 +652,7 @@ impl PagedTree {
         let guard = pool.fetch(page)?;
         let leaf = LeafRef::parse(&guard)?
             .with_collations(self.collations())
+            .with_pad(&self.pad)
             .with_directions(self.directions())
             .with_pool(pool);
         // A row with an out of line value cannot be read back from a copy of the leaf alone.

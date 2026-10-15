@@ -65,6 +65,8 @@ struct ChunkWriter<'a> {
     row_count: u64,
     /// The file's page size, which decides how long a separator may be.
     page_size: usize,
+    /// How many columns a row has.
+    column_count: usize,
 }
 
 impl ChunkWriter<'_> {
@@ -99,6 +101,22 @@ impl ChunkWriter<'_> {
     ) -> DbResult<()> {
         if rows.is_empty() {
             return Ok(());
+        }
+        // A row of many integers is written in the compact encoding, which only format 4 reads.
+        // The same test a single row source gets: rows are looked at only for a table wide enough
+        // that one could be. Rows written before this chunk were not wide, or the format would be
+        // raised already, so each chunk is judged on its own rows.
+        let column_count = self.column_count;
+        if column_count.saturating_mul(9) > self.page_size / 2 {
+            let wide = (0..rows.len()).any(|at| {
+                let row: Vec<Datum<'d>> = (0..column_count).map(|c| rows.value(at, c)).collect();
+                Datum::row_is_wide(&row, self.page_size)
+            });
+            if wide && database.raise_format(inillucent_pool::meta::FORMAT_FOUR) {
+                if let Some(log) = log.as_deref_mut() {
+                    log.log_format(inillucent_pool::meta::FORMAT_FOUR)?;
+                }
+            }
         }
         crate::keylimit::refuse_rows_with_a_key_over_the_limit(
             rows,
@@ -234,6 +252,7 @@ impl PagedTree {
             pages_written: 0,
             row_count: 0,
             page_size,
+            column_count: columns.len(),
         };
         chunks.for_each_chunk(&mut |rows| writer.add_chunk(database, &mut log, rows))?;
         let built = writer.finish(database, &mut log)?;
@@ -308,6 +327,7 @@ impl PagedTree {
             root,
             shape: std::cell::Cell::new(Some((height, *leaves.first().unwrap_or(&PageId::NONE)))),
             columns,
+            pad: crate::leaf::TreePad::default(),
             key_columns,
             page_size,
             encoding,

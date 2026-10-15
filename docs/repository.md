@@ -127,8 +127,8 @@ engine through `inillucent-driver` too.
 `inillucent-driver` is built on `inillucent_engine::connect::Database`, which `inillucent-cli` also
 calls directly. `Database::open` creates or opens a file and recovers it. `Database::import` reads a
 SQLite file. `Database::session` returns a connection with `execute_batch`, `query`,
-`prepare_with_tail`, `explain` and `begin`. The method is named `session` because two sessions can
-share one transaction.
+`prepare_with_tail`, `explain` and `begin`. The method is named `session` because a session also
+scopes `temp.` tables and `ATTACH`. Each session has a transaction of its own.
 
 The engine that came before the current one is deleted.
 [Closed items](closed-items.md#the-old-engine-is-deleted) lists its crates and says what reads a
@@ -227,7 +227,7 @@ prerequisite in `tests/selection.toml` is missing from this table or has a diffe
 
 | prerequisite | rows | what provides it |
 |---|---:|---|
-| `oracle` | 87 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
+| `oracle` | 90 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
 | `shell` | 12 | the pinned `sqlite3` 3.53.4 shell, built by the same two scripts |
 | `embed` | 7 | a build with `inillucent-engine/embed` turned on. The runner builds it from the target's `features` row, and passes a row's `inillucent-cli/embed` to the build of the programs too. `tools/coverage.mjs` does not, because the feature needs `inillucent-core/onnx` and `inillucent-core` is left out of the coverage run |
 | `tracked-fixtures` | 5 | the files under `compat/fixtures/`, which are committed. A new clone has them. The row is for a checkout that has lost them |
@@ -263,8 +263,8 @@ a prerequisite and its suite cannot skip. Those two checks keep this table equal
 
 ## What the tests cover
 
-The workspace has 4,256 tests across 370 test targets, counted tier by tier in the tier table of
-`tests/inillucent-testing-tdd.md`. There are 370 rows in `tests/selection.toml`,
+The workspace has 4,371 tests across 393 test targets, counted tier by tier in the tier table of
+`tests/inillucent-testing-tdd.md`. There are 393 rows in `tests/selection.toml`,
 and each row is one `[[target]]` that the runner runs. `tools/doc-facts/check.mjs` fails when this
 page gives a different count from `tests/selection.toml`.
 

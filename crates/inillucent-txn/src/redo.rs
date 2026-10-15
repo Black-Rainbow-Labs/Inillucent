@@ -1462,7 +1462,9 @@ impl<R: RowRedo> Applier<'_, R> {
                 self.refuse_a_build_the_file_does_not_hold(root)?;
                 self.stats.bulk_built = self.stats.bulk_built.saturating_add(count)
             }
-            Body::Format { version } => drop(self.database.raise_format(version)),
+            Body::Format { version } | Body::FormatRaised { version } => {
+                let _raised = self.database.raise_format(version);
+            }
             Body::Relink { from, to, site } => self.redo_relink(from, to, site, wanted, lsn)?,
             Body::PageCount { pages } => self.note_map_change(PageId::NONE, false, Some(pages)),
         }

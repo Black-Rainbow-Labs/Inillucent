@@ -137,14 +137,12 @@ fn tells_a_syntax_error_from_an_unsupported_construct(session: &mut Session) {
         "a syntax error answered as though it were fine:\n{wrong}"
     );
 
-    // **`ATTACH` with a file name that is not a literal**, which the capability
-    // table's `attach_computed_path` row declares unbuilt. It is deliberately not
-    // a window function or a row value against a subquery: those were the obvious
-    // choices and they answer now, so a case written against them would have
-    // asserted `unsupported` about something that works.
-    // Through `inillucent_exec`: `inillucent_query` refuses a statement that
-    // writes before the engine is asked, and `ATTACH` is one.
-    let not_built = session.tool("inillucent_exec", "{\"sql\":\"ATTACH ? AS other\"}");
+    // **An `EXPLAIN` of another `EXPLAIN`**, which the capability table's
+    // `nested_explain` row declares unbuilt. It is deliberately not a window
+    // function, a row value against a subquery or an `ATTACH` with a computed file
+    // name: those were the obvious choices and they answer now, so a case written
+    // against them would have asserted `unsupported` about something that works.
+    let not_built = session.tool("inillucent_exec", "{\"sql\":\"EXPLAIN EXPLAIN SELECT 1\"}");
     assert!(
         not_built.contains("unsupported"),
         "a construct the engine has not built answered without saying so. An agent that cannot \

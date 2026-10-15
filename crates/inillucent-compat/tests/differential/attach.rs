@@ -473,3 +473,46 @@ fn a_qualified_schema_pragma_is_about_the_database_it_names() {
          SELECT 'main-info'; PRAGMA main.table_info(t);",
     );
 }
+
+/// **The file `ATTACH` opens is an expression, and SQLite evaluates it.**
+///
+/// A concatenation, a scalar subquery and a `CASE` each name a file, and the
+/// rows written through each attached schema read back from it. A bound
+/// parameter is the form applications use and a script cannot bind one, so the
+/// conformance suite (`attach_takes_a_bound_file_name`) and the command line
+/// tests cover that form; the three here cover the evaluation of an expression.
+#[test]
+fn the_file_name_of_an_attach_is_an_expression() {
+    grade(
+        "computed-file-name",
+        "CREATE TABLE names(n TEXT);
+         INSERT INTO names VALUES ('{dir}/from_a_query.db');
+         ATTACH DATABASE '{dir}/' || 'joined.db' AS joined;
+         CREATE TABLE joined.t(a);
+         INSERT INTO joined.t VALUES (1), (2);
+         ATTACH DATABASE (SELECT n FROM names) AS queried;
+         CREATE TABLE queried.t(a);
+         INSERT INTO queried.t VALUES (3);
+         ATTACH DATABASE CASE WHEN 1 THEN '{dir}/chosen.db' ELSE 'unused' END AS chosen;
+         CREATE TABLE chosen.t(a);
+         INSERT INTO chosen.t VALUES (4);
+         SELECT 'joined'; SELECT a FROM joined.t ORDER BY a;
+         SELECT 'queried'; SELECT a FROM queried.t ORDER BY a;
+         SELECT 'chosen'; SELECT a FROM chosen.t ORDER BY a;",
+    );
+}
+
+/// **A file name that evaluates to NULL opens a private temporary database.**
+///
+/// SQLite reads the value as text, and no text means the empty name, which is
+/// the temporary database `ATTACH ''` opens.
+#[test]
+fn a_null_file_name_attaches_a_temporary_database() {
+    grade(
+        "null-file-name",
+        "ATTACH DATABASE NULL AS scratch;
+         CREATE TABLE scratch.t(a);
+         INSERT INTO scratch.t VALUES (5);
+         SELECT a FROM scratch.t;",
+    );
+}

@@ -670,7 +670,7 @@ impl crate::ImportedDatabase {
             // whole bound statement copied per execution, and for a module
             // insert that is once per row.
             Cached::Nothing => Ok(Outcome::empty()),
-            Cached::Ddl(sql) => self.execute_ddl(sql),
+            Cached::Ddl(sql) => self.execute_ddl_with(sql, params),
             Cached::QueryPlan(lines) => Ok(query_plan_rows(lines)),
             Cached::Program(rows) => Ok(program_rows(rows)),
             Cached::VirtualInsert(statement, holds_subquery, source) => {
@@ -1440,28 +1440,37 @@ impl crate::ImportedDatabase {
         // Where this statement's writes begin, in both of the transaction's
         // records. See `statement_mark` for why it costs nothing.
         let mark = self.statement_mark();
-        let (applied, wrote, counted, deferred, key_checks) = self.with_write_view(txn, |view| {
-            // **Not `?`.** A failed statement has writes of its own to put
-            // back, and the borrow of the trees has to end before anything can.
-            let applied = apply(view, params);
-            // **The participant set, read off the logs that were used.** A
-            // transaction that wrote one file commits the way it always has; one
-            // that wrote two is decided by a super-journal, and this is the only
-            // place that can tell them apart without asking every tree. Read on
-            // the failure path too, because a statement that failed partway
-            // still wrote, and `OR FAIL` keeps what it wrote.
-            let wrote = view.logs.wrote();
-            // Read on the failure path too, and for the same reason `wrote` is:
-            // a statement that failed partway still wrote, and `OR FAIL` keeps
-            // it - so the counters have to see it.
-            let counted = view.rows_written();
-            let deferred = std::mem::take(&mut view.deferred);
-            let key_checks = KeyChecks {
-                pending: view.pending_keys.take(),
-                row_time_violation: view.row_time_violation.get(),
-            };
-            (applied, wrote, counted, deferred, key_checks)
-        });
+        let (applied, wrote, counted, deferred, key_checks, captured_root, body_changes) = self
+            .with_write_view(txn, |view| {
+                // **Not `?`.** A failed statement has writes of its own to put
+                // back, and the borrow of the trees has to end before anything can.
+                let applied = apply(view, params);
+                // **The participant set, read off the logs that were used.** A
+                // transaction that wrote one file commits the way it always has; one
+                // that wrote two is decided by a super-journal, and this is the only
+                // place that can tell them apart without asking every tree. Read on
+                // the failure path too, because a statement that failed partway
+                // still wrote, and `OR FAIL` keeps what it wrote.
+                let wrote = view.logs.wrote();
+                // Read on the failure path too, and for the same reason `wrote` is:
+                // a statement that failed partway still wrote, and `OR FAIL` keeps
+                // it - so the counters have to see it.
+                let counted = view.rows_written();
+                let deferred = std::mem::take(&mut view.deferred);
+                let key_checks = KeyChecks {
+                    pending: view.pending_keys.take(),
+                    row_time_violation: view.row_time_violation.get(),
+                };
+                (
+                    applied,
+                    wrote,
+                    counted,
+                    deferred,
+                    key_checks,
+                    view.captured_root.get(),
+                    std::mem::take(&mut view.body_changes),
+                )
+            });
         let changes = match applied {
             Ok(changes) => changes,
             Err(error) => {
@@ -1519,7 +1528,12 @@ impl crate::ImportedDatabase {
             self.record_changes(0, counted.1.saturating_sub(counted.0));
             return Err(self.abandon(error, mark, autocommit, wrote, txn));
         }
-        let module_rows = match self.follow_modules(deferred, &changes, autocommit) {
+        let module_rows = match self.follow_modules(
+            deferred,
+            &changes,
+            (captured_root, body_changes),
+            autocommit,
+        ) {
             Ok(rows) => rows,
             Err(error) => return Err(self.abandon(error, mark, autocommit, wrote, txn)),
         };
@@ -1661,6 +1675,8 @@ impl crate::ImportedDatabase {
             schema_catalog: &self.schema.catalog,
             deferred: Vec::new(),
             pending_keys: std::cell::RefCell::new(Vec::new()),
+            captured_root: std::cell::Cell::new(None),
+            body_changes: Vec::new(),
             single_row: std::cell::Cell::new(false),
             row_time_violation: std::cell::Cell::new(false),
         };
@@ -1677,11 +1693,14 @@ impl crate::ImportedDatabase {
     ///
     /// @param deferred - the trigger bodies' writes to virtual tables
     /// @param changes - what the tree writes reported
+    /// @param followed - the root of the table `changes` describes when it has vector indexes, and
+    ///   what trigger bodies wrote to tables with vector indexes, each with its table's root
     /// @param autocommit - whether the statement is its own transaction
     fn follow_modules(
         &mut self,
         deferred: Vec<inillucent_exec::dml::ModuleWrite>,
         changes: &Changes,
+        followed: (Option<u32>, Vec<(u32, Changes)>),
         autocommit: bool,
     ) -> DbResult<i64> {
         // **A trigger body's writes to a virtual table, now that the trees
@@ -1716,7 +1735,11 @@ impl crate::ImportedDatabase {
         // `examples/rag-agent`. A fold is bounded by what this transaction
         // wrote and returns at once when the log is short, so an ordinary small
         // write pays a `sync` that does nothing.
-        let followed = self.follow_vector_indexes(changes)?;
+        let (captured_root, body_changes) = followed;
+        let mut followed = self.follow_vector_indexes(changes, captured_root)?;
+        for (root, body) in &body_changes {
+            followed |= self.follow_vector_indexes(body, Some(*root))?;
+        }
         // **Only outside a batch**, which is the same guard the
         // `VirtualUpdate` and `VirtualDelete` arms take. `sync_modules` ends
         // with `commit` on every connected module, and telling a module its

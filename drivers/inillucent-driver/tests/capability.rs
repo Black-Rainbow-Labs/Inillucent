@@ -305,16 +305,16 @@ fn an_unimplemented_construct_refuses_by_name_and_a_typo_does_not() {
     // clause, then `ATTACH ... KEY`, each retired as the engine implemented it
     // in turn; the assertion is about the *classification*, so it is repointed
     // at a construct that is still unimplemented rather than weakened. A row
-    // value on the left of `IN (SELECT ...)` was one, and is built now. An
-    // `ATTACH` whose file name is a parameter is one: the capability table's
-    // `attach_computed_path` row says so and checks it.
+    // value on the left of `IN (SELECT ...)` was one, and is built now, as is an
+    // `ATTACH` whose file name is a parameter. An `EXPLAIN` of another `EXPLAIN`
+    // is one: the capability table's `nested_explain` row says so and checks it.
     let refused = connection
-        .query("ATTACH ? AS other", &[], 10)
-        .expect_err("a computed ATTACH file name is refused");
+        .query("EXPLAIN EXPLAIN SELECT 1", &[], 10)
+        .expect_err("a nested EXPLAIN is refused");
     assert_eq!(
         refused.status,
         Status::Unsupported,
-        "a computed ATTACH file name is a capability gap, not a syntax error: {refused}"
+        "a nested EXPLAIN is a capability gap, not a syntax error: {refused}"
     );
     let named = refused.feature.expect("the refusal names the construct");
     assert!(!named.is_empty(), "the refusal named nothing");

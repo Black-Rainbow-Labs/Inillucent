@@ -1093,7 +1093,9 @@ fn push_projection(
             .collect::<DbResult<Vec<_>>>()?
     };
     operators.add(|| "PROJECT".to_string());
-    Ok(Box::new(Project::new(compiled, chain)))
+    let columns = up.plan.select.columns.iter().map(|column| &column.expr);
+    let chain = Box::new(Project::new(compiled, chain));
+    crate::constant::hoist_constants(chain, columns, up.space, up.params, &up.projection_types)
 }
 
 /// Puts the `HAVING` filter on, if the statement has one.

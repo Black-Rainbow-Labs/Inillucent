@@ -21,7 +21,7 @@ use inillucent_driver::{Database, Status, Value};
 /// @param sql - a query returning one integer
 fn integer(database: &Database, sql: &str) -> i64 {
     let rows = database
-        .session()
+        .session_as(1)
         .query_all(sql, &[])
         .expect("the query runs");
     match rows.rows.first().and_then(|row| row.first()) {
@@ -41,7 +41,7 @@ fn fresh(name: &str) -> Database {
     std::fs::create_dir_all(&directory).expect("the case directory can be made");
     let database = Database::open(directory.join("quota.rdb")).expect("the database opens");
     database
-        .session()
+        .session_as(1)
         .execute_batch(
             "CREATE TABLE t(id INTEGER PRIMARY KEY, body TEXT); \
              INSERT INTO t(body) SELECT 'row ' || value FROM generate_series(1, 10);",
@@ -70,7 +70,7 @@ fn a_write_past_the_ceiling_fails_and_takes_nothing() {
     let database = fresh("refused");
     let held = hold_at_the_current_size(&database);
     let refused = database
-        .session()
+        .session_as(1)
         .execute_batch(
             "INSERT INTO t(body) SELECT printf('%.*c', 2000, 'x') FROM generate_series(1, 5000);",
         )
@@ -119,7 +119,7 @@ fn a_write_that_fits_succeeds_and_a_raised_ceiling_lets_more_in() {
     let database = fresh("raised");
     hold_at_the_current_size(&database);
     database
-        .session()
+        .session_as(1)
         .execute_batch("INSERT INTO t(body) VALUES('small');")
         .expect("a row that fits the last leaf is written");
     assert_eq!(
@@ -127,14 +127,14 @@ fn a_write_that_fits_succeeds_and_a_raised_ceiling_lets_more_in() {
         100_000
     );
     database
-        .session()
+        .session_as(1)
         .execute_batch(
             "INSERT INTO t(body) SELECT printf('%.*c', 2000, 'x') FROM generate_series(1, 5000);",
         )
         .expect("the raised ceiling lets the write through");
     assert_eq!(integer(&database, "SELECT count(*) FROM t"), 5_011);
     let check = database
-        .session()
+        .session_as(1)
         .query_all("PRAGMA integrity_check", &[])
         .expect("the check runs");
     assert_eq!(check.rows, vec![vec![Value::Text("ok".to_string())]]);
@@ -159,7 +159,7 @@ fn a_ceiling_of_zero_or_less_or_not_a_number_is_ignored() {
 fn a_ceiling_counts_an_index_build_and_a_long_value() {
     let database = fresh("index_and_chain");
     database
-        .session()
+        .session_as(1)
         .execute_batch(
             "INSERT INTO t(body) SELECT printf('%.*c', 500, 'x') FROM generate_series(1, 3000);",
         )
@@ -167,12 +167,12 @@ fn a_ceiling_counts_an_index_build_and_a_long_value() {
     let held = hold_at_the_current_size(&database);
     let free = integer(&database, "PRAGMA freelist_count");
     let index = database
-        .session()
+        .session_as(1)
         .execute_batch("CREATE INDEX t_body ON t(body);")
         .expect_err("an index needs pages past the ceiling");
     assert_eq!(index.status, Status::Full, "{index:?}");
     let value = database
-        .session()
+        .session_as(1)
         .execute_batch("INSERT INTO t(body) VALUES (printf('%.*c', 200000, 'y'));")
         .expect_err("a long value needs pages past the ceiling");
     assert_eq!(value.status, Status::Full, "{value:?}");
@@ -189,7 +189,7 @@ fn a_ceiling_is_held_per_file_and_per_connection() {
     let other = workspace_root().join("_agent_output/max-page-count/per_file/other.rdb");
     let text = other.to_string_lossy().replace('\'', "''");
     database
-        .session()
+        .session_as(1)
         .execute_batch(&format!(
             "ATTACH '{text}' AS other; CREATE TABLE other.u(id INTEGER PRIMARY KEY, body TEXT);"
         ))
@@ -201,14 +201,14 @@ fn a_ceiling_is_held_per_file_and_per_connection() {
         4_294_967_294
     );
     let refused = database
-        .session()
+        .session_as(1)
         .execute_batch(
             "INSERT INTO other.u(body) SELECT printf('%.*c', 2000, 'x') FROM generate_series(1, 5000);",
         )
         .expect_err("the attached file is at its ceiling");
     assert_eq!(refused.status, Status::Full, "{refused:?}");
     database
-        .session()
+        .session_as(1)
         .execute_batch(
             "INSERT INTO t(body) SELECT printf('%.*c', 2000, 'x') FROM generate_series(1, 500);",
         )
@@ -225,7 +225,7 @@ fn a_ceiling_is_held_per_file_and_per_connection() {
 fn a_sort_that_spills_under_a_tight_limit_still_succeeds() {
     let database = fresh("sort_spill");
     database
-        .session()
+        .session_as(1)
         .execute_batch(
             "INSERT INTO t(body) SELECT printf('%.*c', 300, 'x') || value FROM generate_series(1, 30000);",
         )
@@ -239,7 +239,7 @@ fn a_sort_that_spills_under_a_tight_limit_still_succeeds() {
         30_010
     );
     let rows = database
-        .session()
+        .session_as(1)
         .query_all("SELECT body FROM t ORDER BY body DESC", &[])
         .expect("the sort runs under the ceiling");
     assert_eq!(rows.rows.len(), 30_010);

@@ -44,7 +44,7 @@ The statuses you will see most often, each produced by the release build:
 
 | Status | What caused it | An example message |
 |---|---|---|
-| `unsupported` | a construct the engine has not built | `unsupported: ATTACH with a file name that is not a literal` |
+| `unsupported` | a construct the engine has not built | `unsupported: nested EXPLAIN` |
 | `syntax` | the statement is not valid SQL | `near "SELEC": syntax error` |
 | `not_found` | no such table, column, index, function or capability | `no such table: nothere` |
 | `constraint` | a constraint refused the write | `UNIQUE constraint failed: t.a` |
@@ -85,17 +85,17 @@ can change between releases.
 ## "It says unsupported" or "it exited 3"
 
 ```sh
-inillucent --db app.rdb exec "ATTACH ? AS other" --params '["other.rdb"]'
+inillucent --db app.rdb exec "EXPLAIN EXPLAIN SELECT 1"
 ```
 
 ```text
-Error [unsupported]: unsupported: ATTACH with a file name that is not a literal
-  not built yet: ATTACH with a file name that is not a literal
+Error [unsupported]: unsupported: nested EXPLAIN
+  not built yet: nested EXPLAIN
 ```
 
 The SQL is correct. The engine has not built that construct, so rewording the same construct gets
-the same answer. Write the statement another way: here, pass the file name to `ATTACH` as a
-string literal. Ask what the engine supports before you write an unusual statement:
+the same answer. Write the statement another way: here, run `EXPLAIN` on the inner statement
+alone. Ask what the engine supports before you write an unusual statement:
 
 ```sh
 inillucent capabilities                  # the whole table
@@ -119,6 +119,9 @@ an application built with the `inillucent` crate writes the file and an older `i
 line, installed separately, is used to look at it. Install the command line at the crate's version. Nothing converts a format 3
 file back to format 2. A file that an earlier release created stays at format 2 until it stores a
 key longer than `page_size / 8` or is rebuilt by `VACUUM`, so the earlier release can still open it.
+A file becomes format 4 when `ALTER TABLE ... ADD COLUMN` is run on a table that has rows or a row of
+more than about 1,900 integers is stored. Releases 2.5.0 to this one refuse it with
+`this database is format version 4 and this build reads version 3`.
 
 [`docs/feature-comparison.md`](../../docs/feature-comparison.md) compares inillucent with the pinned
 SQLite 3.53.4, case by case. On the 1.0.32 build, 402 of 416 probed cases produce the same answer.
@@ -207,8 +210,10 @@ and reads a few rows when both `a` and `b` are indexed, and scans the table when
 
 Two things cost more than they appear to:
 
-- **`--limit` does not make a query cheaper.** The engine computes the whole result, so `total` is
-  exact. `--limit` (200 by default) only cuts the rows printed. Put `LIMIT` in the SQL itself.
+- **`--limit` does not make a query faster.** The engine reads every row so that `total` is exact.
+  `--limit` (200 by default) cuts the rows kept and printed, and the other rows are counted and not
+  held, so a query over millions of rows needs memory for 200 rows. Put `LIMIT` in the SQL itself to
+  read fewer rows. `--limit 0` asks for every row, and the output object holds them all.
 - **A vector search with no index reads every row.** The answer is still correct.
   `CREATE INDEX <name> ON <table> USING inillucent_hnsw (<column>)` adds an HNSW index, including
   over rows already in the table.

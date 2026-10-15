@@ -12,7 +12,7 @@ use inillucent_value::Value;
 
 use super::super::{failure, Context, VirtualTable};
 
-use super::doclist::{decode_doclist, encode_doclist, write_varint, DocEntry};
+use super::doclist::write_varint;
 use super::index::*;
 use super::*;
 
@@ -71,14 +71,15 @@ impl Fts5Table {
 
     /// Runs one of the module's special commands.
     ///
-    /// `integrity-check` and `rebuild` do what they say. The merge family -
-    /// `optimize`, `merge`, `automerge`, `crisismerge`, `usermerge`, `pgsz` -
-    /// is accepted and does nothing, because this index keeps one doclist per
-    /// term rather than a stack of segments to merge: there is no work for them
-    /// to ask for. They are accepted rather than refused so that an application
-    /// written against SQLite runs unchanged, and they are listed here rather
-    /// than ignored silently so the next reader knows the difference is
-    /// deliberate.
+    /// `integrity-check` and `rebuild` do what they say. `optimize` merges every
+    /// segment into one, and `flush` writes what the transaction has staged as a
+    /// segment. The rest of the merge family - `merge`, `automerge`,
+    /// `crisismerge`, `usermerge`, `pgsz` - is accepted and does nothing,
+    /// because this index merges segments on its own schedule and has no work
+    /// for them to ask for. They are accepted rather than refused so that an
+    /// application written against SQLite runs unchanged, and they are listed
+    /// here rather than ignored silently so the next reader knows the
+    /// difference is deliberate.
     pub(crate) fn command(
         &mut self,
         context: &mut Context<'_>,
@@ -107,11 +108,12 @@ impl Fts5Table {
                 Ok(())
             }
             "rebuild" => self.rebuild(context),
-            // There is nothing to merge or flush: one doclist per term is the
-            // whole index, so the segment machinery these ask about does not
-            // exist here. They are accepted rather than refused so that an
-            // application written against SQLite runs unchanged.
-            "optimize" | "flush" => Ok(()),
+            // `flush` writes the staged postings out now, as a segment of their own.
+            "flush" => flush_doclists(context, &self.shadows, &self.pending),
+            // `optimize` leaves the index as one run of terms in the base segment,
+            // with no deletion markers, which is the smallest it can be and the
+            // fastest to read.
+            "optimize" => self.optimize(context),
             // **FTS4 writes these two with the value inside the command.**
             // `merge=2,4` and `automerge=8` only tune how segments are merged,
             // and this index has none, so `merge` is accepted and `automerge` is
@@ -136,7 +138,7 @@ impl Fts5Table {
             // **`merge` with no rank value is accepted.** `INSERT INTO f(f)
             // VALUES('merge')` reads the missing argument as zero in SQLite
             // and succeeds; it was refused as an unrecognized command here
-            // (bug hunt 10). Nothing is merged either way, see above.
+            // (bug hunt 10). Nothing is merged on request, see above.
             "merge" => Ok(()),
             // The settings *are* kept, because `%_config` is a table an
             // application reads. Nothing here acts on them - see above - but a
@@ -256,24 +258,18 @@ impl Fts5Table {
                 expected.entry(term).or_default().insert(rowid, columns);
             }
         }
-        let mut stored: Vec<(Vec<u8>, Vec<Value<'static>>)> = Vec::new();
-        self.shadows.scan_keyed(context, b"idx", 2, |values| {
-            if let Some(term) = values.get(1).and_then(Value::as_blob) {
-                stored.push((term.raw().to_vec(), values.to_vec()));
-            }
-            Ok(true)
-        })?;
-        let mut actual: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<(usize, Vec<u32>)>>> = BTreeMap::new();
-        for (term, row) in stored {
-            let Some(bytes) = resolve_doclist(context, &self.shadows, &row)? else {
-                return Ok(false);
-            };
-            let entries = decode_doclist(&bytes)
+        let structure = segment::read_structure(context, &self.shadows)?;
+        let actual: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<(usize, Vec<u32>)>>> =
+            segment::scan_terms(context, &self.shadows, None, &structure, None)?
                 .into_iter()
-                .map(|entry| (entry.rowid, entry.columns))
+                .map(|(term, entries)| {
+                    let by_row = entries
+                        .into_iter()
+                        .map(|entry| (entry.rowid, entry.columns))
+                        .collect();
+                    (term, by_row)
+                })
                 .collect();
-            actual.insert(term, entries);
-        }
         Ok(expected == actual)
     }
 
@@ -336,7 +332,8 @@ impl Fts5Table {
             // those are what a wipe is for. The layout record survives because
             // the index it describes is about to be written again by this
             // build, in this build's layout - see `super::layout`.
-            if rowid != TOTALS && !layout::is_layout_row(rowid) {
+            if rowid != TOTALS && !layout::is_layout_row(rowid) && !segment::is_structure_row(rowid)
+            {
                 doclists.push(rowid);
             }
             Ok(true)
@@ -344,24 +341,13 @@ impl Fts5Table {
         for rowid in doclists {
             self.shadows.delete_row(context, b"data", rowid)?;
         }
-        // The staged dictionary rows go out first, so the scan below sees
-        // every term there is - a delete-all that missed one would leave it in
-        // `%_idx` naming a `%_data` row that has been removed.
-        flush_doclists(context, &self.shadows, &self.pending)?;
-        let mut terms = Vec::new();
-        self.shadows.scan_keyed(context, b"idx", 2, |values| {
-            if let Some(term) = values.get(1).and_then(Value::as_blob) {
-                terms.push(term.raw().to_vec());
-            }
-            Ok(true)
-        })?;
-        for term in terms {
-            self.shadows.delete_keyed(
-                context,
-                b"idx",
-                &[Value::Integer(SEGMENT), Value::owned_blob(&term)?],
-            )?;
+        // Every segment goes, the staged postings with them, and the segment list is written
+        // again as empty. A delete-all that missed a row would leave a term in `%_idx` that
+        // names a `%_data` row that has been removed.
+        if let Ok(mut held) = self.pending.lock() {
+            held.discard_all();
         }
+        segment::clear(context, &self.shadows)?;
         let mut sizes = Vec::new();
         self.shadows.scan(context, b"docsize", |rowid, _| {
             sizes.push(rowid);
@@ -495,21 +481,18 @@ impl Fts5Table {
         Ok(())
     }
 
-    /// Adds one document's occurrences of one term to that term's doclist.
+    /// Stages one document's occurrences of one term.
     ///
     /// **The bulk-load path takes one lock and allocates nothing.** It used to
-    /// take three - `term_row`, `append_staged` and `buffer_is_full` each
-    /// locked the buffer - and build a `Vec<(usize, Vec<u32>)>` to describe the
-    /// occurrences before writing them out as varints. Neither is much on its
-    /// own and both are per term per document: a five-hundred-document build
-    /// over a ten-term vocabulary is fifteen thousand lock/unlock pairs and ten
-    /// thousand allocations, and `extension.fts.build` spent 3.5 of its 8.7 ms
-    /// in here.
+    /// take three and build a `Vec<(usize, Vec<u32>)>` to describe the
+    /// occurrences before writing them out as varints. A five-hundred-document
+    /// build over a ten-term vocabulary is fifteen thousand lock and unlock
+    /// pairs and ten thousand allocations, and `extension.fts.build` spent 3.5
+    /// of its 8.7 ms in here.
     ///
-    /// Everything the fast path needs is in the buffer, so it is one critical
-    /// section: find the term's page, append the entry to the staged doclist,
-    /// and read back whether the buffer is now full. The flush - which needs
-    /// the host and cannot be done under the lock - happens after it.
+    /// Nothing stored is read: the posting is appended to the term's staged list,
+    /// and the list is written as part of a segment at the flush. The flush
+    /// happens after the lock is released because it needs the host.
     ///
     /// @param context - the host
     /// @param rowid - the document being indexed
@@ -523,92 +506,26 @@ impl Fts5Table {
         let Some((term, _, _)) = run.first() else {
             return Ok(());
         };
-        match append_in_one_lock(&self.pending, term, rowid, run) {
-            Appended::Done { full } => {
-                if full {
-                    flush_doclists(context, &self.shadows, &self.pending)?;
-                }
-                return Ok(());
-            }
-            Appended::No => {}
-        }
-        let term = term.clone();
-        let entry = DocEntry {
-            rowid,
-            columns: columns_of(run),
-        };
         let started = std::time::Instant::now();
-        let answer = self.merge_term(context, &term, entry);
+        let Some(full) = stage_posting(&self.pending, term, rowid, run) else {
+            return Err(failure("the full-text buffer cannot be locked"));
+        };
         let spent = started.elapsed().as_nanos();
-        record_stage(|stages| {
-            stages.new_terms = stages.new_terms.saturating_add(spent);
-            stages.new_term_count = stages.new_term_count.saturating_add(1);
-        });
-        answer
-    }
-
-    /// Adds one entry to a term's doclist, keeping it in rowid order.
-    ///
-    /// **`term_row` staging what it finds is what makes the fast path apply
-    /// twice.** `append_staged` is tried before `term_row` because a term
-    /// this transaction has already staged answers there directly; it is
-    /// tried again straight after, because `term_row` - when the term
-    /// exists - has just staged what it read, and the ordinary case for a
-    /// bulk load is a document whose rowid sorts after everything already in
-    /// the list, which is exactly what the retried fast path handles without
-    /// a decode. What is left after both tries is a term with no row yet, or
-    /// one whose new entry does not sort last - and both go through the
-    /// general decode-and-reinsert path below.
-    fn merge_term(&self, context: &mut Context<'_>, term: &[u8], entry: DocEntry) -> DbResult<()> {
-        if append_staged(&self.pending, term, &entry) {
-            if buffer_is_full(&self.pending) {
-                flush_doclists(context, &self.shadows, &self.pending)?;
-            }
-            return Ok(());
-        }
-        let Some(held) = term_row(context, &self.shadows, &self.pending, term, true)? else {
-            return Ok(());
-        };
-        if !held.fresh && append_staged(&self.pending, term, &entry) {
-            if buffer_is_full(&self.pending) {
-                flush_doclists(context, &self.shadows, &self.pending)?;
-            }
-            return Ok(());
-        }
-        // A term whose dictionary row was created a moment ago has no
-        // doclist to merge into; one that failed the retry above has an
-        // entry that does not sort last. Decoding the whole doclist to
-        // insert in the middle and then re-encoding it costs time and
-        // allocation proportional to how many documents already contain the
-        // term, so a bulk index build was quadratic: measured at 100, 200,
-        // 400, 800 and 1,600 documents sharing a vocabulary, the cost of one
-        // insert rose 1.00x, 1.36x, 2.03x, 3.32x, 6.24x, and the total went
-        // from 19 ms to 1,925 ms for sixteen times the documents. That is the
-        // cost of an out-of-order document, not of the ordinary bulk load the
-        // fast path above already leaves this branch for.
-        let existing: Option<Vec<u8>> = if held.fresh {
-            None
-        } else {
-            read_doclist(context, &self.shadows, &self.pending, term)?
-        };
-        let mut entries = match existing.as_deref() {
-            Some(bytes) => decode_doclist(bytes),
-            None => Vec::new(),
-        };
-        match entries.binary_search_by_key(&entry.rowid, |existing| existing.rowid) {
-            Ok(position) => {
-                if let Some(slot) = entries.get_mut(position) {
-                    *slot = entry;
-                }
-            }
-            Err(position) => entries.insert(position, entry),
-        }
-        let encoded = encode_doclist(&entries);
-        stage_doclist(&self.pending, term, encoded, true);
-        if buffer_is_full(&self.pending) {
+        record_stage(|stages| stages.new_terms = stages.new_terms.saturating_add(spent));
+        if full {
             flush_doclists(context, &self.shadows, &self.pending)?;
         }
         Ok(())
+    }
+
+    /// Merges every segment of the index into one, and drops the deletion markers.
+    ///
+    /// @param context - the running statement
+    fn optimize(&mut self, context: &mut Context<'_>) -> DbResult<()> {
+        flush_doclists(context, &self.shadows, &self.pending)?;
+        let mut structure = segment::read_structure(context, &self.shadows)?;
+        segment::merge_all(context, &self.shadows, &mut structure)?;
+        segment::write_structure(context, &self.shadows, &structure)
     }
 
     /// Removes one row from the content and from every doclist it is in.
@@ -696,20 +613,11 @@ impl Fts5Table {
         terms.sort();
         terms.dedup();
         for term in &terms {
-            let removal = remove_row_from_term(context, &self.shadows, &self.pending, term, rowid)?;
-            let TermRemoval::Emptied { legacy_page } = removal else {
-                continue;
-            };
-            // The row was the last one in the doclist. The buffer has let the
-            // term go, so what is left is the stored row, and a delete that
-            // left it there would find the term again.
-            self.shadows.delete_keyed(
-                context,
-                b"idx",
-                &[Value::Integer(SEGMENT), Value::owned_blob(term)?],
-            )?;
-            if let Some(page) = legacy_page {
-                self.shadows.delete_row(context, b"data", page)?;
+            // A marker is staged for the row in each of its terms. See `stage_tombstone`.
+            match stage_tombstone(&self.pending, term, rowid) {
+                Some(true) => flush_doclists(context, &self.shadows, &self.pending)?,
+                Some(false) => {}
+                None => return Err(failure("the full-text buffer cannot be locked")),
             }
         }
 

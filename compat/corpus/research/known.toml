@@ -31,11 +31,6 @@ kind = "defect"
 reason = "An aggregate inside the ORDER BY of a subquery in a result column is refused here as a misuse; SQLite accepts it there and refuses the same subquery in a WHERE."
 
 [[known]]
-case = "research/sqlite-forum/defer_fk_drop_then_rename_commit_fails"
-kind = "deviation"
-reason = "With deferred foreign keys, DROP TABLE of a parent and a rename of its replacement leave SQLite's violation counter raised, so its COMMIT fails. This engine checks the keys at the commit, finds every child row has a parent, and commits."
-
-[[known]]
 case = "research/sqlite-forum/update_from_join_on_references_target"
 kind = "defect"
 reason = "UPDATE t1 ... FROM t2 JOIN t3 ON ... aa: the target table is visible inside the FROM clause's ON here, and SQLite reports no such column."
@@ -61,11 +56,6 @@ kind = "deviation"
 reason = "The delete command for rows the index never held: SQLite reports the index as malformed on the next query; this engine removes nothing and answers the query."
 
 [[known]]
-case = "research/sqlite-forum/fts5_external_content_view_no_trigger_match"
-kind = "defect"
-reason = "An external content table whose content is a view: a scan of the full text table reads the content through the shadow table mechanism, which has no tree for a view, so it returns no rows."
-
-[[known]]
 case = "research/sqlite-forum/fts5_match_phrase_near_prefix_bm25"
 kind = "deviation"
 reason = "One bm25 score differs in the seventeenth significant digit, because the per phrase terms are added in a different order."
@@ -74,11 +64,6 @@ reason = "One bm25 score differs in the seventeenth significant digit, because t
 case = "research/sqlite-forum/fts5_contentless_delete_rebuild"
 kind = "defect"
 reason = "contentless_delete=1 is refused with exit code 3; the index cannot yet find a row's postings without its text."
-
-[[known]]
-case = "research/sqlite-forum/insert_or_fail_fk_unique"
-kind = "defect"
-reason = "INSERT OR FAIL of two rows where the second breaks a UNIQUE constraint and the first an immediate foreign key: SQLite reports the foreign key and keeps nothing; this engine reports the UNIQUE constraint and keeps the first row."
 
 [[known]]
 case = "research/sqlite-forum/insert_error_midway_statement_journal"

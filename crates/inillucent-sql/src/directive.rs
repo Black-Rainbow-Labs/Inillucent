@@ -498,8 +498,14 @@ pub enum Directive {
     },
     /// `ATTACH`, which adds a database file to this connection.
     Attach {
-        /// The file to open, as the literal it was written as.
+        /// The file to open, as the literal it was written as. Empty when the
+        /// file name was an expression, which `file_sql` then holds.
         file: Vec<u8>,
+        /// The text of a file name that is not a string literal, such as a
+        /// parameter, `'a' || 'b'` or `(SELECT path FROM p)`, which the engine
+        /// evaluates when the statement runs, as SQLite does. `None` when the
+        /// file name was a literal.
+        file_sql: Option<String>,
         /// The name it will be known by.
         schema: Vec<u8>,
         /// The `KEY` clause's text: the file's encryption key, or empty for a
@@ -2069,11 +2075,11 @@ impl<'a> Binder<'a> {
 
     /// Binds an `ATTACH`.
     ///
-    /// Every operand is a literal, the `KEY` included. SQLite evaluates them, and every other
-    /// value they could produce is a file name computed at run time - a
-    /// statement that decides which database to open from arithmetic is not a
-    /// shape worth supporting before it is asked for, and it is one an
-    /// authorizer could not check.
+    /// The file name may be any expression, as in SQLite: a parameter, a
+    /// concatenation or a scalar subquery. The schema name and the `KEY` stay
+    /// literals. A computed file name is evaluated by the engine when the
+    /// statement runs, and then goes through the same confinement check as a
+    /// literal one, so `--root` limits it the same way.
     pub(crate) fn bind_attach(
         &mut self,
         file: ast::ExprId,
@@ -2098,8 +2104,10 @@ impl<'a> Binder<'a> {
                 ))
             }
         };
+        let (file, file_sql) = self.attach_file_name(file)?;
         Ok(Directive::Attach {
-            file: self.literal_path(file, "ATTACH with a file name that is not a literal")?,
+            file,
+            file_sql,
             schema: self.literal_or_name(schema)?,
             key,
         })
@@ -2133,25 +2141,30 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Reads the file name a `VACUUM INTO` or an `ATTACH` was given.
+    /// Reads the file name an `ATTACH` was given.
     ///
-    /// A literal only. SQLite evaluates the expression, but every other value
-    /// it could produce is a file name computed at run time, and a statement
-    /// that decides which file to open or where to write a copy of the
-    /// database from arithmetic is not a shape worth supporting before it is
-    /// asked for.
+    /// A string literal is carried as its bytes. Any other expression, such as
+    /// a parameter, `'a' || 'b'` or `(SELECT path FROM p)`, is carried as the
+    /// text it was written as, and the engine evaluates it when the statement
+    /// runs, as SQLite does: the value of a parameter is not known until then.
     ///
     /// @param expr - the file name operand
-    /// @param refused - the construct the refusal names when it is not one
-    fn literal_path(
+    fn attach_file_name(
         &mut self,
         expr: ast::ExprId,
-        refused: &'static str,
-    ) -> Result<Vec<u8>, ParseError> {
-        match self.ast.expr(expr) {
-            Some(ast::Expr::Literal(ast::Literal::String(text))) => Ok(text.clone()),
-            _ => Err(unsupported(refused, Span::default())),
+    ) -> Result<(Vec<u8>, Option<String>), ParseError> {
+        if let Some(ast::Expr::Literal(ast::Literal::String(text))) = self.ast.expr(expr) {
+            return Ok((text.clone(), None));
         }
+        let span = self.ast.expr_span(expr);
+        let written = self
+            .source
+            .get(span.start as usize..span.end as usize)
+            .ok_or_else(|| refused("the file name could not be read", span))?;
+        Ok((
+            Vec::new(),
+            Some(String::from_utf8_lossy(written).into_owned()),
+        ))
     }
 
     /// Binds a `CREATE VIEW`.

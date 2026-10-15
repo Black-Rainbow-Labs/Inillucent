@@ -1188,7 +1188,7 @@ fn settle_a_hot_journal(
     read_only: bool,
 ) -> DbResult<()> {
     if !read_only {
-        inillucent_pool::journal::replay_hot_journal(vfs, db_path)?;
+        crate::recovery::replay_hot_journal_holding_the_log(vfs, db_path)?;
         return Ok(());
     }
     if vfs

@@ -78,6 +78,16 @@ pub mod rerank;
 pub mod rerank_search;
 pub mod store;
 
+/// Drops the embedder's and the reranker's loaded sessions now, and lets the idle reaper end.
+///
+/// For a program that is about to exit and wants ONNX Runtime's threads joined by its own code,
+/// before the C runtime runs the exit handlers. A later call loads the model again. It does
+/// nothing in a build without the `embed` feature, and when nothing is loaded.
+pub fn release_models() {
+    #[cfg(feature = "embed")]
+    inillucent_core::exit_hook::release_all();
+}
+
 /// The implementation phase that filled this crate in, as named by the TDD.
 pub const IMPLEMENTATION_PHASE: &str =
     "phase 13: transactional inillucent search and legacy migration";

@@ -32,6 +32,21 @@ pub(crate) fn require_key_extents(database: &mut Database, log: &mut dyn TreeLog
     Ok(())
 }
 
+/// Makes the file say format 4, logging the move when this is the first time.
+///
+/// Does nothing when the file already says 4. The record is [`inillucent_wal::record::Body::FormatRaised`]
+/// and not [`inillucent_wal::record::Body::Format`], so a release that stops at format 3
+/// refuses a log that holds it by kind.
+///
+/// @param database - the file
+/// @param log - where the format record goes
+pub(crate) fn require_compact_rows(database: &mut Database, log: &mut dyn TreeLog) -> DbResult<()> {
+    if database.raise_format(inillucent_pool::meta::FORMAT_FOUR) {
+        log.log_format(inillucent_pool::meta::FORMAT_FOUR)?;
+    }
+    Ok(())
+}
+
 /// Writes a key or a separator out of line, moving the file to format 3 first.
 ///
 /// @param database - the file the pages are allocated in

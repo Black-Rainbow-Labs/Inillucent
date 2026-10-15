@@ -212,3 +212,41 @@ DELETE FROM ft WHERE rowid = 10;
 INSERT INTO ft(a) VALUES('u');
 COMMIT;
 SELECT rowid, a FROM ft ORDER BY rowid;
+
+-- case: bug-hunt-8/fts5/external_content_view
+-- The owner of the content is a view: it has no tree, so the rows are read with a query over the view.
+CREATE TABLE base(id INTEGER PRIMARY KEY, title TEXT, body TEXT, hidden TEXT);
+INSERT INTO base VALUES (1,'alpha one','red apple','x'),(2,'beta two','green pear','y'),(3,'gamma three','red plum','z');
+CREATE VIEW v AS SELECT id AS key, title, body FROM base WHERE hidden <> 'z';
+CREATE VIRTUAL TABLE f USING fts5(title, body, content='v', content_rowid='key');
+SELECT rowid, title, body FROM f;
+SELECT count(*) FROM f;
+SELECT rowid, title FROM f WHERE rowid = 2;
+SELECT rowid FROM f WHERE f MATCH 'red';
+INSERT INTO f(f) VALUES('rebuild');
+SELECT rowid, title FROM f WHERE f MATCH 'red' ORDER BY rowid;
+SELECT rowid, title FROM f WHERE f MATCH 'beta OR apple' ORDER BY rank;
+SELECT rowid, highlight(f, 1, '[', ']') FROM f WHERE f MATCH 'red';
+INSERT INTO f(f) VALUES('integrity-check');
+INSERT INTO base VALUES (4,'delta four','blue red','w');
+SELECT rowid FROM f ORDER BY rowid;
+SELECT rowid FROM f WHERE f MATCH 'blue';
+INSERT INTO f(rowid, title, body) VALUES (4, 'delta four', 'blue red');
+SELECT rowid FROM f WHERE f MATCH 'blue';
+INSERT INTO f(f, rowid, title, body) VALUES ('delete', 4, 'delta four', 'blue red');
+SELECT rowid FROM f WHERE f MATCH 'blue';
+SELECT rowid FROM f WHERE f MATCH 'red' ORDER BY rowid;
+INSERT INTO f(f) VALUES('delete-all');
+SELECT rowid FROM f WHERE f MATCH 'red';
+SELECT count(*) FROM f;
+
+-- case: bug-hunt-8/fts5/external_content_table_scan_before_the_index_is_built
+-- A scan reads the owner's rows, so it finds rows the index has not been told about.
+CREATE TABLE base(id INTEGER PRIMARY KEY, body TEXT);
+INSERT INTO base VALUES (1,'alpha'),(2,'beta');
+CREATE VIRTUAL TABLE f USING fts5(body, content='base', content_rowid='id');
+SELECT rowid, body FROM f;
+SELECT count(*) FROM f;
+SELECT rowid FROM f WHERE f MATCH 'alpha';
+INSERT INTO f(f) VALUES('rebuild');
+SELECT rowid FROM f WHERE f MATCH 'alpha';

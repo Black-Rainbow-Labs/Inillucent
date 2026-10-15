@@ -40,6 +40,7 @@ use inillucent_base::error::{confinement_refusal, refusal, statement_refusal};
 use inillucent_base::DbResult;
 use inillucent_catalog::paged::{ObjectKind, SchemaEntry};
 use inillucent_exec::dml::Changes;
+use inillucent_exec::physical::Params;
 use inillucent_sql::bind::BoundStatement;
 use inillucent_sql::catalog_view::{IndexInfo, TableInfo};
 use inillucent_sql::directive::Directive;
@@ -60,6 +61,7 @@ mod dropped_parents;
 pub(crate) use dropped_parents::DroppedParent;
 mod index;
 mod module_rename;
+mod pads;
 mod reindex;
 mod table;
 mod tree;
@@ -134,6 +136,20 @@ impl ImportedDatabase {
     /// @param sql - the statement text, which is also the source the stored
     ///   `CREATE` text is sliced out of
     pub fn execute_ddl(&mut self, sql: &str) -> DbResult<Outcome> {
+        self.execute_ddl_with(sql, &Params::default())
+    }
+
+    /// Runs one statement the session carries out itself, with the values its
+    /// parameters were bound to.
+    ///
+    /// Almost every directive reads no parameter. `ATTACH` and `VACUUM INTO`
+    /// take a file name that may be one, so the values travel as far as the
+    /// directive that evaluates that expression.
+    ///
+    /// @param sql - the statement text, which is also the source the stored
+    ///   `CREATE` text is sliced out of
+    /// @param params - the values the statement's parameters are bound to
+    pub(crate) fn execute_ddl_with(&mut self, sql: &str, params: &Params) -> DbResult<Outcome> {
         let BoundStatement::Directive(directive) = self.bind(sql)? else {
             return Err(refusal(format!("{sql} is not a directive")));
         };
@@ -182,7 +198,7 @@ impl ImportedDatabase {
         let mark = self.statement_mark();
         let txn = self.current_txn();
         let logged_from = self.log_of(at).map(|wal| wal.next_lsn());
-        let outcome = self.run_directive(*directive, sql);
+        let outcome = self.run_directive(*directive, sql, params);
         self.schema.ddl_schema = previous;
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -295,7 +311,13 @@ impl ImportedDatabase {
     /// @param directive - the bound statement
     /// @param sql - the statement text, which the DDL cases slice the stored
     ///   `CREATE` text out of
-    fn run_directive(&mut self, directive: Directive, sql: &str) -> DbResult<Outcome> {
+    /// @param params - the values the statement's parameters are bound to
+    fn run_directive(
+        &mut self,
+        directive: Directive,
+        sql: &str,
+        params: &Params,
+    ) -> DbResult<Outcome> {
         let source = sql.as_bytes();
         match directive {
             // **`IF NOT EXISTS` on a table that exists never reads the
@@ -500,7 +522,16 @@ impl ImportedDatabase {
             // numbering, the planner's tree handles, the write path's choice of
             // log - was already written for more than one; what was missing was
             // a second file to point them at.
-            Directive::Attach { file, schema, key } => {
+            Directive::Attach {
+                file,
+                file_sql,
+                schema,
+                key,
+            } => {
+                let file = match file_sql {
+                    Some(expression) => self.file_name_of(&expression, params)?,
+                    None => file,
+                };
                 self.attach(&file, &schema, key.as_deref())?;
                 Ok(Outcome::empty())
             }
@@ -530,7 +561,7 @@ impl ImportedDatabase {
                 database,
                 into,
                 into_sql,
-            } => self.run_vacuum(database, into, into_sql),
+            } => self.run_vacuum(database, into, into_sql, params),
         }
     }
 
@@ -545,17 +576,19 @@ impl ImportedDatabase {
     /// @param database - the schema, as the binder numbers them
     /// @param into - the file name when it was a literal
     /// @param into_sql - the file name expression when it was not a literal
+    /// @param params - the values the statement's parameters are bound to
     fn run_vacuum(
         &mut self,
         database: usize,
         into: Option<Vec<u8>>,
         into_sql: Option<String>,
+        params: &Params,
     ) -> DbResult<Outcome> {
         if self.writing.batch().is_some() {
             return Err(statement_refusal("cannot VACUUM from within a transaction"));
         }
         let into = match (into, into_sql) {
-            (None, Some(expression)) => Some(self.vacuum_target(&expression)?),
+            (None, Some(expression)) => Some(self.vacuum_target(&expression, params)?),
             (into, _) => into,
         };
         let Some(path) = into else {
@@ -601,11 +634,33 @@ impl ImportedDatabase {
     /// `'a' || 'b'`, and refuses a value that is not text.
     ///
     /// @param expression - the expression as it was written
-    fn vacuum_target(&mut self, expression: &str) -> DbResult<Vec<u8>> {
-        let rows = self.query_internally(&format!("SELECT ({expression})"))?;
+    /// @param params - the values the statement's parameters are bound to
+    fn vacuum_target(&mut self, expression: &str, params: &Params) -> DbResult<Vec<u8>> {
+        let rows = self
+            .execute_any(&format!("SELECT ({expression})"), params)?
+            .rows;
         match rows.first().and_then(|row| row.first()) {
             Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes.clone()),
             _ => Err(statement_refusal("non-text filename")),
+        }
+    }
+
+    /// Evaluates the file name expression of an `ATTACH`.
+    ///
+    /// SQLite accepts any expression and reads its value as text, so an
+    /// integer names a file called `5` and a NULL names the empty file name,
+    /// which is a private temporary database. `CAST(... AS TEXT)` does the
+    /// same conversion here, and leaves NULL as NULL for the empty name.
+    ///
+    /// @param expression - the expression as it was written
+    /// @param params - the values the statement's parameters are bound to
+    fn file_name_of(&mut self, expression: &str, params: &Params) -> DbResult<Vec<u8>> {
+        let rows = self
+            .execute_any(&format!("SELECT CAST(({expression}) AS TEXT)"), params)?
+            .rows;
+        match rows.first().and_then(|row| row.first()) {
+            Some(inillucent_tree::datum::OwnedDatum::Text(bytes)) => Ok(bytes.clone()),
+            _ => Ok(Vec::new()),
         }
     }
 }
@@ -636,33 +691,7 @@ pub(crate) fn refuse_duplicates(
     Ok(())
 }
 
-/// Returns the failure a `CREATE UNIQUE INDEX` reports when two rows share a key.
-///
-/// @param owner - the table, for the message
-/// @param index - the index, for the message
-pub(crate) fn unique_violation(owner: &TableInfo, index: &IndexInfo) -> inillucent_base::DbError {
-    let columns: Vec<String> = index
-        .columns
-        .iter()
-        .map(|key| {
-            let name = key
-                .column
-                .and_then(|at| owner.column(at))
-                .map(|column| String::from_utf8_lossy(&column.name).into_owned())
-                .unwrap_or_else(|| "?".to_string());
-            format!("{}.{}", String::from_utf8_lossy(&owner.name), name)
-        })
-        .collect();
-    // `SQLITE_CONSTRAINT_UNIQUE` (2067), which is what SQLite reports
-    // when the rows already there break the new index; `refusal`
-    // answered `SQLITE_MISUSE` (21).
-    let said = format!("UNIQUE constraint failed: {}", columns.join(", "));
-    inillucent_base::DbError::new(inillucent_base::ExtendedCode(
-        inillucent_sql::dml::codes::UNIQUE,
-    ))
-    .with_message(said.clone())
-    .with_detail(said)
-}
+pub(crate) use crate::index_sort::unique_violation;
 
 /// Returns an identifier quoted the way SQL wants it.
 ///

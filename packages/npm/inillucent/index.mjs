@@ -760,6 +760,31 @@ export class Session {
 const OPEN_CREATE = 0x0001;
 const OPEN_READONLY = 0x0002;
 
+/**
+ * Drops the library's loaded embedding model when Node exits.
+ *
+ * **Without it a Node process that called `embed()` could abort at exit on macOS** with
+ * `libc++abi: terminating due to uncaught exception of type std::__1::system_error: mutex lock
+ * failed: Invalid argument` and exit code 134, because ONNX Runtime's own destructors ran while
+ * a session's threads were still running. The `exit` event runs before Node unloads anything, so
+ * the library joins those threads here. A library from before ABI 1.5.0 has no such function and
+ * nothing is done.
+ *
+ * @param native - the addon
+ */
+function releaseModelsAtExit(native) {
+  if (typeof native.releaseModels !== 'function') {
+    return;
+  }
+  process.once('exit', () => {
+    try {
+      native.releaseModels();
+    } catch {
+      // The process is ending, and a failure to release is not worth a different exit code.
+    }
+  });
+}
+
 /** The addon, once loaded: `undefined` before the first look, `null` when there is none. */
 let addon;
 
@@ -788,6 +813,7 @@ function nativeAddon() {
     process.dlopen(module, path);
     if (typeof module.exports.query === 'function') {
       addon = module.exports;
+      releaseModelsAtExit(addon);
     }
   } catch {
     addon = null;

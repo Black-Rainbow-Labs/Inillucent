@@ -29,6 +29,13 @@ pub struct Failed {
     pub feature: Option<String>,
     /// Where in the statement, when the failure knows.
     pub offset: Option<u32>,
+    /// The rows the statement produced before it failed, when it produced any.
+    ///
+    /// SQLite hands out every row ahead of the one that raised the error and then
+    /// reports the error, so a program that reads rows until a failure and
+    /// reports how far it got needs them. `None` for a failure that came before
+    /// the first row, which is almost all of them.
+    pub partial: Option<Box<Outcome>>,
 }
 
 impl Failed {
@@ -42,6 +49,7 @@ impl Failed {
             message: message.into(),
             feature: None,
             offset: None,
+            partial: None,
         }
     }
 
@@ -63,6 +71,7 @@ impl Failed {
             message: message.into(),
             feature: Some(feature),
             offset: None,
+            partial: None,
         }
     }
 
@@ -81,6 +90,7 @@ impl Failed {
             message: classified.message,
             feature: classified.feature,
             offset: classified.offset,
+            partial: None,
         }
     }
 
@@ -110,6 +120,7 @@ impl Failed {
                 message: failure.message.clone(),
                 feature: None,
                 offset: failure.offset,
+                partial: None,
             },
         }
     }
@@ -130,8 +141,29 @@ impl Failed {
         if let Some(offset) = self.offset {
             pairs.push(("offset", Json::Int(i64::from(offset))));
         }
-        pairs.push(("text", json::text(self.to_text())));
+        // The rows before the failure, in the members a success reports them
+        // under, so one reader handles both.
+        if let Some(rows) = &self.partial {
+            pairs.extend(rows.row_members());
+        }
+        pairs.push(("text", json::text(self.to_text_with_rows())));
         json::object(pairs)
+    }
+
+    /// Renders the rows produced before the failure, then the failure.
+    ///
+    /// The order SQLite's own shell prints them in. A failure with no rows
+    /// before it renders as [`Failed::to_text`] does.
+    pub fn to_text_with_rows(&self) -> String {
+        match &self.partial {
+            Some(rows) if !rows.text.is_empty() => format!(
+                "{}
+{}",
+                rows.text,
+                self.to_text()
+            ),
+            _ => self.to_text(),
+        }
     }
 
     /// Renders this failure the way a person reads it.
@@ -340,8 +372,10 @@ impl Outcome {
         self
     }
 
-    /// Renders this outcome as the object every front end reports.
-    pub fn to_json(&self) -> Json {
+    /// Returns the members that carry the result: columns, rows and their counts.
+    ///
+    /// Shared by a success and by a failure that produced rows before it failed.
+    pub fn row_members(&self) -> Vec<(&'static str, Json)> {
         let columns = self
             .columns
             .iter()
@@ -357,18 +391,27 @@ impl Outcome {
             .iter()
             .map(|row| Json::Array(row.clone()))
             .collect();
-        let mut pairs = vec![
-            ("ok", Json::Bool(true)),
-            ("command", json::text(&self.command)),
+        vec![
             ("columns", Json::Array(columns)),
             ("rows", Json::Array(rows)),
             ("row_count", Json::Int(self.rows.len() as i64)),
             ("total", Json::Int(self.total as i64)),
             ("more", Json::Bool(self.more)),
+        ]
+    }
+
+    /// Renders this outcome as the object every front end reports.
+    pub fn to_json(&self) -> Json {
+        let mut pairs = vec![
+            ("ok", Json::Bool(true)),
+            ("command", json::text(&self.command)),
+        ];
+        pairs.extend(self.row_members());
+        pairs.extend([
             ("changes", Json::Int(self.changes)),
             ("last_insert_rowid", Json::Int(self.last_insert_rowid)),
             ("elapsed_ms", Json::Real(self.elapsed_ms)),
-        ];
+        ]);
         let mut object = json::object(std::mem::take(&mut pairs));
         if let Json::Object(members) = &mut object {
             for (name, value) in &self.extra {

@@ -478,6 +478,21 @@ impl ImportedDatabase {
         names: &std::rc::Rc<Vec<String>>,
         params: &Params,
     ) -> DbResult<Outcome> {
+        // A caller that asked for its rows one at a time gets them from the pipeline as it
+        // produces them, and the outcome carries none (see
+        // `ImportedDatabase::execute_statement_streaming`).
+        if let Some(mut consumer) = params.take_stream() {
+            consumer.columns(names);
+            let (ran, consumer) =
+                self.run_cached_query_streaming(plan, prepared, slot, params, consumer);
+            params.return_stream(consumer);
+            ran?;
+            return Ok(Outcome {
+                rows: Vec::new(),
+                names: std::rc::Rc::clone(names),
+                changes: Changes::default(),
+            });
+        }
         let rows = self.run_cached_query(plan, prepared, slot, params)?;
         Ok(Outcome {
             rows,
@@ -577,6 +592,60 @@ impl ImportedDatabase {
         }
         drop(held);
         Ok(physical::run_any_prepared(plan, self, prepared, params)?.0)
+    }
+
+    /// [`ImportedDatabase::run_cached_query`], with every row handed to a consumer as the
+    /// pipeline produces it, so the answer is never held.
+    ///
+    /// The slot is tried and remembered exactly as `run_cached_query` does, and a run that fails
+    /// does not keep a chain it just built, as there. A slot already in use, or a query with no
+    /// chain, builds a pipeline for this one call. The consumer comes back whatever happened, and
+    /// a failure is reported after the rows that came before it were handed over.
+    ///
+    /// @param plan - the planner's output
+    /// @param prepared - the structural choice `prepare` made
+    /// @param slot - this query's compiled-chain cache
+    /// @param params - the bound parameters
+    /// @param consumer - what takes each row
+    pub(crate) fn run_cached_query_streaming(
+        &self,
+        plan: &PhysicalPlan,
+        prepared: &physical::Prepared,
+        slot: &std::cell::RefCell<physical::Slot>,
+        params: &Params,
+        consumer: Box<dyn inillucent_exec::ops::RowConsumer>,
+    ) -> (DbResult<()>, Box<dyn inillucent_exec::ops::RowConsumer>) {
+        let Ok(mut held) = slot.try_borrow_mut() else {
+            return physical::run_any_prepared_streaming(plan, self, prepared, params, consumer);
+        };
+        if let physical::Slot::Reusable(compiled) = &*held {
+            if !compiled.built_under(params) {
+                *held = physical::Slot::Untried;
+            }
+        }
+        match &mut *held {
+            physical::Slot::Reusable(compiled) => {
+                return compiled.run_streaming(plan, self, params, consumer);
+            }
+            physical::Slot::Never => {}
+            physical::Slot::Untried => match physical::try_compile(plan, self, prepared, params) {
+                Err(error) => return (Err(error), consumer),
+                Ok(Some(mut compiled)) => {
+                    let (ran, consumer) = compiled.run_streaming(plan, self, params, consumer);
+                    if ran.is_ok() {
+                        *held = if compiled.rebindable() {
+                            physical::Slot::Reusable(Box::new(compiled))
+                        } else {
+                            physical::Slot::Never
+                        };
+                    }
+                    return (ran, consumer);
+                }
+                Ok(None) => *held = physical::Slot::Never,
+            },
+        }
+        drop(held);
+        physical::run_any_prepared_streaming(plan, self, prepared, params, consumer)
     }
 
     /// [`ImportedDatabase::run_cached_query`] for the source of an `INSERT ... SELECT`, collecting

@@ -453,3 +453,44 @@ fn a_cuda_device_that_will_not_start_fails_and_writes_nothing() {
     );
     assert_eq!(count(&binary, &database, "SELECT count(v) FROM chunk"), 0);
 }
+
+/// `inillucent embed` drops its sessions when it finishes, and the process exits with code 0 on
+/// every one of thirty runs.
+///
+/// The command used to keep finished sessions in a static and never drop them, because dropping an
+/// ONNX Runtime session and then exiting ended about one run in six with
+/// `STATUS_STACK_BUFFER_OVERRUN` on Windows. The environment reference `exit_hook` now holds makes
+/// the drop safe, so this runs the command the way that crash was found: embed, drop, exit.
+#[test]
+fn embed_drops_its_sessions_and_exits_with_code_zero_on_every_run() {
+    let Some(binary) = embedder_or_skip() else {
+        return;
+    };
+    let database = scratch("drops");
+    let path = database.to_string_lossy().into_owned();
+    let created = run(&binary, &["create", &path], &[]);
+    assert_eq!(created.code, 0, "{}", created.said());
+    sql(
+        &binary,
+        &database,
+        "exec",
+        "CREATE TABLE chunk (id INTEGER PRIMARY KEY, body TEXT, v VECTOR(768))",
+    );
+    sql(
+        &binary,
+        &database,
+        "exec",
+        "INSERT INTO chunk (id, body) VALUES (1, 'cats sleep on warm mats'), (2, 'dogs chase balls')",
+    );
+    for pass in 0..30 {
+        let ran = embed(&binary, &database, &["--all"]);
+        assert_eq!(
+            ran.code,
+            0,
+            "run {pass} of 30 ended with {}: {}",
+            ran.code,
+            ran.said()
+        );
+    }
+    assert_eq!(count(&binary, &database, "SELECT count(v) FROM chunk"), 2);
+}

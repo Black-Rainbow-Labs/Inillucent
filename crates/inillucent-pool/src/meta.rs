@@ -67,6 +67,22 @@ pub const FORMAT_VERSION: u32 = 3;
 /// stored out of line or `VACUUM` rebuilds it.
 pub const FORMAT_TWO: u32 = 2;
 
+/// The newest format version this build reads, and the version a file is raised to
+/// the first time it holds something only this build reads.
+///
+/// **A new file still says [`FORMAT_VERSION`]**, so a release that reads format 3 opens
+/// every file that has never held what format 4 adds. A file moves to 4, with a
+/// `FormatRaised` log record written first, when `ALTER TABLE ... ADD COLUMN` leaves
+/// a leaf with fewer columns than its table, or when a row is stored in the compact
+/// integer encoding. A release that stops at 3 reads the number and refuses the file
+/// by name, "format version 4 ... upgrade inillucent to open it", instead of reading
+/// a short leaf as a corrupt one. Nothing lowers the number once it has moved.
+pub const NEWEST_FORMAT_VERSION: u32 = 4;
+
+/// The format version of a file that holds a leaf with fewer columns than its table
+/// or a row in the compact integer encoding.
+pub const FORMAT_FOUR: u32 = 4;
+
 /// The oldest format version this build reads.
 ///
 /// Every published release before task-2074 wrote format 1, and
@@ -78,7 +94,7 @@ pub const OLDEST_FORMAT_VERSION: u32 = 1;
 ///
 /// @param found - the version a file's header carries
 pub fn reads_format(found: u32) -> bool {
-    (OLDEST_FORMAT_VERSION..=FORMAT_VERSION).contains(&found)
+    (OLDEST_FORMAT_VERSION..=NEWEST_FORMAT_VERSION).contains(&found)
 }
 
 /// Returns the refusal a file of another format version reports.
@@ -97,15 +113,15 @@ pub fn reads_format(found: u32) -> bool {
 ///
 /// @param found - the version the file's header carries
 pub(crate) fn wrong_format(found: u32) -> inillucent_base::DbError {
-    if found > FORMAT_VERSION {
+    if found > NEWEST_FORMAT_VERSION {
         return inillucent_base::error::refusal(format!(
             "this database is format version {found} and this build reads version \
-             {FORMAT_VERSION}; upgrade inillucent to open it"
+             {NEWEST_FORMAT_VERSION}; upgrade inillucent to open it"
         ))
         .with_unsupported(format!("a database of format version {found}"));
     }
     corrupt(format!(
-        "format version {found} is not one of {OLDEST_FORMAT_VERSION} to {FORMAT_VERSION}, and \
+        "format version {found} is not one of {OLDEST_FORMAT_VERSION} to {NEWEST_FORMAT_VERSION}, and \
          there is no earlier format: the header has been overwritten"
     ))
 }
@@ -826,7 +842,7 @@ mod tests {
         let slot = page
             .get_mut(at::FORMAT..at::FORMAT + 4)
             .expect("the format field is inside the page");
-        slot.copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+        slot.copy_from_slice(&(NEWEST_FORMAT_VERSION + 1).to_le_bytes());
         let error = Meta::decode(&page).unwrap_err();
         assert!(error.detail().unwrap_or("").contains("format"), "{error:?}");
     }
@@ -848,7 +864,7 @@ mod tests {
         read.encode(&mut again).unwrap();
         assert_eq!(u32(&again, at::FORMAT).unwrap(), FORMAT_TWO);
         assert!(reads_format(1) && reads_format(2) && reads_format(3));
-        assert!(!reads_format(0) && !reads_format(4));
+        assert!(!reads_format(0) && !reads_format(5));
     }
 
     /// A file this build creates says 3, and a record that says 2 is read and
@@ -875,17 +891,29 @@ mod tests {
         assert_eq!(u32(&again, at::FORMAT).unwrap(), 2);
     }
 
-    /// Format 4 is refused by name, and the refusal says what to do.
+    /// Format 4 is read, and a file that says it stays 4 when its record is written again.
     #[test]
-    fn format_four_is_refused_by_name() {
+    fn format_four_is_read_and_kept() {
+        let mut meta = Meta::fresh(8_192, 1);
+        meta.format = FORMAT_FOUR;
+        let mut page = vec![0u8; 8_192];
+        meta.encode(&mut page).unwrap();
+        assert_eq!(u32(&page, at::FORMAT).unwrap(), 4);
+        let read = Meta::decode(&page).expect("a format 4 record reads");
+        assert_eq!(read.format, 4);
+    }
+
+    /// Format 5 is refused by name, and the refusal says what to do.
+    #[test]
+    fn format_five_is_refused_by_name() {
         let mut page = vec![0u8; 8_192];
         Meta::fresh(8_192, 1).encode(&mut page).unwrap();
-        put(&mut page, at::FORMAT, &4u32.to_le_bytes()).unwrap();
+        put(&mut page, at::FORMAT, &5u32.to_le_bytes()).unwrap();
         let sum = checksum(&page).unwrap();
         put(&mut page, at::CHECKSUM, &sum.to_le_bytes()).unwrap();
         let error = Meta::decode(&page).unwrap_err();
         assert!(
-            error.message().contains("format version 4"),
+            error.message().contains("format version 5"),
             "{:?}",
             error.message()
         );

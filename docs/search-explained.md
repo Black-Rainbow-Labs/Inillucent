@@ -670,7 +670,7 @@ flowchart TB
 | the plan says `SCAN` where you expected `USING VECTOR INDEX` | the distance in `ORDER BY` does not match the index's metric, or there is no `LIMIT` | use `vector_distance_cos` with a cosine index, and add a `LIMIT` |
 | a filtered search returns fewer rows than `k` | the filter column is not a `FACET`, so it ran after the search | declare the column `FACET` |
 | search by meaning returns nonsense | the query and the rows were embedded by different models, or without the `search_query: ` and `search_document: ` labels | embed both sides with the same model and the right labels |
-| every confidence is small | the query vector is not length 1, or the hits were found by keywords alone | pass a vector of length 1, with `l2_normalize(v)` if needed, and check `origin()` |
+| every confidence is small | the hits were found by keywords alone, or the query has no good match | check `origin()`, and compare the confidence of a query you know has a match |
 | an FTS5 query for `released` misses `release` | the default FTS5 tokenizer does not stem | create the table with `tokenize = 'porter'`, or use an `inillucent_search` table |
 | the first search after opening the file is slow | an `inillucent_search` table reads its index into memory on the first search | run `INSERT INTO docs(docs) VALUES('compact')` after a large load |
 | a statement fails with exit code 3 or the status `unsupported` | that construct is not built yet | rewording it will not help. Check `inillucent capabilities` |

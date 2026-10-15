@@ -101,3 +101,40 @@ fn the_deliberate_rules_parse() {
         );
     }
 }
+
+/// Group 1 of the `insert` family at both cadences gives the same problems
+/// when the two run at once as when each runs alone.
+///
+/// `matrix::insert` and `matrix_deep::insert` are separate test processes that
+/// the runner starts together, and both have a shard 1 and a group 1. Before
+/// the cadence was part of the scratch path they shared `s1/insert-1-default`
+/// and each deleted the other's fixtures, which read as "unable to open
+/// database file" and "no such table".
+#[test]
+fn two_cadences_running_one_group_at_once_do_not_share_scratch_files() {
+    use inillucent_compat::statement_matrix::group::{run_group_report, scratch_root};
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("both-cadences");
+    assert_ne!(
+        scratch_root(&tmp, Cadence::Change),
+        scratch_root(&tmp, Cadence::Merge)
+    );
+    let run = |cadence: Cadence| {
+        let scratch = scratch_root(&tmp, cadence);
+        run_group_report("insert", cadence, 1, 8, &scratch)
+    };
+    let alone_change = run(Cadence::Change);
+    let alone_merge = run(Cadence::Merge);
+    if alone_change.oracle_missing || alone_merge.oracle_missing {
+        inillucent_compat::differential::announce_skip();
+        return;
+    }
+    let (together_change, together_merge) = std::thread::scope(|scope| {
+        let change = scope.spawn(|| run(Cadence::Change));
+        let merge = scope.spawn(|| run(Cadence::Merge));
+        (change.join().unwrap(), merge.join().unwrap())
+    });
+    assert_eq!(alone_change.problems, together_change.problems);
+    assert_eq!(alone_merge.problems, together_merge.problems);
+    assert_eq!(alone_change.failing, together_change.failing);
+    assert_eq!(alone_merge.failing, together_merge.failing);
+}

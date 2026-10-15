@@ -832,6 +832,12 @@ pub(crate) fn build_session(model_path: &Path, options: &OnnxOptions) -> Result<
 /// @param model_path - the `.onnx` file
 /// @param options - the device, the thread count and the optimization level
 fn open_session(model_path: &Path, options: &OnnxOptions) -> Result<Session> {
+    // **Before the builder, so a session that fails to open is covered too.** A CUDA execution
+    // provider that will not start still created ONNX Runtime's environment, and without this
+    // reference `ort` released it as the last one while the process exited, which read freed memory
+    // and ended the process with STATUS_ACCESS_VIOLATION or STATUS_STACK_BUFFER_OVERRUN on Windows
+    // after the refusal had been printed. `exit_hook` says why the reference is never given back.
+    crate::exit_hook::keep_environment();
     let mut builder = Session::builder().context("creating an ONNX session builder")?;
     builder = builder
         .with_optimization_level(options.optimization.level())
