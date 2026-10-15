@@ -85,7 +85,9 @@ A statement moves down this picture in five steps.
    `SELECT 1; DROP TABLE t` is refused and a `SELECT` that contains the word "delete" is not.
 3. **Plan.** The planner first copies each derived table, view and CTE into the query where SQLite
    would, and plans an outer join the `WHERE` cannot null extend as an inner join. Then it picks an
-   access path and a join order. `EXPLAIN QUERY PLAN` prints its choice as SQLite's tree.
+   access path and a join order. A derived table that stays a subquery is sized the way SQLite sizes
+   it: a `SELECT` with no `FROM` clause is one row, a `UNION` adds its arms, and a constant `LIMIT`
+   caps it. A small one becomes the outer loop. `EXPLAIN QUERY PLAN` prints its choice as SQLite's tree.
 4. **Compile.** The plan becomes a chain of operators. The compiled form is cached by statement text,
    so preparing the same text again is a lookup.
 5. **Run.** Batches of column values flow up the chain. A statement runs to the end on its first

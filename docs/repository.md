@@ -227,7 +227,7 @@ prerequisite in `tests/selection.toml` is missing from this table or has a diffe
 
 | prerequisite | rows | what provides it |
 |---|---:|---|
-| `oracle` | 85 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
+| `oracle` | 87 | the pinned SQLite 3.53.4 comparison process: `pwsh tools/sqlite-reference.ps1` or `bash tools/sqlite-reference.sh` |
 | `shell` | 12 | the pinned `sqlite3` 3.53.4 shell, built by the same two scripts |
 | `embed` | 7 | a build with `inillucent-engine/embed` turned on. The runner builds it from the target's `features` row, and passes a row's `inillucent-cli/embed` to the build of the programs too. `tools/coverage.mjs` does not, because the feature needs `inillucent-core/onnx` and `inillucent-core` is left out of the coverage run |
 | `tracked-fixtures` | 5 | the files under `compat/fixtures/`, which are committed. A new clone has them. The row is for a checkout that has lost them |

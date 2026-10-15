@@ -10,6 +10,37 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**A query that fails partway returns the rows before the failure through the C library and the
+Python, Node, PHP and Go packages.** SQLite hands out every row ahead of the one that raised the
+error and then reports the error, and the Rust driver and the command line already did the same.
+The C library dropped those rows, so a query that failed on its 4th row gave a Python, Node or C
+caller the error and none of the first 3 rows. `inillucent_error_take_rows` (ABI 1.5.0, provisional)
+returns them once as a result the caller frees with `inillucent_rows_free`, and returns `NULL` when
+the statement failed before its first row. The Python `DriverError.partial` is a `Rows` through the
+C library and a list of dictionaries through the command line helper `query`. The Node error has an
+array of row objects as `partial`, the PHP `Error::$partial` is a list of associative arrays, and the
+Go `Error.Partial` is a slice of maps. Each is empty or `null` when no row came before the failure.
+New tests fail each package's call when the rows are missing.
+
+**`LIMIT` with `OFFSET` no longer evaluates the select list of the rows it skips.** In
+`SELECT a, CASE WHEN a = 3 THEN json('x') END FROM t LIMIT 1 OFFSET 5` SQLite skips row 3 without
+running `json('x')` and answers row 6. The engine projected every row ahead of the `LIMIT`, so the
+skipped row raised `malformed JSON`. The `OFFSET` is now applied below the projection when the rows
+reach the `LIMIT` in the order they are answered in: no `ORDER BY` that needs a sort, no `DISTINCT`,
+no aggregate and no window function. Those four keep evaluating every row, as SQLite does. A
+`UNION ALL` with an `OFFSET` still projects the rows it skips.
+
+**A join with a derived table that is known to be small returns its rows in SQLite's order.**
+`SELECT t.a, j.k FROM t, (SELECT 1 k UNION ALL SELECT 2) j` returned `10|1, 10|2, 20|1, 20|2` where
+SQLite returns `10|1, 20|1, 10|2, 20|2`. SQLite sizes a subquery it cannot flatten and makes the
+small one the outer loop. The planner gave every subquery the row count of a table it had not
+analysed, so both orders cost the same and the written order stood. A subquery with no `FROM`
+clause, a `UNION` or `UNION ALL` of such subqueries, and one with a constant `LIMIT` are now sized
+the way SQLite sizes them, which puts them first. A subquery over a table keeps the default size,
+so it stays where it was written, as it does in SQLite. A `CROSS JOIN` still pins the order. Ten
+join statements in the ordering differential suite compare the order with SQLite, and five of them
+failed before this change.
+
 **Two connections on one file see each other's commits when the log rolls to a new segment, and an
 attached file does too.** The log moves to a new segment when the open one reaches 64 MiB, and that
 writes no meta record. A connection asks whether the next segment exists, and on Windows it skips
