@@ -30,8 +30,9 @@
 //!
 //! [`release_all`] runs the same unloaders on request, for a program that knows it is about to
 //! exit and would rather release the sessions from its own code than from an exit handler. The C
-//! library exports it as `inillucent_release_models`, and the Node, Python and PHP wrappers call
-//! it before they exit.
+//! library exports it as `inillucent_release_models`, and the Node and Python wrappers call it
+//! before they exit. The PHP package starts the `inillucent` program for each call and loads no
+//! library, so it has nothing to release.
 //!
 //! ## The environment reference
 //!
