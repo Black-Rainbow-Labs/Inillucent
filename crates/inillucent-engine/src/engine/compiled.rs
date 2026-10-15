@@ -693,23 +693,16 @@ impl crate::ImportedDatabase {
                 let rows = match source {
                     // Packed when the bulk build could take the rows (task-2226); see
                     // `crate::engine::bulk::Collected`.
-                    Some(query) if self.bulk_could_take(statement)? => {
-                        let rows = self.run_cached_query_packed(
+                    Some(query) => {
+                        let packed = self.bulk_could_take(statement)?;
+                        let rows = self.run_cached_query_gathered(
                             &query.plan,
                             &query.prepared,
                             &query.slot,
                             params,
+                            packed,
                         );
                         self.before_write(rows)?
-                    }
-                    Some(query) => {
-                        let rows = self.run_cached_query(
-                            &query.plan,
-                            &query.prepared,
-                            &query.slot,
-                            params,
-                        );
-                        Collected::Rows(self.before_write(rows)?)
                     }
                     // Rows a lifted statement hands in (task-2191); none for
                     // an ordinary `VALUES` list.

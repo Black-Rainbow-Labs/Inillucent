@@ -149,7 +149,7 @@ pub fn release_all() {
         return;
     };
     for unload in unloaders.iter() {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unload()));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(unload));
     }
 }
 

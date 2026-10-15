@@ -250,9 +250,9 @@ pub struct Compiled {
     /// Where `upper`'s `CollectInto` writes the rows, and where
     /// [`Compiled::take_rows`] takes them back out.
     collected: std::rc::Rc<std::cell::RefCell<Vec<Vec<OwnedDatum>>>>,
-    /// Where `upper`'s `CollectInto` writes the rows instead while [`Compiled::run_packed`]
+    /// Where `upper`'s `CollectInto` writes the rows instead while [`Compiled::run_gathered`]
     /// runs: empty otherwise.
-    packed: crate::ops::Packing,
+    gathered: crate::ops::Gather,
     /// Where `upper`'s `CollectInto` hands the rows instead while [`Compiled::run_streaming`]
     /// runs: empty otherwise.
     streaming: crate::ops::Streaming,
@@ -555,29 +555,49 @@ impl Compiled {
         }
     }
 
-    /// Runs the chain into a packed set of rows instead of a vector a row.
+    /// Runs the chain into a collection that packs its rows, or keeps one vector a row, and moves
+    /// them to a transient file when they pass a byte limit.
     ///
-    /// For an `INSERT ... SELECT` the bulk build will take; see
-    /// [`crate::ops::CollectInto::with_packed`]. On a failure the rows delivered before it are
-    /// kept for [`crate::physical::take_partial_rows`], as `take_rows` keeps them for a
-    /// caller of [`Compiled::run`].
+    /// For an `INSERT ... SELECT`; see [`crate::ops::CollectInto::with_gathering`] and
+    /// [`crate::gather`]. On a failure the rows delivered before it that are still in memory are
+    /// kept for [`crate::physical::take_partial_rows`], as `take_rows` keeps them for a caller of
+    /// [`Compiled::run`].
     ///
     /// @param plan - the planner's output this chain was compiled from
     /// @param catalog - where the trees and layouts come from, for this call only
     /// @param params - the values bound to `?1`, `?2`, ...
-    pub fn run_packed(
+    /// @param packed - whether to pack the rows (for the bulk build) or keep one vector a row
+    pub fn run_gathered(
         &mut self,
         plan: &PhysicalPlan,
         catalog: &dyn TreeCatalog,
         params: &Params,
-    ) -> DbResult<crate::packed::PackedRows> {
-        *self.packed.borrow_mut() = Some(crate::packed::PackedRows::new());
+        packed: bool,
+    ) -> DbResult<crate::gather::Gathered> {
+        let spill = catalog.spill();
+        *self.gathered.borrow_mut() = Some(if packed {
+            crate::gather::Gathering::packed(spill)
+        } else {
+            crate::gather::Gathering::rows(spill)
+        });
         let ran = self.run(plan, catalog, params);
-        let packed = self.packed.borrow_mut().take().unwrap_or_default();
-        match ran {
-            Ok(()) => Ok(packed),
-            Err(error) => {
-                crate::physical::keep_partial_rows(packed.into_rows());
+        let gathering = self.gathered.borrow_mut().take();
+        let gathered = match gathering {
+            Some(gathering) => gathering.finish(),
+            None => Ok(crate::gather::Gathered::Rows(Vec::new())),
+        };
+        match (ran, gathered) {
+            (Ok(()), gathered) => gathered,
+            (Err(error), kept) => {
+                match kept {
+                    Ok(crate::gather::Gathered::Rows(rows)) => {
+                        crate::physical::keep_partial_rows(rows)
+                    }
+                    Ok(crate::gather::Gathered::Packed(packed)) => {
+                        crate::physical::keep_partial_rows(packed.into_rows())
+                    }
+                    _ => {}
+                }
                 Err(error)
             }
         }
@@ -760,14 +780,14 @@ pub fn try_compile_limited(
     // exactly once no matter what the rest of this function decides.
     let before = params.reads();
     let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let packed: crate::ops::Packing = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let gathered: crate::ops::Gather = std::rc::Rc::new(std::cell::RefCell::new(None));
     let streaming: crate::ops::Streaming = std::rc::Rc::new(std::cell::RefCell::new(None));
     let sink = Box::new(
         match limit {
             Some(limit) => CollectInto::with_limit(std::rc::Rc::clone(&collected), limit),
             None => CollectInto::new(std::rc::Rc::clone(&collected)),
         }
-        .with_packed(std::rc::Rc::clone(&packed))
+        .with_gathering(std::rc::Rc::clone(&gathered))
         .with_streaming(std::rc::Rc::clone(&streaming)),
     );
     // The listing is kept here: a `Compiled` builds its chain once and every
@@ -816,7 +836,7 @@ pub fn try_compile_limited(
         settings: params.settings(),
         bindings,
         collected,
-        packed,
+        gathered,
         streaming,
         correlated,
     }))

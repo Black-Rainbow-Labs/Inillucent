@@ -587,32 +587,6 @@ impl ImportedDatabase {
         }
     }
 
-    /// Runs a statement for its rows, with the caller's streaming consumer set aside.
-    ///
-    /// **For a statement the engine runs on a statement's behalf.** A streamed statement
-    /// carries its consumer in `params`, and the first statement run against those
-    /// parameters that can stream takes it. `ATTACH` and `VACUUM` are not queries, so the
-    /// consumer was still waiting when the `SELECT` that evaluates their file name ran, and
-    /// that `SELECT` streamed its one row to the shell. The shell printed the file name and
-    /// `.rows` came back empty, so `VACUUM INTO (SELECT n FROM p)` refused a text name as
-    /// "non-text filename" and `ATTACH ?1` attached the empty name, outside a confined root,
-    /// without a refusal.
-    ///
-    /// @param sql - the statement text
-    /// @param params - the values bound to `?1`, `?2`, ...
-    pub(crate) fn execute_any_unstreamed(
-        &mut self,
-        sql: &str,
-        params: &Params,
-    ) -> DbResult<Outcome> {
-        let aside = params.take_stream();
-        let ran = self.execute_any(sql, params);
-        if let Some(consumer) = aside {
-            params.supply_stream(consumer);
-        }
-        ran
-    }
-
     /// Compiles one statement, or finds it compiled, and runs it once.
     ///
     /// Fails with `PrimaryCode::Schema` when another process changed the schema

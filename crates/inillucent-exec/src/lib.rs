@@ -50,6 +50,7 @@ pub mod correlate;
 pub mod declared;
 pub mod dml;
 pub mod expr;
+pub mod gather;
 pub mod insert_plan;
 pub mod inset;
 pub mod join;

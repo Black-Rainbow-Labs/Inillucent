@@ -183,6 +183,34 @@ pub(super) fn insert_rows(
     depth: Depth,
     compiled: &CompiledInsert,
 ) -> DbResult<Changes> {
+    let mut feed = rows.iter().map(|row| Ok(std::borrow::Cow::Borrowed(row)));
+    insert_row_feed(statement, target, params, &mut feed, depth, compiled)
+}
+
+/// Writes the rows an insert's source produces, as they are handed over one at a time.
+///
+/// **The body of [`insert_rows`], over an iterator instead of a slice.** A statement whose source
+/// rows are too many to hold (an `INSERT ... SELECT` of millions of rows, read back from a
+/// transient file) takes them a row at a time. Everything the statement keeps between rows is
+/// kept here, for the whole feed: the sequence mark of an `AUTOINCREMENT` table is opened once and
+/// written once, the next rowid carries from row to row, and the changes are one tally. So a feed is
+/// the same statement as a slice of the same rows, and a failure on any row ends it exactly where
+/// the slice would have ended it.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param params - the bound parameters
+/// @param rows - one row of supplied values per row to write, lent or handed over
+/// @param depth - how many triggers deep this write already is
+/// @param compiled - the plan, the row space, the layout and the declarations
+pub(super) fn insert_row_feed(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    params: &Params,
+    rows: &mut dyn Iterator<Item = DbResult<std::borrow::Cow<'_, Row>>>,
+    depth: Depth,
+    compiled: &CompiledInsert,
+) -> DbResult<Changes> {
     let table = &statement.table;
     let CompiledInsert {
         layout,
@@ -202,7 +230,9 @@ pub(super) fn insert_rows(
     let mut changes = Changes::default();
     let captured = target.captures(table.root);
     let request = request_for(compiled, params, depth);
-    for supplied_row in rows.iter() {
+    for supplied in rows {
+        let supplied = supplied?;
+        let supplied_row: &Row = &supplied;
         // See `give_back`: a skipped row hands its rowid back.
         let rowid_before = next_rowid;
         let mut image = plan.build_row(
@@ -229,19 +259,12 @@ pub(super) fn insert_rows(
         // A key the statement left out is -1 in a `BEFORE INSERT` body, as in
         // SQLite, which fires it before the key is allocated.
         let unassigned = key_is_unassigned(statement, layout, (plan, space), supplied_row)?;
-        let firing = trigger::TriggerFiring {
-            rows: trigger::TriggerRows {
-                old: None,
-                new: Some(image.as_slice()),
-            },
-            slots: &layout.slots,
-            rowid: layout.rowid,
-            params,
-            depth,
-        };
-        if trigger::fire_before_insert(&statement.triggers, target, &firing, unassigned)?
-            == trigger::Fired::SkipRow
-        {
+        if before_triggers_skip_the_row(
+            (statement, compiled, params, depth),
+            target,
+            &image,
+            unassigned,
+        )? {
             give_back(table, &mut next_rowid, rowid_before);
             continue;
         }
@@ -315,26 +338,88 @@ pub(super) fn insert_rows(
             // VALUES (50, ...)` makes the next allocated key 51.
             high_water = high_water.max(assigned);
         }
-        // **`AFTER INSERT` does not fire for a row the upsert updated.** The
-        // arm fired the `UPDATE` triggers itself, in `upsert_row`.
-        let after_insert: &[inillucent_sql::dml::BoundTrigger] = match stored {
-            Stored::Updated(_) => &[],
-            Stored::Inserted(_) => &statement.triggers,
-        };
-        let returned = returned_for_row(statement, plan, space, params, target, &stored, layout)?;
-        let fired = (after_insert, stored.row(), &**layout, params, depth);
-        if fire_and_count(fired, target, &mut changes)? {
-            continue;
-        }
-        if captured {
-            changes.written.push(stored.row().to_vec());
-        }
-        if let Some(out) = returned {
-            changes.returned.push(out);
-        }
+        finish_stored_row(
+            (statement, compiled, params, depth),
+            target,
+            &stored,
+            captured,
+            &mut changes,
+        )?;
     }
     close_sequence(statement, target, sequence_mark.as_ref(), high_water)?;
     Ok(changes)
+}
+
+/// Fires the `BEFORE INSERT` triggers on the row about to be written, and reports whether one skipped it.
+///
+/// @param write - the bound insert, the plan, the row space, the layout and the declarations, the
+///   bound parameters, and how many triggers deep this write already is
+/// @param target - the file and its trees
+/// @param image - the row as it will be written
+/// @param unassigned - whether the statement left the row's key out
+fn before_triggers_skip_the_row(
+    write: (&BoundInsert, &CompiledInsert, &Params, Depth),
+    target: &mut dyn WriteTarget,
+    image: &[OwnedDatum],
+    unassigned: bool,
+) -> DbResult<bool> {
+    let (statement, compiled, params, depth) = write;
+    let firing = trigger::TriggerFiring {
+        rows: trigger::TriggerRows {
+            old: None,
+            new: Some(image),
+        },
+        slots: &compiled.layout.slots,
+        rowid: compiled.layout.rowid,
+        params,
+        depth,
+    };
+    Ok(
+        trigger::fire_before_insert(&statement.triggers, target, &firing, unassigned)?
+            == trigger::Fired::SkipRow,
+    )
+}
+
+/// Fires the `AFTER` triggers for a row that was written, and records it in the tally.
+///
+/// @param write - the bound insert, the plan, the row space, the layout and the declarations, the
+///   bound parameters, and how many triggers deep this write already is
+/// @param target - the file and its trees
+/// @param stored - what the write did
+/// @param captured - whether the target keeps the rows written
+/// @param changes - the statement's tally
+fn finish_stored_row(
+    write: (&BoundInsert, &CompiledInsert, &Params, Depth),
+    target: &mut dyn WriteTarget,
+    stored: &Stored,
+    captured: bool,
+    changes: &mut Changes,
+) -> DbResult<()> {
+    let (statement, compiled, params, depth) = write;
+    let CompiledInsert {
+        layout,
+        space,
+        plan,
+        ..
+    } = compiled;
+    // **`AFTER INSERT` does not fire for a row the upsert updated.** The
+    // arm fired the `UPDATE` triggers itself, in `upsert_row`.
+    let after_insert: &[inillucent_sql::dml::BoundTrigger] = match stored {
+        Stored::Updated(_) => &[],
+        Stored::Inserted(_) => &statement.triggers,
+    };
+    let returned = returned_for_row(statement, plan, space, params, target, stored, layout)?;
+    let fired = (after_insert, stored.row(), &**layout, params, depth);
+    if fire_and_count(fired, target, changes)? {
+        return Ok(());
+    }
+    if captured {
+        changes.written.push(stored.row().to_vec());
+    }
+    if let Some(out) = returned {
+        changes.returned.push(out);
+    }
+    Ok(())
 }
 /// Fires the foreign key triggers again for a row whose `NULL` a default replaced.
 ///

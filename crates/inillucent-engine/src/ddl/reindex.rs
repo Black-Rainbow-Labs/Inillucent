@@ -178,7 +178,7 @@ impl ImportedDatabase {
             .collect();
         let computed =
             index.partial_sql.is_some() || index.columns.iter().any(|key| key.expr_sql.is_some());
-        let entries = if computed {
+        let collected = if computed {
             self.index_entries_by_query(
                 &owner,
                 &index,
@@ -197,16 +197,10 @@ impl ImportedDatabase {
                 &directions,
             )?
         };
-        let order = entries.order();
-        if index.unique {
-            refuse_duplicates(&entries, &order, &owner, &index, key_columns)?;
+        let entries = collected.finish()?;
+        if entries.has_duplicate_or_long_key(index.unique, &columns, key_columns)? {
+            return Err(unique_violation(&owner, &index));
         }
-        let flat = entries.to_datums(&order);
-        let rows: Vec<&[Datum<'_>]> = if key_columns == 0 {
-            Vec::new()
-        } else {
-            flat.chunks_exact(key_columns).collect()
-        };
         // **The catalog row names the new tree before the tree is filled
         // (task-1932, found by `reindex_crash.rs`).** A recovery derives every
         // tree's shape from the catalog rows it has replayed so far, and
@@ -245,7 +239,7 @@ impl ImportedDatabase {
         // The tree being replaced goes on the list the commit drains, before
         // the replacement is built - see `retire_the_index_this_replaces`.
         self.retire_the_index_this_replaces(declared.root)?;
-        let page = self.build_tree_from(root, columns, key_columns, layout, &rows)?;
+        let page = self.build_tree_from_entries(root, columns, key_columns, layout, &entries)?;
         self.carry_the_index_onto_its_new_handle(&owner, &index, root);
         // The statistics and the identifier come off the tree that was just
         // built, exactly as `record` takes them, so the row cannot describe a

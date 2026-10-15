@@ -433,6 +433,43 @@ fn a_write_that_fails_after_returning_rows_hands_them_over_before_the_failure() 
     );
 }
 
+/// A connection that is not the first streams from its own engine: it sees the row its open
+/// transaction wrote, and the first connection, which reads what is committed, does not.
+///
+/// Each connection of a `Database` runs on an engine of its own. The streamed path once took the
+/// first connection's engine for every connection, so a second connection's `query_each` read
+/// another connection's state: its own uncommitted rows were missing, and a pragma it had set,
+/// such as `foreign_keys`, was not in force.
+#[test]
+fn a_second_connection_streams_from_its_own_engine() {
+    let database = open("own-engine");
+    let first = database.session();
+    let second = database.session();
+    second
+        .execute_batch("BEGIN; INSERT INTO u VALUES (900001, 'uncommitted');")
+        .expect("the second connection writes in its transaction");
+    let mine = Rc::new(RefCell::new(Keep::default()));
+    second
+        .query_each("SELECT label FROM u WHERE a = 900001", &[], &mine)
+        .expect("the second connection streams");
+    assert_eq!(
+        mine.borrow().rows,
+        vec![vec![Value::Text("uncommitted".into())]],
+        "the second connection sees its own uncommitted row"
+    );
+    let theirs = Rc::new(RefCell::new(Keep::default()));
+    first
+        .query_each("SELECT label FROM u WHERE a = 900001", &[], &theirs)
+        .expect("the first connection streams");
+    assert!(
+        theirs.borrow().rows.is_empty(),
+        "the first connection does not see a row that is not committed"
+    );
+    second
+        .execute_batch("ROLLBACK;")
+        .expect("the transaction ends");
+}
+
 /// A window query that fails after producing rows hands them over before the failure, as the
 /// reference shell prints them. A window query is not one pipeline, so its rows are collected and
 /// the rows kept by the failure are what the sink is given.
