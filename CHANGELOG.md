@@ -8,7 +8,7 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## 2.8.0, 15 October 2026
+## 2.8.0, 14 October 2026
 
 **A query that fails partway returns the rows before the failure through the C library and the
 Python, Node, PHP and Go packages.** SQLite hands out every row ahead of the one that raised the

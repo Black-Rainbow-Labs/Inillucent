@@ -172,6 +172,23 @@ fn known_gap(
         .find(|(release, name, _)| *release == version && *name == question)
 }
 
+/// Reports whether a release refused a full text search because the index is in a layout it does
+/// not read, and named the layout.
+///
+/// **An FTS5 commit from 2.8.0 on appends a segment, and the first one marks the index layout 3.**
+/// A release that reads layouts up to 2 would find no segment list and answer `MATCH` from the
+/// postings it already knew, which leaves out every row added since. So it refuses the search by
+/// name, as it refuses a file format it does not read, and the rest of the file still reads.
+/// 0.1.1 has no layout record at all and answers no rows instead; `KNOWN_GAPS` holds that row.
+///
+/// @param question - the label in `verify.sql`
+/// @param complaint - what the release printed
+fn refused_by_fts_layout(question: &str, complaint: &str) -> bool {
+    question.starts_with("fts.")
+        && complaint.contains("is in layout 3")
+        && complaint.contains("reads layouts up to")
+}
+
 /// Returns an empty scratch directory.
 ///
 /// @param name - what to call it
@@ -411,6 +428,10 @@ fn every_released_binary_reads_what_this_build_writes() {
             }
             let got = match ask_release(exe, &database, &question.sql) {
                 Ok(got) => got,
+                Err(complaint) if refused_by_fts_layout(name, &complaint) => {
+                    checked = checked.saturating_add(1);
+                    continue;
+                }
                 Err(complaint) => panic!(
                     "{version} could not answer `{name}` against a database this build wrote:\n  \
                      {complaint}"
