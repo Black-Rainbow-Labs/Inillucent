@@ -78,16 +78,16 @@ under full page heap. 600 runs each: `cuda:99` exits 1 every time, the processor
 2.4.2 at 0.30x. On 2.8.0, both engines on the performance cores, 10 rounds, two runs after a quiet
 window: 1.03x and 1.00x. It is closed with those numbers.
 
-**Single row inserts into an indexed table are about 2% faster, and into a table with a `UNIQUE`
-index about 4%.** Three costs added since 2.4.2 are gone. An append to a full leaf of wide rows
+**Three costs that single row inserts gained after 2.4.2 are gone.** An append to a full leaf of wide rows
 tried a splice and a sizing pass before the split it was always going to take; after one failed
-pack the tree now splits its next appends at once. The leaf sizing pass and the encoder read every
+pack of a leaf of unpacked rows the tree now splits its next appends at once. The leaf sizing pass and the encoder read every
 value of a row twice to work out the wide row threshold, which only matters for a value longer than
 64 bytes. A `UNIQUE` probe that missed searched the leaf again to see whether the key could
-continue in the next leaf, where one comparison answers it. Six alternating runs after a quiet
-window, 40 rounds each: `write.insert.batch` 2.33x to 2.36x on 2.8.0 and 2.36x to 2.39x now, against
-2.56x to 2.59x on 2.4.2. The rest of that difference is the per row cost of the format 4 leaf
-encoder (narrow integer slots and per value classes), which is part of the file format.
+continue in the next leaf, where one comparison answers it. Five alternating runs of 40 rounds,
+2.8.0 with only these changes against 2.8.0: `write.insert.batch` 2.34x to 2.37x against 2.31x to 2.35x,
+about 1%, where 2.4.2 reads 2.56x to 2.59x. The rest of that difference, about 8%, is the per row cost
+of the format 4 leaf encoder (narrow integer slots and a class for each value), which is part of the
+file format and stays.
 
 **Bug 23 did not reproduce under heavier load.** One run of `durability::process_readers` on
 29 September 2026 lost an acknowledged row under 24 way parallel load. A stress harness,

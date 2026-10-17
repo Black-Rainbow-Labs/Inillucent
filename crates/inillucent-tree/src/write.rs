@@ -2212,9 +2212,13 @@ impl PagedTree {
                 ));
             }
         }
+        // A leaf of delta rows alone that does not pack small enough has rows that do not shrink
+        // when packed. A leaf that already holds packed rows and does not is merely full, which is
+        // what a narrow row's leaf is after its packs, and its next leaves still pack.
+        let unpacked = leaf.row_count() <= 1;
         let fit = self.pack_or_split(&leaf, order, needed, splice_allowed, appending)?;
         if appending {
-            let split = matches!(fit, Fit::Split(..));
+            let split = matches!(fit, Fit::Split(..)) && unpacked;
             self.append_splits.set(if split {
                 APPEND_SPLITS_AFTER_A_FAILED_PACK
             } else {

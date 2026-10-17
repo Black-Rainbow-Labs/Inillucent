@@ -714,7 +714,7 @@ impl PagedTree {
     /// search that had just missed; on the uniqueness probe of every insert into a table with a
     /// `UNIQUE` index that was a second search of the leaf. Profiled on `inillucent-hcprobe`'s
     /// `fresh.plain`, 2,000 inserts a transaction into a table with a `UNIQUE` index, the second
-    /// search was 3.4% of the samples, and the case is about 4% faster without it.
+    /// search was 3.4% of the samples.
     ///
     /// @param leaf - the leaf a probe missed in
     /// @param probe - the prefix
