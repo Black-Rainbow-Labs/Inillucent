@@ -288,6 +288,10 @@ const APPEND_FILL: f64 = 0.95;
 /// is only taken when the write that asked for it will actually land.
 const TIGHT_FILL: f64 = 0.95;
 
+/// How many full leaves an append splits at once after a pack that left no room, before it tries
+/// a pack again; see `PagedTree::append_splits_at_once`.
+const APPEND_SPLITS_AFTER_A_FAILED_PACK: u8 = 16;
+
 /// Packs every live row of a leaf into one page, at the loosest fill that holds
 /// them all.
 ///
@@ -2189,11 +2193,17 @@ impl PagedTree {
         // encode. Whether it is allowed is a question about the page alone -
         // see `leaf/splice.rs` - which is what lets recovery make the same
         // choice from the same page.
+        if appending && self.append_splits_at_once() {
+            return Ok(Fit::Split(leaf.bytes().to_vec(), true));
+        }
         let gap = self.room_gap(appending);
         let spliced = self.timed_splice(&leaf, &order)?;
         let splice_allowed = spliced.is_some();
         if let Some(mut image) = spliced {
             if LeafMut::new(&mut image)?.room_for(needed.saturating_add(gap))? {
+                if appending {
+                    self.append_splits.set(0);
+                }
                 return Ok(Fit::Compact(
                     image,
                     leaf.right_sibling(),
@@ -2202,7 +2212,38 @@ impl PagedTree {
                 ));
             }
         }
-        self.pack_or_split(&leaf, order, needed, splice_allowed, appending)
+        let fit = self.pack_or_split(&leaf, order, needed, splice_allowed, appending)?;
+        if appending {
+            let split = matches!(fit, Fit::Split(..));
+            self.append_splits.set(if split {
+                APPEND_SPLITS_AFTER_A_FAILED_PACK
+            } else {
+                0
+            });
+        }
+        Ok(fit)
+    }
+
+    /// Reports whether an append splits a full leaf without trying to pack it first, and counts it.
+    ///
+    /// **A table whose rows do not pack smaller than they sit in the delta area finds that out on
+    /// every full leaf.** An append packs a full leaf when the pack leaves a third of the page free
+    /// and splits it otherwise (see [`Tree::choose_fit`]), and a wide row never leaves the third,
+    /// so each of its leaves paid a splice attempt and a sizing pass before the split it was always
+    /// going to take. Profiled on the gate's `write.insert.batch`, 2,000 single row inserts of a
+    /// 64 byte blob row, that was part of what the workload lost against SQLite between 2.4.2,
+    /// which split every append at once, and 2.8.0. So after a pack that failed,
+    /// the tree's next appends split at once, and the pack is tried again after
+    /// [`APPEND_SPLITS_AFTER_A_FAILED_PACK`] of them, in case the rows have changed. A table of
+    /// narrow rows never fails a pack and keeps packing as before. Recovery does not depend on
+    /// which was chosen: a split and a compaction are each logged as what they did.
+    fn append_splits_at_once(&self) -> bool {
+        let left = self.append_splits.get();
+        if left == 0 {
+            return false;
+        }
+        self.append_splits.set(left - 1);
+        true
     }
 
     /// Reports whether the row a full leaf is making room for arrives in key

@@ -344,6 +344,7 @@ impl PagedTree {
             merge_backoff: RefCell::new(std::collections::HashMap::new()),
             pending_unlinks: RefCell::new(Vec::new()),
             last_leaf: std::cell::Cell::new(None),
+            append_splits: std::cell::Cell::new(0),
         })
     }
 

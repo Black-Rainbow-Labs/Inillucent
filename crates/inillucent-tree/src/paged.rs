@@ -341,6 +341,11 @@ pub struct PagedTree {
     /// wants is the one the read just found. See `update_in_place` for why a
     /// key found in it proves it is the key's leaf.
     pub(crate) last_leaf: std::cell::Cell<Option<PageId>>,
+    /// How many more full leaves an append splits without first trying to pack them.
+    ///
+    /// Set when an append found that packing a full leaf would not leave room, which is what a
+    /// table of wide rows finds every time; see `PagedTree::append_splits_at_once`.
+    pub(crate) append_splits: std::cell::Cell<u8>,
     /// The page this tree's rightmost leaf was on, the last time a write looked.
     ///
     /// **The leaf hint** (task-2000, designs 6 and 7). A write descends from the
@@ -576,6 +581,7 @@ impl PagedTree {
             merge_backoff: RefCell::new(std::collections::HashMap::new()),
             pending_unlinks: RefCell::new(Vec::new()),
             last_leaf: std::cell::Cell::new(None),
+            append_splits: std::cell::Cell::new(0),
         })
     }
 
