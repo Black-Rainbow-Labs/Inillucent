@@ -464,8 +464,15 @@ impl Correlation {
         if self.built.borrow().is_none() && !self.build_table(key, catalog, bound)? {
             return Ok(None);
         }
-        for (column, number) in &self.feeds {
-            bound.set(*number, feed(*column)?);
+        // **The outer values are bound only when something reads them**: an
+        // expression key computes from them, and the block's chain reads them.
+        // An `EXISTS` answered from the table alone reads neither.
+        let expression_key = key
+            .probes
+            .iter()
+            .any(|probe| matches!(probe, Probe::Expression(_)));
+        if expression_key {
+            self.bind_feeds(bound, feed)?;
         }
         // An outer expression that fails is answered by the scan, which raises
         // the error only if a row of the table makes it compute the expression.
@@ -475,6 +482,9 @@ impl Correlation {
         if key.existence_only {
             let found = !bucket.is_empty();
             return Ok(Some(OwnedDatum::Int(i64::from(found != self.negated))));
+        }
+        if !expression_key {
+            self.bind_feeds(bound, feed)?;
         }
         let mut pending = Some(bucket);
         let rows = self.with_chain(catalog, bound, &mut |compiled| {
@@ -489,6 +499,21 @@ impl Correlation {
                 Ok(None)
             }
         }
+    }
+
+    /// Writes the outer row's values into the parameters the block reads them through.
+    ///
+    /// @param bound - the statement's parameters
+    /// @param feed - returns the joined row's value in one column
+    fn bind_feeds(
+        &self,
+        bound: &mut Params,
+        feed: &dyn Fn(usize) -> DbResult<OwnedDatum>,
+    ) -> DbResult<()> {
+        for (column, number) in &self.feeds {
+            bound.set(*number, feed(*column)?);
+        }
+        Ok(())
     }
 
     /// Reads the block's table into the hash table, once for the execution.
