@@ -1001,3 +1001,32 @@ INSERT INTO f(rowid, a) VALUES (1, 'x y'), (2, 'x z'), (3, 'x w q r y'), (4, 'x 
 SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NOT y';
 SELECT group_concat(rowid) FROM f WHERE f MATCH 'x NEAR/3 y';
 SELECT group_concat(rowid) FROM f WHERE f MATCH 'x -y';
+
+-- case: fts3/query_syntax/minus_or_and_near
+-- SQLite reads an FTS3 or FTS4 query with OR binding tighter than two words side by side, takes
+-- a -word out of the query and applies it to the whole of it at the end, and treats parentheses
+-- as separators. x -y NEAR/3 w is (x NEAR/3 w) NOT y.
+CREATE VIRTUAL TABLE f USING fts4(b, c);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) INSERT INTO f(rowid, b, c) SELECT i, (SELECT group_concat(w, ' ') FROM (SELECT substr('xyzwq', 1 + ((i*7 + k*13 + k*k*i) % 5), 1) AS w FROM (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6) WHERE (i + k) % 3 <> 0)), (SELECT group_concat(w, ' ') FROM (SELECT substr('xyzwq', 1 + ((i*11 + k*3 + k*i) % 5), 1) AS w FROM (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) WHERE (i * k) % 4 <> 1)) FROM n;
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x -y NEAR/3 w';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x -y NEAR w';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x y OR z';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x OR y z';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x -y OR z';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x OR -y';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH '-x y';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x-y';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x -b:y';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x (y z OR w)';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x OR y -z';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x -y OR z w';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x y -z NEAR/2 w q';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH '-x -y';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x NEAR/2 y z OR w';
+
+-- case: fts3/query_syntax/minus_before_near_fts3
+CREATE VIRTUAL TABLE f USING fts3(b, c);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) INSERT INTO f(rowid, b, c) SELECT i, (SELECT group_concat(w, ' ') FROM (SELECT substr('xyzwq', 1 + ((i*7 + k*13 + k*k*i) % 5), 1) AS w FROM (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6) WHERE (i + k) % 3 <> 0)), (SELECT group_concat(w, ' ') FROM (SELECT substr('xyzwq', 1 + ((i*11 + k*3 + k*i) % 5), 1) AS w FROM (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) WHERE (i * k) % 4 <> 1)) FROM n;
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x -y NEAR/3 w';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH 'x y OR z';
+SELECT count(*), sum(rowid * rowid % 1000003) FROM f WHERE f MATCH '-x y';

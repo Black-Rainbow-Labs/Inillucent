@@ -160,6 +160,11 @@ pub struct Prepared {
     pub forced: ForcePlan,
     /// The statement's correlated blocks, prepared at its first execution.
     pub blocks: crate::correlate::KeptBlocks,
+    /// The `OFFSET` this pipeline draws on when it is one arm of a `UNION ALL`, or `None`.
+    ///
+    /// Set only by the compound runner, on an arm it prepared for one execution, so that the
+    /// arm skips the compound's offset rows before its projection evaluates them.
+    pub skip: Option<crate::ops::SkipBudget>,
 }
 impl Prepared {
     /// Returns the tree the outermost stage reads.
@@ -606,6 +611,7 @@ pub fn prepare(
                 stages: trial,
                 forced,
                 blocks: Default::default(),
+                skip: None,
             };
             if build_prepared(plan, catalog, &attempt, &Params::new(), dummy_sink()).is_ok() {
                 mark_needed(plan, catalog, &mut attempt.stages);
@@ -628,6 +634,7 @@ pub fn prepare(
         stages,
         forced,
         blocks: Default::default(),
+        skip: None,
     })
 }
 

@@ -28,7 +28,7 @@ use inillucent_value::collation::Collation;
 use crate::expr::Expr;
 use crate::gather::{Gathered, Gathering};
 
-use crate::ops::{CollectInto, Limit, Sink, Sort, SortKey};
+use crate::ops::{CollectInto, Limit, Sink, Skip, Sort, SortKey};
 use crate::setop::{SetKind, SetOp};
 
 /// A catalog that also answers one recursive CTE's queue.
@@ -244,12 +244,20 @@ pub fn run_compound_into(
     let collations = compound_collations(plan);
     let spill = catalog.spill();
     let streams = compound_streams(plan);
+    let budget = compound_skip(plan, params, streams)?;
+    let skipped = budget.is_some();
     let gathering = new_gathering(&spill);
-    let shape = match run_arm_into(plan, catalog, params, collecting(&gathering)) {
+    let shape = match run_arm_into(
+        plan,
+        catalog,
+        params,
+        collecting(&gathering),
+        budget.as_ref(),
+    ) {
         Ok(shape) => shape,
         Err(error) => {
             stash_partial(&gathering);
-            return compound_failure_into(plan, params, streams, error, sink);
+            return compound_failure_into(plan, params, (streams, skipped), error, sink);
         }
     };
     let mut rows = take_gathered(&gathering)?;
@@ -260,12 +268,19 @@ pub fn run_compound_into(
             // is what the physical pass does with a shape it has not seen.
             return unsupported("a compound query nested inside a compound arm");
         }
-        rows = match combine(kind_of(*op), &collations, rows, arm, catalog, params) {
+        let fold = Folding {
+            kind: kind_of(*op),
+            collations: &collations,
+            budget: budget.as_ref(),
+        };
+        rows = match combine(&fold, rows, arm, catalog, params) {
             Ok(combined) => combined,
-            Err(error) => return compound_failure_into(plan, params, streams, error, sink),
+            Err(error) => {
+                return compound_failure_into(plan, params, (streams, skipped), error, sink)
+            }
         };
     }
-    let mut tail = compound_tail(&plan.select, params, catalog.spill(), sink)?;
+    let mut tail = compound_tail(&plan.select, params, catalog.spill(), sink, skipped)?;
     feed_rows(rows, tail.as_mut())?;
     tail.finish()?;
     Ok(shape)
@@ -286,6 +301,32 @@ fn compound_streams(plan: &PhysicalPlan) -> bool {
             .iter()
             .all(|(op, _)| *op == inillucent_sql::ast::CompoundOp::UnionAll)
 }
+/// Returns the count of rows a compound's arms skip before their projections, when they do.
+///
+/// **SQLite does not evaluate the select list of a row a `UNION ALL` skips.** It hands the
+/// compound's `OFFSET` to each arm, and an arm counts a row off before it computes the result
+/// columns, so in `SELECT a FROM t UNION ALL SELECT 1 / 0 FROM u LIMIT 1 OFFSET 5` a skipped row
+/// of the second arm never divides. The compound used to apply its `OFFSET` to the rows the arms
+/// had already projected, so a skipped row's expression ran and could fail the query. Only a
+/// compound that streams has this order; `UNION`, `INTERSECT`, `EXCEPT` and a sorted compound
+/// count the offset over the finished answer and keep applying it there.
+///
+/// @param plan - the head arm, carrying the rest in `compounds`
+/// @param params - the bound parameters
+/// @param streams - whether the compound hands out rows as each arm produces them
+fn compound_skip(
+    plan: &PhysicalPlan,
+    params: &Params,
+    streams: bool,
+) -> DbResult<Option<crate::ops::SkipBudget>> {
+    if !streams {
+        return Ok(None);
+    }
+    let offset = constant_count(plan.select.offset.as_ref(), params, Negative::Zero)?;
+    Ok(offset
+        .filter(|offset| *offset > 0)
+        .map(|offset| std::rc::Rc::new(std::cell::Cell::new(offset))))
+}
 /// Reports an arm of a compound that failed, with the rows SQLite would have returned first.
 ///
 /// For a compound that streams, those are the rows of the arms before the one
@@ -296,13 +337,14 @@ fn compound_streams(plan: &PhysicalPlan) -> bool {
 ///
 /// @param plan - the head arm, carrying the rest in `compounds`
 /// @param params - the bound parameters
-/// @param streams - whether the compound hands out rows as each arm produces them
+/// @param streaming - whether the compound hands out rows as each arm produces them, and whether
+///   the arms already threw the `OFFSET` rows away
 /// @param earlier - the rows of the arms that finished
 /// @param error - what the failing arm said
 fn compound_failure(
     plan: &PhysicalPlan,
     params: &Params,
-    streams: bool,
+    (streams, skipped): (bool, bool),
     mut earlier: Vec<Vec<OwnedDatum>>,
     error: inillucent_base::DbError,
 ) -> DbResult<(Vec<Vec<OwnedDatum>>, Shape)> {
@@ -313,10 +355,13 @@ fn compound_failure(
     }
     earlier.extend(tail);
     let wanted = constant_count(plan.select.limit.as_ref(), params, Negative::NoLimit)?;
-    let skipped = constant_count(plan.select.offset.as_ref(), params, Negative::Zero)?;
+    let offset = match skipped {
+        true => None,
+        false => constant_count(plan.select.offset.as_ref(), params, Negative::Zero)?,
+    };
     let enough =
-        wanted.is_some_and(|wanted| earlier.len() >= skipped.unwrap_or(0).saturating_add(wanted));
-    let kept = order_compound(&plan.select, earlier, params)?;
+        wanted.is_some_and(|wanted| earlier.len() >= offset.unwrap_or(0).saturating_add(wanted));
+    let kept = order_compound(&plan.select, earlier, params, skipped)?;
     if enough {
         let names = plan.select.columns.iter().map(|column| column.name.clone());
         return Ok((
@@ -354,11 +399,13 @@ fn compound_collations(plan: &PhysicalPlan) -> Vec<Collation> {
 /// @param catalog - where the trees and layouts come from
 /// @param params - the bound parameters
 /// @param sink - where the arm's rows go; it is finished when the arm ends
+/// @param budget - the compound's `OFFSET` still to skip, when the arms skip it themselves
 fn run_arm_into(
     plan: &PhysicalPlan,
     catalog: &dyn TreeCatalog,
     params: &Params,
     sink: Box<dyn Sink>,
+    budget: Option<&crate::ops::SkipBudget>,
 ) -> DbResult<Shape> {
     let mut arm = plan.clone();
     arm.compounds.clear();
@@ -368,9 +415,15 @@ fn run_arm_into(
     arm.needs_sort = false;
     arm.reverse = false;
     if !arm.select.windows.is_empty() {
+        // A window sees every row of its partition, so the rows skipped are the ones it answers.
+        let sink: Box<dyn Sink> = match budget {
+            Some(budget) => Box::new(Skip::shared(std::rc::Rc::clone(budget), sink)),
+            None => sink,
+        };
         return crate::windowpass::run_windowed_into(&arm, catalog, params, sink);
     }
-    let prepared = prepare(&arm, catalog, ForcePlan::default())?;
+    let mut prepared = prepare(&arm, catalog, ForcePlan::default())?;
+    prepared.skip = budget.cloned();
     let (mut pipeline, shape) = build_prepared(&arm, catalog, &prepared, params, sink)?;
     pipeline.run()?;
     Ok(shape)
@@ -511,6 +564,7 @@ pub fn prepare_any(plan: &PhysicalPlan, catalog: &dyn TreeCatalog) -> DbResult<P
             stages: Vec::new(),
             forced: ForcePlan::default(),
             blocks: Default::default(),
+            skip: None,
         });
     }
     prepare(plan, catalog, ForcePlan::default())
@@ -622,6 +676,15 @@ fn kind_of(op: inillucent_sql::ast::CompoundOp) -> SetKind {
         inillucent_sql::ast::CompoundOp::Intersect => SetKind::Intersect,
     }
 }
+/// What one fold of a compound needs besides its rows: the operator, its collations and its skip.
+struct Folding<'a> {
+    /// Which of the four set operations.
+    kind: SetKind,
+    /// The collation of each result column.
+    collations: &'a [Collation],
+    /// The compound's `OFFSET` still to skip, when the arms skip it themselves.
+    budget: Option<&'a crate::ops::SkipBudget>,
+}
 /// Applies one set operation to the rows so far and the next arm.
 ///
 /// **The next arm is run into the set operation, not collected first.** The rows so far are read
@@ -629,20 +692,19 @@ fn kind_of(op: inillucent_sql::ast::CompoundOp) -> SetKind {
 /// collected, in memory or in a file when it is large. For `EXCEPT` and `INTERSECT` the right arm
 /// goes first, because a left row cannot be judged until the whole right arm is known.
 ///
-/// @param kind - which of the four
-/// @param collations - the collation of each result column
+/// @param fold - the operator, the collations and the skip
 /// @param left - the rows so far
 /// @param arm - the arm being folded in
 /// @param catalog - where the trees and layouts come from
 /// @param params - the bound parameters
 fn combine(
-    kind: SetKind,
-    collations: &[Collation],
+    fold: &Folding<'_>,
     left: Gathered,
     arm: &PhysicalPlan,
     catalog: &dyn TreeCatalog,
     params: &Params,
 ) -> DbResult<Gathered> {
+    let (kind, collations) = (fold.kind, fold.collations);
     let spill = catalog.spill();
     let gathering = new_gathering(&spill);
     let operation = std::rc::Rc::new(std::cell::RefCell::new(
@@ -654,14 +716,14 @@ fn combine(
         })
     };
     if kind.needs_right_first() {
-        run_arm_into(arm, catalog, params, arm_sink())
+        run_arm_into(arm, catalog, params, arm_sink(), fold.budget)
             .inspect_err(|_| stash_partial(&gathering))?;
         operation.borrow_mut().next_arm();
         feed_rows(left, &mut *operation.borrow_mut())?;
     } else {
         feed_rows(left, &mut *operation.borrow_mut())?;
         operation.borrow_mut().next_arm();
-        run_arm_into(arm, catalog, params, arm_sink())
+        run_arm_into(arm, catalog, params, arm_sink(), fold.budget)
             .inspect_err(|_| stash_partial(&gathering))?;
     }
     operation.borrow_mut().finish()?;
@@ -685,17 +747,18 @@ fn stash_partial(gathering: &std::rc::Rc<std::cell::RefCell<Option<Gathering>>>)
 ///
 /// @param plan - the head arm, carrying the rest in `compounds`
 /// @param params - the bound parameters
-/// @param streams - whether the compound hands out rows as each arm produces them
+/// @param streaming - whether the compound hands out rows as each arm produces them, and whether
+///   the arms already threw the `OFFSET` rows away
 /// @param error - what the failing arm said
 /// @param sink - where the answer goes
 fn compound_failure_into(
     plan: &PhysicalPlan,
     params: &Params,
-    streams: bool,
+    streaming: (bool, bool),
     error: inillucent_base::DbError,
     mut sink: Box<dyn Sink>,
 ) -> DbResult<Shape> {
-    let (rows, shape) = compound_failure(plan, params, streams, Vec::new(), error)?;
+    let (rows, shape) = compound_failure(plan, params, streaming, Vec::new(), error)?;
     crate::ops::emit_rows(&rows, sink.as_mut())?;
     sink.finish()?;
     Ok(shape)
@@ -736,14 +799,16 @@ fn feed_rows(rows: Gathered, sink: &mut dyn Sink) -> DbResult<()> {
 /// @param select - the head arm's bound statement, which carries them
 /// @param rows - the rows
 /// @param params - the bound parameters
+/// @param skipped - whether the arms already threw the `OFFSET` rows away
 fn order_compound(
     select: &BoundSelect,
     rows: Vec<Vec<OwnedDatum>>,
     params: &Params,
+    skipped: bool,
 ) -> DbResult<Vec<Vec<OwnedDatum>>> {
     let collected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let sink = Box::new(CollectInto::new(std::rc::Rc::clone(&collected)));
-    let mut tail = compound_tail(select, params, None, sink)?;
+    let mut tail = compound_tail(select, params, None, sink, skipped)?;
     feed_rows(Gathered::Rows(rows), tail.as_mut())?;
     tail.finish()?;
     let answer = std::mem::take(&mut *collected.borrow_mut());
@@ -755,13 +820,16 @@ fn order_compound(
 /// @param params - the bound parameters
 /// @param catalog - where a sort that does not fit in memory writes its runs
 /// @param sink - where the ordered and limited rows go
+/// @param skipped - whether the arms already threw the `OFFSET` rows away
 fn compound_tail(
     select: &BoundSelect,
     params: &Params,
     spill: Option<std::rc::Rc<dyn crate::spill::Spill>>,
     collect: Box<dyn Sink>,
+    skipped: bool,
 ) -> DbResult<Box<dyn Sink>> {
-    if select.order_by.is_empty() && select.limit.is_none() && select.offset.is_none() {
+    let offset_left = select.offset.is_some() && !skipped;
+    if select.order_by.is_empty() && select.limit.is_none() && !offset_left {
         return Ok(collect);
     }
     let mut keys = Vec::with_capacity(select.order_by.len());
@@ -795,7 +863,10 @@ fn compound_tail(
         });
     }
     let limit = constant_count(select.limit.as_ref(), params, Negative::NoLimit)?;
-    let offset = constant_count(select.offset.as_ref(), params, Negative::Zero)?;
+    let offset = match offset_left {
+        true => constant_count(select.offset.as_ref(), params, Negative::Zero)?,
+        false => None,
+    };
     let sink: Box<dyn Sink> = match (limit, offset) {
         (None, None) => collect,
         (limit, offset) => Box::new(Limit::new(

@@ -967,8 +967,17 @@ fn push_limit(
 ///
 /// @param up - everything the operators are built from
 fn skips_before_projection(up: &Upward<'_>) -> bool {
-    up.offset > 0
-        && (up.outputs.sort_keys.is_empty() || up.sorted_already)
+    up.offset > 0 && projection_may_skip(up)
+}
+
+/// Whether nothing between the projection and the end of the chain decides which rows survive.
+///
+/// The conditions of [`skips_before_projection`] without the statement's own `OFFSET`, so that an
+/// arm of a `UNION ALL`, whose offset is the compound's, can ask the same question.
+///
+/// @param up - everything the operators are built from
+fn projection_may_skip(up: &Upward<'_>) -> bool {
+    (up.outputs.sort_keys.is_empty() || up.sorted_already)
         && !up.plan.select.distinct
         && !up.skipping
         && up.plan.aggregation == AggregationMode::None
@@ -982,12 +991,37 @@ fn skips_before_projection(up: &Upward<'_>) -> bool {
 /// stops the source. The description gets no line of its own: [`push_limit`]
 /// already prints `OFFSET`.
 ///
+/// An arm of a `UNION ALL` with an `OFFSET` carries the compound's count in
+/// `prepared.skip`, and skips from it here when it can.
+///
 /// @param chain - the projection, which it will push into
 /// @param up - everything the operators are built from
 fn push_early_skip(chain: Box<dyn Sink>, up: &Upward<'_>) -> Box<dyn Sink> {
+    if let Some(budget) = &up.prepared.skip {
+        return match projection_may_skip(up) {
+            true => Box::new(Skip::shared(std::rc::Rc::clone(budget), chain)),
+            false => chain,
+        };
+    }
     match skips_before_projection(up) {
         true => Box::new(Skip::new(up.offset, chain)),
         false => chain,
+    }
+}
+
+/// Puts the compound's skip at the end of an arm whose projection has to see every row.
+///
+/// An arm with `DISTINCT`, an aggregate or a window decides which rows it answers from the
+/// projected values, so the compound's `OFFSET` counts the rows it answers, as SQLite counts them.
+///
+/// @param sink - the end of the arm
+/// @param up - everything the operators are built from
+fn push_late_skip(sink: Box<dyn Sink>, up: &Upward<'_>) -> Box<dyn Sink> {
+    match &up.prepared.skip {
+        Some(budget) if !projection_may_skip(up) => {
+            Box::new(Skip::shared(std::rc::Rc::clone(budget), sink))
+        }
+        _ => sink,
     }
 }
 
@@ -1447,7 +1481,7 @@ pub(crate) fn build_upper(
     // description is collected in the same order and reversed at the end, so it
     // reads source-first the way a plan should.
     let mut operators = listing;
-    let mut chain: Box<dyn Sink> = sink;
+    let mut chain: Box<dyn Sink> = push_late_skip(sink, &up);
     chain = push_sort(chain, &mut operators, &up)?;
     chain = push_distinct(chain, &mut operators, &up);
     chain = push_projection(chain, &mut operators, &up)?;

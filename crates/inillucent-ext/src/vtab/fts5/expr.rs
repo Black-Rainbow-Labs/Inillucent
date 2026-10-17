@@ -131,6 +131,58 @@ impl Query {
     }
 }
 
+/// Refuses an FTS5 query that holds a character no FTS5 token starts with.
+///
+/// **SQLite's `fts5ExprGetToken` stops at the first byte that is not white space, an operator, a
+/// quote or part of a word.** A word is ASCII letters and digits, `_`, the byte `0x1A` and every byte
+/// at or above `0x80`. So `x NEAR/3 w`, which is FTS3's spelling of a `NEAR`, is
+/// `fts5: syntax error near "/"` there, where the lexer here dropped the `/` into a word, the
+/// tokenizer split the word, and the query matched nothing without an error. The FTS3 and FTS4
+/// front end does not come here: [`fts3_pattern`] rewrites their queries first.
+///
+/// @param text - the `MATCH` operand of an FTS5 table
+pub fn refuse_stray_characters(text: &[u8]) -> DbResult<()> {
+    let mut quoted = false;
+    for byte in text.iter().copied() {
+        if byte == b'"' {
+            // A doubled quote inside a string closes it and opens it again,
+            // which leaves the same state as reading it as one character.
+            quoted = !quoted;
+            continue;
+        }
+        let allowed = quoted
+            || byte.is_ascii_alphanumeric()
+            || byte >= 0x80
+            || matches!(
+                byte,
+                b'_' | 0x1A
+                    | b' '
+                    | b'\t'
+                    | b'\n'
+                    | b'\r'
+                    | 0x0B
+                    | 0x0C
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b':'
+                    | b','
+                    | b'+'
+                    | b'*'
+                    | b'-'
+                    | b'^'
+            );
+        if !allowed {
+            return Err(syntax(format!(
+                "fts5: syntax error near \"{}\"",
+                char::from(byte)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The byte that opens a `NEAR/n` marker in the text [`fts3_words`] produces.
 ///
 /// A control byte, because no query a person types contains one and the marker
@@ -158,16 +210,10 @@ const FTS3_DEFAULT_NEAR: u32 = 10;
 /// in lower case are ordinary words as well.
 ///
 /// A `-` that is not directly followed by a term is only a separator, so
-/// `MATCH '- a'` is the query `a`. A `-term` with nothing before it, a quote that
+/// `MATCH '- a'` is the query `a`. A query of nothing but `-term`s, a quote that
 /// is never closed, and a `NEAR` with no term on one side are SQLite's
 /// `malformed MATCH expression: [...]`. A query with no terms at all matches
-/// nothing, and `None` says so.
-///
-/// A chain such as `a NEAR/5 b NEAR/5 c` becomes one FTS5 group `NEAR(a b c, 5)`,
-/// which keeps every term within a window of that many tokens. FTS3 compares
-/// each pair that is next to each other in the chain. Both answer the same on
-/// the chains with one distance throughout. With several distances the group
-/// takes the largest.
+/// nothing, and `None` says so. [`fts3_group_near`] says how the operators bind.
 ///
 /// @param text - the query the `MATCH` operand was given
 pub fn fts3_pattern(text: &[u8]) -> DbResult<Option<Vec<u8>>> {
@@ -180,7 +226,7 @@ pub fn fts3_pattern(text: &[u8]) -> DbResult<Option<Vec<u8>>> {
     let Some(words) = fts3_words(text, &malformed)? else {
         return Ok(None);
     };
-    Ok(Some(fts3_group_near(&words, &malformed)?))
+    fts3_group_near(&words, &malformed)
 }
 
 /// Returns the length of the FTS3 keyword that starts at a position, and what it becomes.
@@ -250,13 +296,12 @@ fn fts3_words(
     malformed: &dyn Fn() -> inillucent_base::DbError,
 ) -> DbResult<Option<Vec<u8>>> {
     let mut out = Vec::with_capacity(text.len().saturating_add(8));
-    let (mut quoted, mut has_term) = (false, false);
+    let mut quoted = false;
     let mut at = 0usize;
     while let Some(byte) = text.get(at).copied() {
         let next_at = at.saturating_add(1);
         if byte == b'"' {
             quoted = !quoted;
-            has_term = true;
             out.push(byte);
             at = next_at;
             continue;
@@ -273,30 +318,22 @@ fn fts3_words(
             .is_none_or(|before| before.is_ascii_whitespace() || *before == b'(');
         if begins_word {
             if let Some((length, replacement)) = fts3_keyword(text, at) {
-                if replacement.first() != Some(&NEAR_OPEN) {
-                    has_term = true;
-                }
                 out.extend_from_slice(&replacement);
                 at = at.saturating_add(length);
                 continue;
             }
         }
-        if byte == b'-' && begins_word {
-            let starts_term = text
-                .get(next_at)
-                .is_some_and(|next| next.is_ascii_alphanumeric() || *next >= 0x80);
-            if !starts_term {
-                out.push(b' ');
-            } else if has_term {
-                out.extend_from_slice(b" NOT ");
-            } else {
-                return Err(malformed());
-            }
+        // SQLite reads the next token wherever the last one ended and negates it
+        // when the byte before it is a `-`, so `x-y` is `x` and not `y` just as
+        // `x -y` is. A `-` phrase with nothing before it is allowed when another
+        // phrase follows; `fts3_group_near` refuses a query of nothing else.
+        let starts_term = text
+            .get(next_at)
+            .is_some_and(|next| next.is_ascii_alphanumeric() || *next >= 0x80);
+        if byte == b'-' && (begins_word || starts_term) {
+            out.extend_from_slice(if starts_term { b" NOT " } else { b" " });
             at = next_at;
             continue;
-        }
-        if !byte.is_ascii_whitespace() && byte != b'(' && byte != b')' {
-            has_term = true;
         }
         out.push(byte);
         at = next_at;
@@ -364,69 +401,327 @@ fn fts3_near_distance(item: &[u8]) -> Option<u32> {
     std::str::from_utf8(inner).ok()?.parse::<u32>().ok()
 }
 
-/// Turns each run `a NEAR/n b NEAR/m c` into the FTS5 group `NEAR(a b c, k)`.
+/// What one node of an FTS3 query is, as SQLite's `fts3ExprParse` builds the tree.
+#[derive(Clone, Copy)]
+enum Fts3Kind<'q> {
+    /// A word or a quoted string, as it was written.
+    Phrase(&'q [u8]),
+    /// `NEAR/n`, with its distance.
+    Near(u32),
+    /// `OR`.
+    Or,
+    /// Two phrases side by side.
+    And,
+}
+
+/// One node of the tree, with the links `insertBinaryOperator` moves.
+struct Fts3Node<'q> {
+    /// What the node is.
+    kind: Fts3Kind<'q>,
+    /// The operator above it, if any.
+    parent: Option<usize>,
+    /// An operator's left operand.
+    left: Option<usize>,
+    /// An operator's right operand.
+    right: Option<usize>,
+}
+
+/// How tightly an FTS3 operator binds: lower binds tighter.
 ///
-/// Every other item is copied through. An operator at either end of the query or
-/// next to another operator, `OR` or `NOT`, has no term on one side and is
-/// malformed, as it is in SQLite.
+/// SQLite's `opPrecedence` without `SQLITE_ENABLE_FTS3_PARENTHESIS`: `NEAR`, then `OR`, then the
+/// implicit `AND`. So `x y OR z` is `x AND (y OR z)`, where FTS5 reads it as `(x AND y) OR z`.
+///
+/// @param kind - the operator
+fn fts3_precedence(kind: Fts3Kind<'_>) -> u8 {
+    match kind {
+        Fts3Kind::Near(_) => 1,
+        Fts3Kind::Or => 2,
+        Fts3Kind::And | Fts3Kind::Phrase(_) => 3,
+    }
+}
+
+/// The tree of an FTS3 query while it is built, the way `fts3ExprParse` builds it.
+struct Fts3Tree<'q> {
+    /// Every node, in the order it was read.
+    nodes: Vec<Fts3Node<'q>>,
+    /// The node at the top.
+    root: Option<usize>,
+    /// The node read last, where the next operator is inserted.
+    previous: Option<usize>,
+    /// Whether the next item has to be a phrase.
+    needs_phrase: bool,
+    /// The phrases written with a leading `-`, which are taken out of the tree.
+    negated: Vec<&'q [u8]>,
+}
+
+impl<'q> Fts3Tree<'q> {
+    /// Adds a node and returns its number.
+    ///
+    /// @param kind - what it is
+    fn push(&mut self, kind: Fts3Kind<'q>) -> usize {
+        self.nodes.push(Fts3Node {
+            kind,
+            parent: None,
+            left: None,
+            right: None,
+        });
+        self.nodes.len().saturating_sub(1)
+    }
+
+    /// Returns the node's operator above it, if any.
+    ///
+    /// @param at - the node
+    fn parent_of(&self, at: usize) -> Option<usize> {
+        self.nodes.get(at).and_then(|node| node.parent)
+    }
+
+    /// Puts a binary operator into the tree above the node read last, as `insertBinaryOperator` does.
+    ///
+    /// It climbs from the node read last while the operator above binds at least as tightly as
+    /// the new one, so operators of one precedence group to the left.
+    ///
+    /// @param operator - the new operator's node
+    /// @param from - the node read last
+    fn insert_binary(&mut self, operator: usize, from: usize) {
+        let new = self
+            .nodes
+            .get(operator)
+            .map_or(u8::MAX, |node| fts3_precedence(node.kind));
+        let mut split = from;
+        while let Some(above) = self.parent_of(split) {
+            let binds = self
+                .nodes
+                .get(above)
+                .map_or(u8::MAX, |node| fts3_precedence(node.kind));
+            if binds > new {
+                break;
+            }
+            split = above;
+        }
+        match self.parent_of(split) {
+            Some(above) => {
+                if let Some(node) = self.nodes.get_mut(above) {
+                    node.right = Some(operator);
+                }
+                if let Some(node) = self.nodes.get_mut(operator) {
+                    node.parent = Some(above);
+                }
+            }
+            None => self.root = Some(operator),
+        }
+        if let Some(node) = self.nodes.get_mut(operator) {
+            node.left = Some(split);
+        }
+        if let Some(node) = self.nodes.get_mut(split) {
+            node.parent = Some(operator);
+        }
+    }
+
+    /// Reads one item, a phrase or an operator, into the tree.
+    ///
+    /// @param kind - the item
+    /// @param malformed - builds the error for a query SQLite refuses
+    fn read(
+        &mut self,
+        kind: Fts3Kind<'q>,
+        malformed: &dyn Fn() -> inillucent_base::DbError,
+    ) -> DbResult<()> {
+        let phrase = matches!(kind, Fts3Kind::Phrase(_));
+        if !phrase && self.needs_phrase {
+            return Err(malformed());
+        }
+        if phrase && !self.needs_phrase {
+            let and = self.push(Fts3Kind::And);
+            let Some(from) = self.previous else {
+                return Err(malformed());
+            };
+            self.insert_binary(and, from);
+            self.previous = Some(and);
+        }
+        let previous_is_phrase = self.previous.is_none_or(|at| {
+            self.nodes
+                .get(at)
+                .is_some_and(|node| matches!(node.kind, Fts3Kind::Phrase(_)))
+        });
+        if matches!(kind, Fts3Kind::Near(_)) && !previous_is_phrase {
+            return Err(malformed());
+        }
+        let at = self.push(kind);
+        match (phrase, self.root, self.previous) {
+            (true, Some(_), Some(above)) => {
+                if let Some(node) = self.nodes.get_mut(above) {
+                    node.right = Some(at);
+                }
+                if let Some(node) = self.nodes.get_mut(at) {
+                    node.parent = Some(above);
+                }
+            }
+            (true, _, _) => self.root = Some(at),
+            (false, _, Some(from)) => self.insert_binary(at, from),
+            (false, _, None) => return Err(malformed()),
+        }
+        self.needs_phrase = !phrase;
+        self.previous = Some(at);
+        Ok(())
+    }
+
+    /// Writes a node and everything below it in the FTS5 spelling, with every operator bracketed.
+    ///
+    /// @param at - the node
+    /// @param out - where the text goes
+    fn render(&self, at: usize, out: &mut Vec<u8>) {
+        let Some(node) = self.nodes.get(at) else {
+            return;
+        };
+        let (word, left, right) = match node.kind {
+            Fts3Kind::Phrase(text) => {
+                out.extend_from_slice(text);
+                return;
+            }
+            Fts3Kind::Near(_) => {
+                let mut members = Vec::new();
+                let widest = self.near_members(at, &mut members);
+                out.extend_from_slice(b"NEAR(");
+                for (index, member) in members.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b' ');
+                    }
+                    out.extend_from_slice(member);
+                }
+                out.extend_from_slice(format!(", {widest})").as_bytes());
+                return;
+            }
+            Fts3Kind::Or => (&b" OR "[..], node.left, node.right),
+            Fts3Kind::And => (&b" AND "[..], node.left, node.right),
+        };
+        out.push(b'(');
+        if let Some(left) = left {
+            self.render(left, out);
+        }
+        out.extend_from_slice(word);
+        if let Some(right) = right {
+            self.render(right, out);
+        }
+        out.push(b')');
+    }
+
+    /// Collects the phrases of a chain of `NEAR` operators, and returns the widest distance in it.
+    ///
+    /// @param at - the top `NEAR` of the chain, or one of its phrases
+    /// @param members - where the phrases go, in written order
+    fn near_members(&self, at: usize, members: &mut Vec<&'q [u8]>) -> u32 {
+        let Some(node) = self.nodes.get(at) else {
+            return 0;
+        };
+        match node.kind {
+            Fts3Kind::Phrase(text) => {
+                members.push(text);
+                0
+            }
+            Fts3Kind::Near(distance) => {
+                let left = node.left.map_or(0, |left| self.near_members(left, members));
+                let right = node
+                    .right
+                    .map_or(0, |right| self.near_members(right, members));
+                distance.max(left).max(right)
+            }
+            Fts3Kind::Or | Fts3Kind::And => 0,
+        }
+    }
+}
+
+/// Parses the items of an FTS3 query the way SQLite does, and writes it in the FTS5 spelling.
+///
+/// **This follows `fts3ExprParse` in SQLite's `fts3_expr.c` with
+/// `SQLITE_ENABLE_FTS3_PARENTHESIS` off.** Three of its rules differ from FTS5, and an answer
+/// that followed the FTS5 reading differed from SQLite:
+///
+/// - `OR` binds tighter than two phrases side by side, so `x OR y z` is `(x OR y) AND z`.
+/// - A phrase written with a leading `-` is taken out of the tree where it stands, and every such
+///   phrase is applied with `NOT` to the whole query at the end. The next operator joins the
+///   phrase before the `-` phrase, so `x -y NEAR/3 w` is `(x NEAR/3 w) NOT y` and not
+///   `x NOT (y NEAR/3 w)`. A query of nothing but `-` phrases is malformed, and `-x y` is
+///   `y NOT x`.
+/// - Parentheses group nothing. They only separate words.
+///
+/// A `NEAR` chain such as `a NEAR/5 b NEAR/5 c` becomes one FTS5 group `NEAR(a b c, k)`, which
+/// keeps every term within a window of that many tokens. FTS3 compares each pair that is next to
+/// each other in the chain. Both answer the same on the chains with one distance throughout. With
+/// several distances the group takes the largest. An operator with no phrase on one side, and a
+/// `NEAR` after something other than a phrase, are SQLite's malformed query.
 ///
 /// @param text - the output of [`fts3_words`]
 /// @param malformed - builds the error for a query SQLite refuses
 fn fts3_group_near(
     text: &[u8],
     malformed: &dyn Fn() -> inillucent_base::DbError,
-) -> DbResult<Vec<u8>> {
-    let items = fts3_items(text);
-    let operand = |item: &[u8]| {
-        !matches!(item, b"OR" | b"NOT" | b"(" | b")") && fts3_near_distance(item).is_none()
+) -> DbResult<Option<Vec<u8>>> {
+    let mut tree = Fts3Tree {
+        nodes: Vec::new(),
+        root: None,
+        previous: None,
+        needs_phrase: true,
+        negated: Vec::new(),
     };
-    let mut out: Vec<u8> = Vec::with_capacity(text.len().saturating_add(16));
-    let mut at = 0usize;
-    while let Some(item) = items.get(at).copied() {
-        if !out.is_empty() {
-            out.push(b' ');
-        }
-        if fts3_near_distance(item).is_some() {
-            return Err(malformed());
-        }
-        let joined = items
-            .get(at.saturating_add(1))
-            .copied()
-            .and_then(fts3_near_distance);
-        if joined.is_none() {
-            out.extend_from_slice(item);
-            at = at.saturating_add(1);
+    let mut negate_next = false;
+    for item in fts3_items(text) {
+        if matches!(item, b"(" | b")") {
             continue;
         }
-        if !operand(item) {
-            return Err(malformed());
+        if item == b"NOT" {
+            negate_next = true;
+            continue;
         }
-        let mut members: Vec<&[u8]> = vec![item];
-        let mut widest = 0u32;
-        let mut next = at.saturating_add(1);
-        while let Some(distance) = items.get(next).copied().and_then(fts3_near_distance) {
-            let Some(member) = items
-                .get(next.saturating_add(1))
-                .copied()
-                .filter(|member| operand(member))
-            else {
-                return Err(malformed());
+        if std::mem::take(&mut negate_next) {
+            // A word after a `-` is a phrase whatever it spells: `-OR` is the word `or`.
+            // It is one token, so a column name before a colon is not a filter there:
+            // `-b:y` negates the word `b`, and `y` is a phrase of its own.
+            let (negated, rest) = match item.iter().position(|byte| *byte == b':') {
+                Some(colon) if item.first() != Some(&b'"') => (
+                    item.get(..colon).unwrap_or_default(),
+                    item.get(colon.saturating_add(1)..),
+                ),
+                _ => (item, None),
             };
-            widest = widest.max(distance);
-            members.push(member);
-            next = next.saturating_add(2);
-        }
-        out.extend_from_slice(b"NEAR(");
-        for (index, member) in members.iter().enumerate() {
-            if index > 0 {
-                out.push(b' ');
+            tree.negated
+                .push(match (negated, fts3_near_distance(negated)) {
+                    (b"OR", _) => b"\"OR\"",
+                    (_, Some(_)) => b"\"NEAR\"",
+                    _ => negated,
+                });
+            if let Some(rest) = rest.filter(|rest| !rest.is_empty()) {
+                tree.read(Fts3Kind::Phrase(rest), malformed)?;
             }
-            out.extend_from_slice(member);
+            continue;
         }
-        out.extend_from_slice(format!(", {widest})").as_bytes());
-        at = next;
+        let kind = match (item, fts3_near_distance(item)) {
+            (_, Some(distance)) => Fts3Kind::Near(distance),
+            (b"OR", None) => Fts3Kind::Or,
+            _ => Fts3Kind::Phrase(item),
+        };
+        tree.read(kind, malformed)?;
     }
-    Ok(out)
+    if tree.root.is_some() && tree.needs_phrase {
+        return Err(malformed());
+    }
+    let Some(root) = tree.root else {
+        return match tree.negated.is_empty() {
+            true => Ok(None),
+            false => Err(malformed()),
+        };
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(text.len().saturating_add(16));
+    tree.render(root, &mut out);
+    for phrase in &tree.negated {
+        let mut wrapped = Vec::with_capacity(out.len().saturating_add(phrase.len() + 8));
+        wrapped.push(b'(');
+        wrapped.extend_from_slice(&out);
+        wrapped.extend_from_slice(b" NOT ");
+        wrapped.extend_from_slice(phrase);
+        wrapped.push(b')');
+        out = wrapped;
+    }
+    Ok(Some(out))
 }
 
 impl Query {
@@ -1447,11 +1742,11 @@ mod tests {
     /// `AND` and `NOT` are words in FTS3 and FTS4, and the binary operator is a leading `-`.
     #[test]
     fn fts3_reads_and_and_not_as_words() {
-        assert_eq!(fts3("x NOT y").as_deref(), Some("x \"NOT\" y"));
-        assert_eq!(fts3("x AND y").as_deref(), Some("x \"AND\" y"));
-        assert_eq!(fts3("x not y").as_deref(), Some("x not y"));
-        assert_eq!(fts3("x -y").as_deref(), Some("x NOT y"));
-        assert_eq!(fts3("x OR y").as_deref(), Some("x OR y"));
+        assert_eq!(fts3("x NOT y").as_deref(), Some("((x AND \"NOT\") AND y)"));
+        assert_eq!(fts3("x AND y").as_deref(), Some("((x AND \"AND\") AND y)"));
+        assert_eq!(fts3("x not y").as_deref(), Some("((x AND not) AND y)"));
+        assert_eq!(fts3("x -y").as_deref(), Some("(x NOT y)"));
+        assert_eq!(fts3("x OR y").as_deref(), Some("(x OR y)"));
     }
 
     /// `NEAR/n` becomes an FTS5 group with the same distance, and a bare `NEAR` is ten.
@@ -1461,7 +1756,7 @@ mod tests {
         assert_eq!(fts3("x NEAR y").as_deref(), Some("NEAR(x y, 10)"));
         assert_eq!(
             fts3("z OR x NEAR/0 y").as_deref(),
-            Some("z OR NEAR(x y, 0)")
+            Some("(z OR NEAR(x y, 0))")
         );
         assert_eq!(
             fts3("\"x w\" NEAR/2 y*").as_deref(),
@@ -1471,7 +1766,10 @@ mod tests {
             fts3("x NEAR/5 y NEAR/5 q").as_deref(),
             Some("NEAR(x y q, 5)")
         );
-        assert_eq!(fts3("x near/3 y").as_deref(), Some("x near/3 y"));
+        assert_eq!(
+            fts3("x near/3 y").as_deref(),
+            Some("((x AND near/3) AND y)")
+        );
     }
 
     /// A `NEAR` with no term on one side is the error SQLite gives.
@@ -1496,7 +1794,39 @@ mod tests {
     /// A `-` before a quote is only a separator in FTS3 and FTS4.
     #[test]
     fn fts3_minus_before_a_quote_is_not_an_operator() {
-        assert_eq!(fts3("x -\"w q\"").as_deref(), Some("x \"w q\""));
+        assert_eq!(fts3("x -\"w q\"").as_deref(), Some("(x AND \"w q\")"));
+    }
+
+    /// `OR` binds tighter than two phrases side by side, as SQLite's FTS3 parser has it.
+    #[test]
+    fn fts3_or_binds_tighter_than_and() {
+        assert_eq!(fts3("x y OR z").as_deref(), Some("(x AND (y OR z))"));
+        assert_eq!(fts3("x OR y z").as_deref(), Some("((x OR y) AND z)"));
+        assert_eq!(
+            fts3("x OR y NEAR/2 z").as_deref(),
+            Some("(x OR NEAR(y z, 2))")
+        );
+    }
+
+    /// A `-` phrase leaves the tree where it stands and is applied with `NOT` to the whole query.
+    #[test]
+    fn fts3_minus_applies_to_the_whole_query() {
+        assert_eq!(
+            fts3("x -y NEAR/3 w").as_deref(),
+            Some("(NEAR(x w, 3) NOT y)")
+        );
+        assert_eq!(fts3("x -y OR z").as_deref(), Some("((x OR z) NOT y)"));
+        assert_eq!(fts3("-x y").as_deref(), Some("(y NOT x)"));
+        assert_eq!(fts3("x -y -z").as_deref(), Some("((x NOT y) NOT z)"));
+        assert_eq!(fts3("(x OR y) z").as_deref(), Some("((x OR y) AND z)"));
+        for text in ["-x", "-x -y", "x OR -y", "x NEAR/3 -y"] {
+            let error = fts3_pattern(text.as_bytes()).expect_err(text);
+            assert!(
+                error.message().contains("malformed MATCH expression"),
+                "{text}: {}",
+                error.message()
+            );
+        }
     }
 
     /// Two words side by side are an `AND`.

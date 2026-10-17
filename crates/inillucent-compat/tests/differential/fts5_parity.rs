@@ -1,4 +1,4 @@
-//! FTS5 query parity: fifty queries over a five hundred document corpus,
+//! FTS5 query parity: fifty three queries over a five hundred document corpus,
 //! against the pinned SQLite 3.53.4.
 //!
 //! Invariant: **every query in `corpora/fts5-parity/queries.list` returns
@@ -6,7 +6,9 @@
 //! allow list here. The forty one queries came out of the task-1979 review,
 //! where thirteen of them disagreed; the nine after them are the cross column
 //! cases the review's own corpus could not have caught, because `bm25()` only
-//! differs from SQLite's when a term is in more than one column of a row.
+//! differs from SQLite's when a term is in more than one column of a row. The last three are
+//! characters FTS5 has no token for: `alpha NEAR/3 beta` is FTS3's spelling of a `NEAR`, and SQLite
+//! refuses it as `fts5: syntax error near "/"` where this engine matched nothing without an error.
 //!
 //! The corpus is a file rather than a literal for the reason `differential.rs`
 //! keeps its own: five hundred documents inline would be a file nobody reads,

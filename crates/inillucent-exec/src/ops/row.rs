@@ -399,10 +399,19 @@ impl Sink for Limit {
 /// `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n FROM
 /// r WHERE n%7=0 LIMIT 3 OFFSET 2` run until it ran out of memory.
 pub struct Skip {
-    offset: usize,
-    remaining: usize,
+    /// What a reset puts back, or `None` when the count is shared and belongs to the caller.
+    offset: Option<usize>,
+    remaining: SkipBudget,
     downstream: Box<dyn Sink>,
 }
+
+/// How many rows are still to be thrown away, shared by the operators that draw on it.
+///
+/// **The arms of a `UNION ALL` share one `OFFSET`.** Each arm is a pipeline of its own, and the
+/// rows the first arm did not have are skipped from the second, so each arm's [`Skip`] takes from
+/// the same count.
+pub type SkipBudget = std::rc::Rc<std::cell::Cell<usize>>;
+
 impl Skip {
     /// Returns an operator that skips rows.
     ///
@@ -410,25 +419,41 @@ impl Skip {
     /// @param downstream - what to push the later rows into
     pub fn new(offset: usize, downstream: Box<dyn Sink>) -> Skip {
         Skip {
-            offset,
-            remaining: offset,
+            offset: Some(offset),
+            remaining: std::rc::Rc::new(std::cell::Cell::new(offset)),
+            downstream,
+        }
+    }
+
+    /// Returns an operator that skips rows from a count other operators draw on too.
+    ///
+    /// A reset leaves the count alone: whoever made it decides when it starts again.
+    ///
+    /// @param budget - the shared count of rows still to throw away
+    /// @param downstream - what to push the later rows into
+    pub fn shared(budget: SkipBudget, downstream: Box<dyn Sink>) -> Skip {
+        Skip {
+            offset: None,
+            remaining: budget,
             downstream,
         }
     }
 }
 impl Sink for Skip {
     fn push(&mut self, batch: &Batch<'_>) -> DbResult<Flow> {
-        if self.remaining == 0 {
+        let mut remaining = self.remaining.get();
+        if remaining == 0 {
             return self.downstream.push(batch);
         }
         let mut selection: Vec<u32> = Vec::new();
         for nth in 0..batch.live() {
-            if self.remaining > 0 {
-                self.remaining -= 1;
+            if remaining > 0 {
+                remaining -= 1;
                 continue;
             }
             selection.push(batch.row_at(nth) as u32);
         }
+        self.remaining.set(remaining);
         if selection.is_empty() {
             return Ok(Flow::Continue);
         }
@@ -446,7 +471,9 @@ impl Sink for Skip {
 
     /// Returns this operator and everything below it to its pre-input state.
     fn reset(&mut self) -> DbResult<()> {
-        self.remaining = self.offset;
+        if let Some(offset) = self.offset {
+            self.remaining.set(offset);
+        }
         self.downstream.reset()
     }
 }

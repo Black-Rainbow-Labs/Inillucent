@@ -58,6 +58,8 @@ fn scripts() -> Vec<(&'static str, String, Option<usize>)> {
     let mut all = scripts_over_one_select();
     all.extend(scripts_over_compounds_and_windows());
     all.extend(scripts_over_offset());
+    all.extend(scripts_over_compound_offset());
+    all.extend(scripts_over_window_partitions());
     all
 }
 
@@ -149,6 +151,120 @@ fn scripts_over_offset() -> Vec<(&'static str, String, Option<usize>)> {
                 "SELECT a FROM s WHERE CASE WHEN a=3 THEN json('x') ELSE 1 END LIMIT 1 OFFSET 5;",
             ),
             Some(0),
+        ),
+    ]
+}
+
+/// The scripts where a `UNION ALL` skips a row whose select list would fail.
+///
+/// **SQLite hands a `UNION ALL`'s `OFFSET` to its arms**, and each arm counts a row off before it
+/// computes the select list, so a skipped row of any arm is never evaluated. The engine applied the
+/// `OFFSET` to the rows the arms had already projected, so the skipped row raised its error.
+fn scripts_over_compound_offset() -> Vec<(&'static str, String, Option<usize>)> {
+    let t = |text: &str| format!("{FILL} {text}");
+    let seven = |text: &str| {
+        format!("CREATE TABLE s(a); INSERT INTO s VALUES (1),(2),(3),(4),(5),(6),(7); {text}")
+    };
+    let probe = "SELECT a, CASE WHEN a=3 THEN json('x') END FROM s";
+    vec![
+        (
+            "a UNION ALL OFFSET past a failing row of the first arm never evaluates it",
+            seven(&format!("{probe} UNION ALL SELECT 8, 9 LIMIT 1 OFFSET 5;")),
+            None,
+        ),
+        (
+            "a UNION ALL OFFSET past a failing row of the second arm never evaluates it",
+            seven(&format!("SELECT 0, 0 UNION ALL {probe} LIMIT 2 OFFSET 4;")),
+            None,
+        ),
+        (
+            "a UNION ALL OFFSET that crosses a whole arm and a failing row more than a batch in",
+            t(&format!("SELECT a FROM t UNION ALL SELECT {BAD} FROM t LIMIT 2 OFFSET 8000;")),
+            None,
+        ),
+        (
+            "a UNION ALL OFFSET with no LIMIT skips the failing row",
+            seven(&format!("{probe} UNION ALL SELECT 8, 9 LIMIT -1 OFFSET 5;")),
+            None,
+        ),
+        (
+            "a UNION ALL OFFSET that lands on the failing row raises it",
+            seven(&format!("SELECT 0, 0 UNION ALL {probe} LIMIT 1 OFFSET 3;")),
+            Some(0),
+        ),
+        (
+            "a UNION ALL OFFSET that ends before the failing row returns the rows before it",
+            seven(&format!("SELECT 0, 0 UNION ALL {probe} LIMIT 5 OFFSET 1;")),
+            Some(2),
+        ),
+        (
+            "a DISTINCT arm of a UNION ALL evaluates every row before the OFFSET",
+            seven("SELECT 0, 0 UNION ALL SELECT DISTINCT a, CASE WHEN a=3 THEN json('x') END FROM s LIMIT 1 OFFSET 5;"),
+            Some(0),
+        ),
+        (
+            "an ordered UNION ALL evaluates every row before the OFFSET",
+            seven(&format!("{probe} UNION ALL SELECT 8, 9 ORDER BY 1 LIMIT 1 OFFSET 5;")),
+            Some(0),
+        ),
+        (
+            "a UNION evaluates every row before the OFFSET",
+            seven(&format!("{probe} UNION SELECT 8, 9 LIMIT 1 OFFSET 5;")),
+            Some(0),
+        ),
+    ]
+}
+
+/// The scripts where a window function's own value fails, over a partition it computes first.
+///
+/// **A window computes the whole of a partition before it hands out the partition's first row**,
+/// so SQLite returns no row of a partition whose computation fails. `OVER ()` is one partition,
+/// the whole table, so a failure anywhere in it returns no rows at all.
+fn scripts_over_window_partitions() -> Vec<(&'static str, String, Option<usize>)> {
+    let t = |text: &str| format!("{FILL} {text}");
+    let overflow = "sum(CASE WHEN a=4000 THEN 9223372036854775807 ELSE a END)";
+    vec![
+        (
+            "a window over the whole table fails before its first row",
+            t(&format!("SELECT a, {overflow} OVER () FROM t;")),
+            Some(0),
+        ),
+        (
+            "a window over the whole table with a LIMIT still fails before its first row",
+            t(&format!("SELECT a, {overflow} OVER () FROM t LIMIT 10;")),
+            Some(0),
+        ),
+        (
+            "a window over the whole table fails in a derived table",
+            t(&format!("SELECT * FROM (SELECT a, {overflow} OVER () AS s FROM t);")),
+            Some(0),
+        ),
+        (
+            "a window returns the partitions before the one that fails",
+            t(&format!("SELECT a, {overflow} OVER (PARTITION BY a > 2500) FROM t;")),
+            Some(2500),
+        ),
+        (
+            "a window whose ordered frame takes in every row fails before its first row",
+            t(&format!(
+                "SELECT a, {overflow} OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t;"
+            )),
+            Some(0),
+        ),
+        (
+            "ntile reads its count from the first row of the partition and no other",
+            t("SELECT a, ntile(CASE WHEN a > 10 THEN 0 ELSE 2 END) OVER () FROM t;"),
+            None,
+        ),
+        (
+            "ntile whose first row has no usable count fails before any row",
+            t("SELECT a, ntile(CASE WHEN a > 10 THEN 2 ELSE 0 END) OVER () FROM t;"),
+            Some(0),
+        ),
+        (
+            "ntile reads a new count at the start of each partition",
+            t("SELECT a, ntile(CASE WHEN a > 2500 THEN 0 ELSE 2 END) OVER (PARTITION BY a > 2500) FROM t;"),
+            Some(2500),
         ),
     ]
 }

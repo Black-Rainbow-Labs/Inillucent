@@ -632,11 +632,22 @@ fn function_refusal(said: &str) -> inillucent_base::DbError {
 /// parentheses so that an `OR` inside one cannot bind to its neighbour. The column name is
 /// quoted, which is what lets a column called `b-c` be filtered.
 ///
-/// Answers `None` when a query is NULL, because a MATCH against NULL matches nothing.
+/// Answers `None` when a query is NULL, because a MATCH against NULL matches nothing, and when
+/// `rewrite` says a query matches nothing.
+///
+/// **Each query is rewritten before it is joined.** An FTS3 or FTS4 query is in another language
+/// from the FTS5 syntax the joining adds (`{"b"} : (...)`, `AND`, the parentheses), so the FTS3
+/// rewrite of the joined text read that syntax as FTS3 words and `b MATCH 'secret'` failed with
+/// `no such column: AND`.
 ///
 /// @param plan - the plan `best_index` chose and the values it was given
 /// @param names - the table's indexed column names
-fn combined_pattern(plan: &FilterPlan, names: &[Vec<u8>]) -> Option<(Vec<u8>, Option<String>)> {
+/// @param rewrite - turns one query into the FTS5 spelling, or says it matches nothing
+fn combined_pattern(
+    plan: &FilterPlan,
+    names: &[Vec<u8>],
+    rewrite: &dyn Fn(Vec<u8>) -> DbResult<Option<Vec<u8>>>,
+) -> DbResult<Option<(Vec<u8>, Option<String>)>> {
     let roles: Vec<&str> = plan.index_string.split(',').collect();
     let mut parts: Vec<Vec<u8>> = Vec::new();
     let mut rank_setting: Option<String> = None;
@@ -649,7 +660,12 @@ fn combined_pattern(plan: &FilterPlan, names: &[Vec<u8>]) -> Option<(Vec<u8>, Op
             }
             continue;
         }
-        let text = text?;
+        let Some(text) = text else {
+            return Ok(None);
+        };
+        let Some(text) = rewrite(text)? else {
+            return Ok(None);
+        };
         let column = role
             .strip_prefix('c')
             .and_then(|digits| digits.parse::<usize>().ok())
@@ -670,7 +686,7 @@ fn combined_pattern(plan: &FilterPlan, names: &[Vec<u8>]) -> Option<(Vec<u8>, Op
         }
     }
     let pattern = match parts.len() {
-        0 => return None,
+        0 => return Ok(None),
         1 => parts.swap_remove(0),
         _ => {
             let wrapped: Vec<Vec<u8>> = parts
@@ -680,7 +696,7 @@ fn combined_pattern(plan: &FilterPlan, names: &[Vec<u8>]) -> Option<(Vec<u8>, Op
             wrapped.join(&b" AND "[..])
         }
     };
-    Some((pattern, rank_setting))
+    Ok(Some((pattern, rank_setting)))
 }
 
 impl VirtualCursor for Fts5Cursor {
@@ -725,18 +741,24 @@ impl VirtualCursor for Fts5Cursor {
         // the `MATCH` with nothing. The refusal belongs on the one query whose
         // answer depends on the dictionary. See `layout.rs`.
         super::layout::readable(context, &self.shadows, &self.pending, &self.table)?;
-        let Some((pattern, rank_setting)) = combined_pattern(plan, &self.names) else {
+        let as_written = |text: Vec<u8>| Ok(Some(text));
+        let Some((pattern, rank_setting)) = combined_pattern(plan, &self.names, &as_written)?
+        else {
             return Ok(());
         };
         self.pattern = pattern.clone();
         // The FTS3 and FTS4 front end reads `-` as an operator (bug hunt 10).
-        let parsed = if self.dialect == Dialect::Three {
-            match expr::fts3_pattern(&pattern)? {
-                Some(rewritten) => rewritten,
-                None => return Ok(()),
-            }
+        let rewritten = if self.dialect == Dialect::Three {
+            combined_pattern(plan, &self.names, &|text| expr::fts3_pattern(&text))?
         } else {
-            pattern
+            let checked = |text: Vec<u8>| {
+                expr::refuse_stray_characters(&text)?;
+                Ok(Some(text))
+            };
+            combined_pattern(plan, &self.names, &checked)?
+        };
+        let Some((parsed, _)) = rewritten else {
+            return Ok(());
         };
         let query = Query::parse(&parsed, &self.tokenizer, &self.names)?;
         // **The buffered totals, not the row.** A score is computed from the

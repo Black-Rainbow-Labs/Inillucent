@@ -136,3 +136,33 @@ fn a_window_pass_carries_the_rows_before_its_failure() {
     assert_eq!(failure.message, "integer overflow");
     assert_eq!(failure.partial.map(|rows| rows.rows.len()), Some(1));
 }
+
+/// A window over the whole table computes every row before its first, so a failure carries none.
+///
+/// SQLite returns no row of `OVER ()` when the window's value fails, because the partition is the
+/// whole table and its value is known only after the last row.
+#[test]
+fn a_window_over_the_whole_table_carries_no_rows_from_its_failure() {
+    let database = filled("window-whole");
+    let connection = database.session();
+    for sql in [
+        "SELECT a, sum(CASE WHEN a = 4000 THEN 9223372036854775807 ELSE a END) OVER () FROM t",
+        "SELECT a, sum(CASE WHEN a = 4000 THEN 9223372036854775807 ELSE a END) OVER () FROM t LIMIT 10",
+        "SELECT a, count(*) OVER () FROM t WHERE CASE WHEN a = 3000 THEN json('x') ELSE 1 END",
+        "SELECT a, max(CASE WHEN a = 3000 THEN json('x') END) OVER () FROM t",
+    ] {
+        let failure = connection.query_all(sql, &[]).expect_err("the window fails");
+        assert_eq!(
+            failure.partial.map(|rows| rows.rows.len()),
+            None,
+            "`{sql}` carries rows from a window that had not finished"
+        );
+        let mut statement = connection.prepare(sql).expect("it compiles");
+        let prepared = statement.query(&[], usize::MAX).expect_err("the window fails");
+        assert_eq!(
+            prepared.partial.map(|rows| rows.rows.len()),
+            None,
+            "the prepared `{sql}` carries rows from a window that had not finished"
+        );
+    }
+}

@@ -48,3 +48,6 @@ cross column 6	SELECT rowid FROM d WHERE d MATCH '{title}:crosscolumn' ORDER BY 
 cross column 7	SELECT rowid FROM d WHERE d MATCH '-body:marker' ORDER BY rowid
 cross column 8	SELECT rowid FROM d WHERE d MATCH '^crosscolumn' ORDER BY rowid
 cross column 9	SELECT rowid FROM d WHERE d MATCH '"crosscolumn app"*' ORDER BY rowid
+fts5 NEAR slash is refused	SELECT rowid FROM d WHERE d MATCH 'alpha NEAR/3 beta' ORDER BY rowid
+fts5 a stray character is refused	SELECT rowid FROM d WHERE d MATCH 'alpha.beta' ORDER BY rowid
+fts5 minus column before NEAR/n	SELECT rowid FROM d WHERE d MATCH 'alpha -title NEAR/3 beta' ORDER BY rowid

@@ -755,6 +755,11 @@ fn evaluate(
 /// count it computed hears about it rather than reading a column of NULLs as
 /// data.
 ///
+/// **The count is read from the partition's first row only.** SQLite's `ntile`
+/// takes its argument when it steps the first row of a partition and never reads
+/// it again, so `ntile(CASE WHEN a > 10 THEN 0 ELSE 2 END) OVER ()` answers every
+/// row in two buckets. Reading it on every row raised the error at the eleventh.
+///
 /// @param rows - the buffered input
 /// @param call - the call, whose first argument is the bucket count
 /// @param partition - the row's partition, with its peer groups
@@ -768,7 +773,7 @@ fn ntile(
     let Some(column) = call.arguments.first() else {
         return Ok(OwnedDatum::Null);
     };
-    let buckets = integer_of(&value_at(rows, row, *column));
+    let buckets = integer_of(&value_at(rows, partition.start, *column));
     match frames::ntile(partition, row, buckets) {
         Some(bucket) => Ok(OwnedDatum::Int(bucket)),
         None => Err(inillucent_base::error::statement_refusal(
