@@ -116,6 +116,34 @@ fn correlated_subqueries_over_an_unindexed_column_finish_in_time() {
     );
 }
 
+/// A correlated block keyed on an expression of the outer row reads `b` once.
+///
+/// Only a bare outer column was a key, so `b.k = a.k + 1` scanned `b` for every row of `a`. At
+/// 20,000 rows each the command line built with the workspace's optimised dev profile took
+/// 11.0 s for the `EXISTS` and 41.2 s for `b.n = lower(a.name)`, against 77 ms for `b.k = a.k`.
+#[test]
+fn correlated_subqueries_keyed_on_an_outer_expression_finish_in_time() {
+    let database = tables("correlated-expression", 10_000);
+    let took = timed(
+        &database,
+        &[
+            (
+                "SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k + 1)",
+                9_999,
+            ),
+            (
+                "SELECT sum((SELECT count(*) FROM b WHERE b.k = (a.k * 3) % 10000)) FROM a",
+                10_000,
+            ),
+        ],
+    );
+    assert!(
+        took < Duration::from_millis(250),
+        "two correlated blocks keyed on an outer expression over 10,000 rows took {took:?}; \
+         each outer row scanned b"
+    );
+}
+
 /// A correlated `NOT EXISTS` is answered from the table too.
 ///
 /// SQLite keeps a subquery node for it and scans, taking 1.7 s at 10,000 rows.

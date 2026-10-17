@@ -342,6 +342,86 @@ fn an_outer_join_with_more_than_a_key_answers_what_a_scan_answers() {
     );
 }
 
+/// A correlated block keyed on an expression of the enclosing row answers what a scan answers.
+///
+/// The block computes the expression once for the outer row and looks its value up in the table.
+/// The cases are an arithmetic key, a key that is NULL because the outer column is, a function,
+/// a key compared under the integer affinity of `b.k`, a composite key, a `CASE`, a bucket that a
+/// filter on `b` narrows, and a NOCASE column, which is not keyed. An expression that fails is
+/// left to the scan, which fails on the same row.
+#[test]
+fn a_correlated_block_keyed_on_an_outer_expression_answers_what_a_scan_answers() {
+    let database = fixture("outer-expression");
+    let connection = database.session();
+    assert_both_ways(
+        &connection,
+        &[
+            (
+                "SELECT id, (SELECT count(*) FROM b WHERE b.k = a.k + 1) FROM a ORDER BY id",
+                "1/2 2/1 3/1 4/0 5/1 6/2 7/2 8/0 9/0 10/0",
+            ),
+            (
+                "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.g * 2) ORDER BY id",
+                "1 2 3 4 5 6 7 8 9 10",
+            ),
+            (
+                "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k - 1) \
+                 ORDER BY id",
+                "1 4 6 7 8",
+            ),
+            (
+                "SELECT id, (SELECT max(x) FROM b WHERE b.k = abs(a.k) + 0) FROM a ORDER BY id",
+                "1/90 2/40 3/50 4/NULL 5/NULL 6/100 7/90 8/NULL 9/80 10/110",
+            ),
+            (
+                "SELECT id, (SELECT count(*) FROM b WHERE b.k = a.s || '') FROM a ORDER BY id",
+                "1/3 2/2 3/1 4/0 5/2 6/1 7/3 8/0 9/2 10/1",
+            ),
+            (
+                "SELECT id, (SELECT count(*) FROM b WHERE b.k = a.k + 0 AND b.g = a.g) \
+                 FROM a ORDER BY id",
+                "1/1 2/2 3/1 4/0 5/0 6/0 7/2 8/0 9/1 10/1",
+            ),
+            (
+                "SELECT id, (SELECT count(*) FROM b WHERE b.x = a.k * 10) FROM a ORDER BY id",
+                "1/1 2/1 3/1 4/0 5/1 6/1 7/1 8/1 9/1 10/1",
+            ),
+            (
+                "SELECT id, (SELECT count(*) FROM b WHERE b.name = lower(a.nm)) \
+                 FROM a ORDER BY id",
+                "1/2 2/3 3/2 4/0 5/2 6/1 7/2 8/0 9/2 10/3",
+            ),
+            (
+                "SELECT id, (SELECT count(*) FROM b WHERE \
+                 b.k = CASE WHEN a.g = 2 THEN a.k + 1 ELSE a.k END) FROM a ORDER BY id",
+                "1/3 2/2 3/1 4/0 5/1 6/1 7/2 8/0 9/2 10/1",
+            ),
+            (
+                "SELECT id, (SELECT count(*) FROM b WHERE b.k = a.k + 1 AND b.active = 1) \
+                 FROM a ORDER BY id",
+                "1/1 2/1 3/0 4/0 5/1 6/1 7/1 8/0 9/0 10/0",
+            ),
+        ],
+    );
+    for setting in ["ON", "OFF"] {
+        connection
+            .execute_batch(&format!("PRAGMA automatic_index = {setting};"))
+            .expect("the pragma runs");
+        let failed = connection
+            .query(
+                "SELECT id, (SELECT count(*) FROM b WHERE b.k = \
+                 CASE WHEN a.id = 4 THEN abs(-9223372036854775808) ELSE a.k END) \
+                 FROM a ORDER BY id",
+            )
+            .expect_err("the fourth row's key overflows");
+        assert_eq!(
+            failed.message(),
+            "integer overflow",
+            "automatic_index = {setting}"
+        );
+    }
+}
+
 /// A key side that is an expression gives a scan's rows.
 #[test]
 fn an_expression_key_answers_what_a_scan_answers() {

@@ -1214,6 +1214,39 @@ fn correlated_read_workloads(point: u32) -> Vec<Workload> {
             binds: Vec::new(),
             mutates: false,
         },
+        // **The two arms keyed on an expression of the outer row.** `side_table.note` has no
+        // index, so each block reaches its rows through the table it builds once per execution.
+        // A key that was an expression, here `'note ' || a.id`, did not count as a key, and every
+        // one of `wide`'s 400 rows scanned the 25,000 rows of `side_table`. SQLite builds an
+        // automatic index on `note` for both.
+        Workload {
+            name: "correlated.exists.expression".to_string(),
+            family: "read.correlated".to_string(),
+            sql: "SELECT count(*) FROM wide a WHERE EXISTS \
+                  (SELECT 1 FROM side_table b WHERE b.note = 'note ' || (a.id * 7))"
+                .to_string(),
+            pre: None,
+            post: None,
+            repeat,
+            grouping: Grouping::Autocommit,
+            prepare_each: false,
+            binds: Vec::new(),
+            mutates: false,
+        },
+        Workload {
+            name: "correlated.scalar.expression".to_string(),
+            family: "read.correlated".to_string(),
+            sql: "SELECT sum((SELECT count(*) FROM side_table b WHERE b.note = 'note ' || (a.id + 1))) \
+                  FROM wide a"
+                .to_string(),
+            pre: None,
+            post: None,
+            repeat,
+            grouping: Grouping::Autocommit,
+            prepare_each: false,
+            binds: Vec::new(),
+            mutates: false,
+        },
     ]
 }
 

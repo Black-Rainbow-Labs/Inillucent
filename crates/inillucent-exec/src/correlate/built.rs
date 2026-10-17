@@ -14,6 +14,12 @@
 //! serves every block the engine answers per row, so `NOT EXISTS` and a scalar
 //! `count(*)` in a result column get it too.
 //!
+//! The outer value can be an expression of the outer row, such as `o.a + 1` or
+//! `lower(o.name)`. It is computed once per outer row and looked up the same way,
+//! where the block used to scan the whole table for every outer row because only a
+//! bare outer column was a key. An index on the column was already sought with the
+//! expression's value, so this is the case with no index.
+//!
 //! The table belongs to one execution of the statement. A block over the table
 //! that a statement changes is not given one, because the statements that
 //! change data prepare their blocks with `Levers::BLOCK_TABLE` off. A request
@@ -39,19 +45,31 @@ pub(super) struct AutomaticKey {
     build_keys: Vec<Box<dyn Eval>>,
     /// The key expressions over the outer row's values, one per key.
     probe_keys: Vec<Box<dyn Eval>>,
-    /// For each key, the joined row column that supplies the outer value.
-    feed_columns: Vec<usize>,
+    /// For each key, where the outer value comes from.
+    probes: Vec<Probe>,
     /// The conjuncts that read only the table, applied once as it is read.
     filter: Option<BoundExpr>,
     /// Whether the answer is only whether the key's bucket has a row.
     existence_only: bool,
 }
 
+/// Where the outer value of one key comes from.
+#[derive(Clone)]
+enum Probe {
+    /// A column of the joined outer row, read as it is.
+    Feed(usize),
+    /// An expression of the outer row's values, which the block holds as parameters.
+    Expression(BoundExpr),
+}
+
+/// One key equality: the column's place in the table's record, where the outer value comes
+/// from, and the affinity the comparison applies.
+type Key = (usize, Probe, Option<inillucent_value::Affinity>);
+
 /// The parts of a block's residual, sorted by what they do.
 struct Sorted {
-    /// Each key equality: the column's number in the table's record and the
-    /// affinity its comparison applies.
-    keys: Vec<(usize, usize, Option<inillucent_value::Affinity>)>,
+    /// Each key equality.
+    keys: Vec<Key>,
     /// The conjuncts the table can be filtered by while it is read.
     filter: Vec<BoundExpr>,
     /// How many conjuncts were neither a key nor part of the filter.
@@ -107,7 +125,7 @@ pub(super) fn decide(
     let existence_only =
         kind == SubqueryKind::Exists && sorted.left_over == 0 && answers_existence_alone(plan);
     let types: Vec<StaticType> = space.types.to_vec();
-    let (build_keys, probe_keys, feed_columns) = compile_keys(&sorted.keys, &types)?;
+    let (build_keys, probe_keys, probes) = compile_keys(&sorted.keys, &types)?;
     let filter = sorted
         .filter
         .into_iter()
@@ -115,7 +133,7 @@ pub(super) fn decide(
     Ok(Some(AutomaticKey {
         build_keys,
         probe_keys,
-        feed_columns,
+        probes,
         filter,
         existence_only,
     }))
@@ -188,10 +206,10 @@ fn sort_residual(
 }
 
 /// Returns the key an equality is, when it is a byte comparison of a column of
-/// the table with a value the outer row feeds.
+/// the table with a value the outer row feeds, or with an expression of such values.
 ///
-/// The key is the feeding joined row column, the column's place in the
-/// table's record, and the affinity the comparison applies.
+/// The key is the column's place in the table's record, where the outer value
+/// comes from, and the affinity the comparison applies.
 ///
 /// @param term - one conjunct of the residual
 /// @param id - the statement wide number of the block's table
@@ -202,7 +220,7 @@ fn key_equality(
     id: usize,
     feeds: &[(usize, u32)],
     space: &crate::physical::Space<'_>,
-) -> Option<(usize, usize, Option<inillucent_value::Affinity>)> {
+) -> Option<Key> {
     let BoundExpr::Compare {
         op: inillucent_sql::ast::BinaryOp::Equal,
         left,
@@ -213,18 +231,103 @@ fn key_equality(
     else {
         return None;
     };
-    let (column, number) = match (&**left, &**right) {
-        (BoundExpr::Column { source, column, .. }, BoundExpr::Parameter(number))
-        | (BoundExpr::Parameter(number), BoundExpr::Column { source, column, .. })
+    let (column, outer) = match (&**left, &**right) {
+        (BoundExpr::Column { source, column, .. }, outer)
+        | (outer, BoundExpr::Column { source, column, .. })
             if *source == id =>
         {
-            (*column, *number)
+            (*column, outer)
         }
         _ => return None,
     };
-    let (feed_column, _) = feeds.iter().find(|(_, fed)| *fed == number)?;
+    let probe = match outer {
+        BoundExpr::Parameter(number) => {
+            let (feed_column, _) = feeds.iter().find(|(_, fed)| fed == number)?;
+            Probe::Feed(*feed_column)
+        }
+        expression if probe_expression(expression) && reads_a_feed(expression, feeds) => {
+            Probe::Expression(expression.clone())
+        }
+        _ => return None,
+    };
     let slot = space.column(id, usize::from(column))?;
-    Some((slot, *feed_column, *affinity))
+    Some((slot, probe, *affinity))
+}
+
+/// Reports whether an expression gives one value for one outer row however often it is computed.
+///
+/// **Literals, parameters, operators and the scalar functions that read nothing but their
+/// arguments.** The scan the built table replaces computes the expression once for every row of
+/// the table, and the table computes it once for the outer row, so a function whose answer changes
+/// between calls, such as `random()` or `changes()`, would answer differently. Anything not named
+/// here keeps the block scanning.
+///
+/// @param expr - the outer side of an equality
+fn probe_expression(expr: &BoundExpr) -> bool {
+    use inillucent_sql::function::ScalarFunc as F;
+    let own = match expr {
+        BoundExpr::Null
+        | BoundExpr::Integer(_)
+        | BoundExpr::Real(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::Blob(_)
+        | BoundExpr::Parameter(_)
+        | BoundExpr::Unary { .. }
+        | BoundExpr::Arithmetic { .. }
+        | BoundExpr::Cast { .. }
+        | BoundExpr::Case { .. }
+        | BoundExpr::Math { .. } => true,
+        BoundExpr::Function { func, .. } => matches!(
+            func,
+            F::Abs
+                | F::Char
+                | F::Coalesce
+                | F::Concat
+                | F::ConcatWs
+                | F::Hex
+                | F::IfNull
+                | F::Iif
+                | F::Instr
+                | F::Length
+                | F::Lower
+                | F::LTrim
+                | F::Max
+                | F::Min
+                | F::NullIf
+                | F::Quote
+                | F::Replace
+                | F::Round
+                | F::RTrim
+                | F::Sign
+                | F::Substr
+                | F::Trim
+                | F::TypeOf
+                | F::Unhex
+                | F::Unicode
+                | F::Upper
+                | F::Printf
+                | F::OctetLength
+        ),
+        _ => false,
+    };
+    own && expr.children().into_iter().all(probe_expression)
+}
+
+/// Reports whether an expression reads a value this block's outer row feeds.
+///
+/// One that reads none is the same for every outer row, and the planner already treats it as a
+/// constant.
+///
+/// @param expr - the outer side of an equality
+/// @param feeds - for each outer reference, the joined row column and the parameter it became
+fn reads_a_feed(expr: &BoundExpr, feeds: &[(usize, u32)]) -> bool {
+    match expr {
+        BoundExpr::Parameter(number) => feeds.iter().any(|(_, fed)| fed == number),
+        _ => expr
+            .children()
+            .into_iter()
+            .any(|child| reads_a_feed(child, feeds)),
+    }
 }
 
 /// Reports whether a conjunct can be applied once, while the table is read.
@@ -284,13 +387,13 @@ fn answers_existence_alone(plan: &PhysicalPlan) -> bool {
 
 /// Compiles the key expressions of both sides, and lists the feeding columns.
 ///
-/// @param keys - each key: the record column, the feeding column, the affinity
+/// @param keys - each key: the record column, where the outer value comes from, the affinity
 /// @param types - the static type of every column of the block's table
 #[allow(clippy::type_complexity)]
 fn compile_keys(
-    keys: &[(usize, usize, Option<inillucent_value::Affinity>)],
+    keys: &[Key],
     types: &[StaticType],
-) -> DbResult<(Vec<Box<dyn Eval>>, Vec<Box<dyn Eval>>, Vec<usize>)> {
+) -> DbResult<(Vec<Box<dyn Eval>>, Vec<Box<dyn Eval>>, Vec<Probe>)> {
     let unknown = vec![StaticType::Unknown; keys.len()];
     let mut build = Vec::with_capacity(keys.len());
     let mut probe = Vec::with_capacity(keys.len());
@@ -301,9 +404,25 @@ fn compile_keys(
             &converted(Expr::Column(position), *affinity),
             &unknown,
         )?);
-        feeds.push(*feed);
+        feeds.push(feed.clone());
     }
     Ok((build, probe, feeds))
+}
+
+/// Computes an outer expression key for the outer row whose values `bound` holds.
+///
+/// The expression reads no column, so it is computed over a space with none.
+///
+/// @param expression - the outer side of the equality
+/// @param bound - the parameters, holding this outer row's values
+fn outer_value(expression: &BoundExpr, bound: &Params) -> DbResult<OwnedDatum> {
+    let held = crate::physical::HeldSpace {
+        layouts: Vec::new(),
+        types: Vec::new(),
+        order: Vec::new(),
+    };
+    let space = held.view(&[]);
+    crate::constant::constant_value(expression, &space, bound, None)
 }
 
 /// Reports whether a row makes a `WHERE` conjunct true.
@@ -345,13 +464,17 @@ impl Correlation {
         if self.built.borrow().is_none() && !self.build_table(key, catalog, bound)? {
             return Ok(None);
         }
-        let bucket = self.bucket_for(key, feed)?;
+        for (column, number) in &self.feeds {
+            bound.set(*number, feed(*column)?);
+        }
+        // An outer expression that fails is answered by the scan, which raises
+        // the error only if a row of the table makes it compute the expression.
+        let Some(bucket) = self.bucket_for(key, feed, bound)? else {
+            return Ok(None);
+        };
         if key.existence_only {
             let found = !bucket.is_empty();
             return Ok(Some(OwnedDatum::Int(i64::from(found != self.negated))));
-        }
-        for (column, number) in &self.feeds {
-            bound.set(*number, feed(*column)?);
         }
         let mut pending = Some(bucket);
         let rows = self.with_chain(catalog, bound, &mut |compiled| {
@@ -433,34 +556,46 @@ impl Correlation {
     /// only an existence test: `count(*)` of nothing is 0 and `max(x)` of
     /// nothing is NULL, and only running the chain answers both.
     ///
+    /// `None` when a key that is an expression fails to compute, so the caller
+    /// scans for this outer row.
+    ///
     /// @param key - how the block is keyed
     /// @param feed - returns the joined row's value in one column
+    /// @param bound - the parameters, holding this outer row's values
     fn bucket_for(
         &self,
         key: &AutomaticKey,
         feed: &dyn Fn(usize) -> DbResult<OwnedDatum>,
-    ) -> DbResult<Vec<Vec<OwnedDatum>>> {
-        let values: Vec<OwnedDatum> = key
-            .feed_columns
-            .iter()
-            .map(|column| feed(*column))
-            .collect::<DbResult<_>>()?;
+        bound: &Params,
+    ) -> DbResult<Option<Vec<Vec<OwnedDatum>>>> {
+        let mut values: Vec<OwnedDatum> = Vec::with_capacity(key.probes.len());
+        for probe in &key.probes {
+            values.push(match probe {
+                Probe::Feed(column) => feed(*column)?,
+                Probe::Expression(expression) => match outer_value(expression, bound) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(None),
+                },
+            });
+        }
         let borrowed: Vec<Datum<'_>> = values.iter().map(OwnedDatum::borrow).collect();
         let columns: Vec<Vector<'_>> = borrowed.iter().map(|value| Vector::Const(*value)).collect();
         let batch = Batch::new(1, columns);
         let (encoded, has_null) = crate::join::encode_row_key(&key.probe_keys, &batch, 0)?;
         if has_null {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         let held = self.built.borrow();
         let Some(table) = held.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
-        Ok(table
-            .probe(&encoded)
-            .iter()
-            .filter_map(|position| table.rows.get(*position as usize).cloned())
-            .collect())
+        Ok(Some(
+            table
+                .probe(&encoded)
+                .iter()
+                .filter_map(|position| table.rows.get(*position as usize).cloned())
+                .collect(),
+        ))
     }
 
     /// Stops using the built table for the rest of the execution.
