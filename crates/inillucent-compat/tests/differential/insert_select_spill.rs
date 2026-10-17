@@ -377,3 +377,106 @@ fn sources_that_are_not_plain_scans_copy_the_same_rows() {
         0,
     );
 }
+
+/// A streamed copy that stops part way, because a row fails or the rowids stop increasing, leaves
+/// what SQLite leaves, inside a transaction that goes on and commits and on its own.
+///
+/// The streamed build checks each row as it writes it, so a row that fails ends a tree that is
+/// half built, and the statement's writes are undone to its mark. A source in falling rowid order
+/// is undone the same way after its first row and handed to the row by row insert. The chunk size
+/// is lowered so the stop comes after several chunks have been written.
+#[test]
+fn a_streamed_copy_that_stops_part_way_leaves_what_sqlite_leaves() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    inillucent_exec::spill::set_chunk_rows_override(100);
+    drop(_serial);
+    compare(
+        "stops-part-way",
+        &[
+            Step::Exec("BEGIN"),
+            Step::Exec("CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT, maybe TEXT NOT NULL)"),
+            Step::Exec("CREATE INDEX p_k ON p(k)"),
+            Step::Exec("INSERT INTO p SELECT id, k, maybe FROM src"),
+            Step::Query("SELECT count(*), changes(), last_insert_rowid() FROM p"),
+            Step::Exec("INSERT INTO p SELECT id, k, coalesce(maybe, 'filled') FROM src"),
+            Step::Query("SELECT count(*), changes(), last_insert_rowid() FROM p"),
+            Step::Exec("CREATE TABLE q(id INTEGER PRIMARY KEY, k TEXT)"),
+            Step::Exec("CREATE INDEX q_k ON q(k)"),
+            Step::Exec("INSERT INTO q SELECT id, k FROM src ORDER BY id DESC"),
+            Step::Query("SELECT count(*), changes(), last_insert_rowid(), min(id), max(id) FROM q"),
+            Step::Exec("COMMIT"),
+            Step::Query("PRAGMA integrity_check"),
+            Step::Exec("CREATE TABLE r(id INTEGER PRIMARY KEY, n INTEGER CHECK (n < 99))"),
+            Step::Exec("CREATE INDEX r_n ON r(n)"),
+            Step::Exec("INSERT INTO r SELECT id, n FROM src"),
+            Step::Query("SELECT count(*), changes(), last_insert_rowid() FROM r"),
+            Step::Exec("CREATE TABLE s(id INTEGER PRIMARY KEY, k TEXT)"),
+            Step::Exec("INSERT INTO s SELECT 1100 - id, k FROM src"),
+            Step::Query("SELECT count(*), changes(), last_insert_rowid(), min(id), max(id) FROM s"),
+            Step::Query("SELECT count(*) FROM p WHERE k > 'key 9'"),
+            Step::Query("PRAGMA integrity_check"),
+        ],
+        6,
+    );
+}
+
+/// The file a streamed copy that stopped part way left behind reopens whole.
+///
+/// A statement that reads its own pages back from the cache can look right while the file is not,
+/// so the database is closed, opened again and checked.
+#[test]
+fn a_file_with_a_stopped_streamed_copy_reopens_whole() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    inillucent_exec::spill::set_run_bytes_override(GATHER_BYTES);
+    inillucent_exec::spill::set_chunk_rows_override(100);
+    let area = inillucent_compat::workspace_root().join("target/scratch/insert-select-spill");
+    let _ = std::fs::create_dir_all(&area);
+    let path = area.join(format!("reopen-{}.rdb", std::process::id()));
+    inillucent_base::testing::remove_database(&path);
+    {
+        let database = inillucent_engine::connect::Database::open(&path).expect("it opens");
+        let connection = database.session();
+        connection.execute_batch(SOURCE).expect("the source table");
+        connection.execute_batch(FILL).expect("the source rows");
+        connection
+            .execute_batch(
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT, maybe TEXT NOT NULL); \
+                 CREATE INDEX p_k ON p(k); CREATE TABLE q(id INTEGER PRIMARY KEY, k TEXT);",
+            )
+            .expect("the targets");
+        assert!(
+            connection
+                .execute_batch("INSERT INTO p SELECT id, k, maybe FROM src")
+                .is_err(),
+            "the fiftieth row's NULL fails the copy"
+        );
+        connection
+            .execute_batch("INSERT INTO q SELECT id, k FROM src ORDER BY id DESC")
+            .expect("a copy in falling rowid order is written row by row");
+        connection
+            .execute_batch("INSERT INTO p SELECT id, k, coalesce(maybe, 'x') FROM src")
+            .expect("the copy that is right");
+    }
+    let database = inillucent_engine::connect::Database::open(&path).expect("it opens again");
+    let connection = database.session();
+    let answer = |sql: &str| -> String {
+        let rows = connection.query(sql).expect("the query runs");
+        rows.iter()
+            .flat_map(|row| row.iter().map(|cell| format!("{cell:?}")))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    assert_eq!(answer("PRAGMA integrity_check"), r#"Text([111, 107])"#);
+    assert_eq!(
+        answer("SELECT count(*), sum(id) FROM p"),
+        "Int(1100),Int(605550)"
+    );
+    assert_eq!(
+        answer("SELECT count(*), sum(id) FROM q"),
+        "Int(1100),Int(605550)"
+    );
+}

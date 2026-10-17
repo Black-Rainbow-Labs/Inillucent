@@ -1,11 +1,14 @@
 //! `INSERT ... SELECT` into an empty table, built as one tree instead of row
 //! by row.
 //!
-//! Invariant: **the bulk build writes nothing until every row has been built
-//! and checked, and then writes exactly the trees and catalog rows the
-//! ordinary insert would have left.** A statement it refuses either is handed
-//! back to the ordinary insert unchanged, having written nothing, or fails with
-//! the error the ordinary insert reports for it, also having written nothing.
+//! Invariant: **the bulk build leaves exactly the trees and catalog rows the
+//! ordinary insert would have left, or nothing.** A statement it refuses either
+//! is handed back to the ordinary insert unchanged, having written nothing, or
+//! fails with the error the ordinary insert reports for it, also having written
+//! nothing. A build from rows in memory checks every row before it writes. A
+//! build from rows in a file checks each row as it writes it, and a row that
+//! fails stops the build and the statement's writes are undone to its mark (see
+//! [`ImportedDatabase::insert_in_bulk_streamed`]).
 //!
 //! ## Why
 //!
@@ -155,15 +158,22 @@ struct StreamedIndex {
 }
 
 /// The images of a streamed bulk build, handed to the tree builder a chunk at a time.
+///
+/// Each source row is built and checked here, once. A row that fails, or a rowid that does not
+/// increase, ends the input at the row before it, so the builder finishes a whole tree of the rows
+/// so far and registers it, and the reason is kept in `stopped` for the caller to undo the
+/// statement by.
 struct ImageChunks<'a> {
     /// Builds and checks each image.
     stream: dml::bulk::BulkStream,
     /// The bound insert.
     statement: &'a BoundInsert,
     /// The source rows.
-    spooled: SpooledRows,
+    spooled: &'a mut SpooledRows,
     /// The index trees, which take an entry from every image.
     builds: &'a mut Vec<StreamedIndex>,
+    /// Why the input ended before the source did, when it did.
+    stopped: Option<dml::bulk::StreamFailure>,
 }
 
 impl inillucent_tree::paged::RowChunks for ImageChunks<'_> {
@@ -182,11 +192,9 @@ impl inillucent_tree::paged::RowChunks for ImageChunks<'_> {
                 let streamed = match self.stream.add(self.statement, row?) {
                     Ok(Some(streamed)) => streamed,
                     Ok(None) => continue,
-                    Err(dml::bulk::StreamFailure::Failed(failure)) => return Err(failure.error),
-                    Err(dml::bulk::StreamFailure::NotIncreasing) => {
-                        return Err(refusal(
-                            "the rows of a copy changed order between two reads",
-                        ))
+                    Err(stopped) => {
+                        self.stopped = Some(stopped);
+                        break;
                     }
                 };
                 for build in self.builds.iter_mut() {
@@ -218,11 +226,13 @@ impl inillucent_tree::paged::RowChunks for ImageChunks<'_> {
                 }
                 taken = taken.saturating_add(1);
             }
-            if taken == 0 {
+            if taken > 0 {
+                let view: &PackedRows = &packed;
+                each(&view)?;
+            }
+            if taken == 0 || self.stopped.is_some() {
                 return Ok(());
             }
-            let view: &PackedRows = &packed;
-            each(&view)?;
         }
     }
 }
@@ -470,40 +480,42 @@ impl ImportedDatabase {
         indexes: Vec<IndexBuild>,
     ) -> DbResult<Outcome> {
         let count = built.rows.len();
-        self.apply_bulk_with(table, count, built.last_rowid, |database| {
-            database.replace_trees(table, &built.rows, indexes)
+        self.apply_bulk_with(table, |database| {
+            database
+                .replace_trees(table, &built.rows, indexes)
+                .map(|()| (count, built.last_rowid))
         })
     }
 
     /// Runs the part of a bulk build that writes, and settles the statement after it.
     ///
     /// @param table - the table being written
-    /// @param count - how many rows the statement writes
-    /// @param last_rowid - the rowid of the last row kept, in input order
-    /// @param write - builds the trees
+    /// @param write - builds the trees, and returns how many rows it wrote and the rowid of the
+    ///   last row kept, in input order
     fn apply_bulk_with(
         &mut self,
         table: &TableInfo,
-        count: usize,
-        last_rowid: Option<i64>,
-        write: impl FnOnce(&mut Self) -> DbResult<()>,
+        write: impl FnOnce(&mut Self) -> DbResult<(usize, Option<i64>)>,
     ) -> DbResult<Outcome> {
         let autocommit = self.writing.batch().is_none();
         let mark = self.statement_mark();
         let txn = self.current_txn();
         let previous = self.schema.ddl_schema;
         self.schema.ddl_schema = table.database;
-        let written = write(self).and_then(|()| self.seal());
+        let written = write(self).and_then(|wrote| self.seal().map(|()| wrote));
         self.schema.ddl_schema = previous;
-        if let Err(error) = written {
-            let undone = self.undo_to_floor(mark, true, txn);
-            if autocommit {
-                self.writing.undo().borrow_mut().clear();
-                self.writing.pending_frees().borrow_mut().clear();
-                self.writing.built().borrow_mut().clear();
+        let (count, last_rowid) = match written {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                let undone = self.undo_to_floor(mark, true, txn);
+                if autocommit {
+                    self.writing.undo().borrow_mut().clear();
+                    self.writing.pending_frees().borrow_mut().clear();
+                    self.writing.built().borrow_mut().clear();
+                }
+                return Err(undone.err().unwrap_or(error));
             }
-            return Err(undone.err().unwrap_or(error));
-        }
+        };
         if autocommit {
             // The statement committed in `seal`, so nothing can abandon it
             // now, and a later `ROLLBACK` must not reach its before-images.
@@ -556,54 +568,72 @@ impl ImportedDatabase {
         if !ready {
             return Ok(Bulk::Declined(Collected::Spooled(spooled)));
         }
-        let checked = self.with_write_view(txn, |view| {
-            let mut stream = dml::bulk::BulkStream::open(statement, view, params)?;
-            for row in &mut spooled {
-                let row = row.map_err(|error| dml::bulk::BulkFailure {
-                    error,
-                    last_rowid: stream.last_rowid(),
-                })?;
-                match stream.add(statement, row) {
-                    Ok(_) => {}
-                    Err(dml::bulk::StreamFailure::NotIncreasing) => return Ok(None),
-                    Err(dml::bulk::StreamFailure::Failed(failure)) => return Err(failure),
-                }
-            }
-            Ok(Some((stream.kept(), stream.last_rowid())))
+        let stream = self.with_write_view(txn, |view| {
+            dml::bulk::BulkStream::open(statement, view, params)
         });
-        spooled.rewind();
-        let (count, last_rowid) = match checked {
-            Ok(Some(counted)) => counted,
-            Ok(None) => return Ok(Bulk::Declined(Collected::Spooled(spooled))),
-            Err(failure) => {
-                // What the ordinary insert's failure path records: the last rowid it wrote, and
-                // no rows changed.
-                self.remember_rowid(failure.last_rowid);
-                self.record_changes(0, 0);
-                return Err(failure.error);
-            }
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(failure) => return self.bulk_failed(failure),
         };
-        let count = usize::try_from(count).unwrap_or(usize::MAX);
-        inillucent_exec::gather::note_streamed_build();
-        self.apply_bulk_with(table, count, last_rowid, |database| {
-            database.replace_trees_streamed(statement, params, spooled)
-        })
-        .map(Bulk::Done)
+        let mut stopped: Option<dml::bulk::StreamFailure> = None;
+        let written = self.apply_bulk_with(table, |database| {
+            database.replace_trees_streamed(statement, stream, &mut spooled, &mut stopped)
+        });
+        match (written, stopped) {
+            (Ok(outcome), None) => {
+                inillucent_exec::gather::note_streamed_build();
+                Ok(Bulk::Done(outcome))
+            }
+            // The rows do not arrive in rowid order. What was built is undone, and the ordinary
+            // insert, which needs no order, takes the rows from the first.
+            (_, Some(dml::bulk::StreamFailure::NotIncreasing)) => {
+                spooled.rewind();
+                Ok(Bulk::Declined(Collected::Spooled(spooled)))
+            }
+            (_, Some(dml::bulk::StreamFailure::Failed(failure))) => self.bulk_failed(failure),
+            (Err(error), None) => Err(error),
+        }
+    }
+
+    /// Reports a row a bulk build refused, as the ordinary insert's failure path would.
+    ///
+    /// The ordinary insert records the last rowid it wrote and no rows changed.
+    ///
+    /// @param failure - the error, and the rowid of the last row kept before it
+    fn bulk_failed(&mut self, failure: dml::bulk::BulkFailure) -> DbResult<Bulk> {
+        self.remember_rowid(failure.last_rowid);
+        self.record_changes(0, 0);
+        Err(failure.error)
     }
 
     /// Builds the table's tree and its indexes' trees from a source in a file, a chunk at a time.
     ///
-    /// The shape of [`Self::replace_trees`], with the images built as the table's tree is built.
+    /// The shape of [`Self::replace_trees`], with the images built and checked as the table's tree
+    /// is built.
+    ///
+    /// **One pass over the file, not two.** The rows used to be read, built and checked once to
+    /// find a failure before anything was written, and read, built and checked again to write
+    /// them. At 3,000,000 rows into an empty table that took 1.09 s where the 2.7.0 path, which
+    /// held every row in memory and checked each once, took 0.78 s; the second check was the
+    /// whole of the difference. A failure no longer needs finding first, because the statement
+    /// is undone to its mark when this returns an error: a row that fails, or a rowid that does
+    /// not increase, ends the table's input there, the builder finishes and registers the tree of
+    /// the rows before it so the undo can give its pages back, and this returns an error with the
+    /// reason in `stopped`.
+    ///
+    /// Returns how many rows were written and the rowid of the last.
     ///
     /// @param statement - the bound insert
-    /// @param params - the bound parameters
+    /// @param stream - builds and checks each row
     /// @param spooled - the source rows, positioned at the first
+    /// @param stopped - where the reason the rows ended early is put
     fn replace_trees_streamed(
         &mut self,
         statement: &BoundInsert,
-        params: &Params,
-        spooled: SpooledRows,
-    ) -> DbResult<()> {
+        stream: dml::bulk::BulkStream,
+        spooled: &mut SpooledRows,
+        stopped: &mut Option<dml::bulk::StreamFailure>,
+    ) -> DbResult<(usize, Option<i64>)> {
         let table = &statement.table;
         let root = table.root;
         let covering = self.schema.covering.get(&root).cloned().unwrap_or_default();
@@ -626,12 +656,6 @@ impl ImportedDatabase {
             .cloned()
             .ok_or_else(|| refusal("no layout for the table being built"))?;
         let mut builds = self.streamed_index_builds(table, &table_layout)?;
-        let txn = self.current_txn();
-        let stream = self
-            .with_write_view(txn, |view| {
-                dml::bulk::BulkStream::open(statement, view, params)
-            })
-            .map_err(|failure| failure.error)?;
         let mut handles = vec![root];
         self.release_tree(root)?;
         let mut chunks = ImageChunks {
@@ -639,8 +663,16 @@ impl ImportedDatabase {
             statement,
             spooled,
             builds: &mut builds,
+            stopped: None,
         };
         self.build_tree_chunks(root, columns, key_columns, layout, &mut chunks)?;
+        let (count, last_rowid) = (chunks.stream.kept(), chunks.stream.last_rowid());
+        if let Some(reason) = chunks.stopped.take() {
+            *stopped = Some(reason);
+            return Err(refusal(
+                "a streamed copy stopped at a row it could not write",
+            ));
+        }
         for build in builds {
             let StreamedIndex {
                 root: handle,
@@ -663,7 +695,7 @@ impl ImportedDatabase {
         for handle in handles {
             self.record_new_root(table.database, handle)?;
         }
-        Ok(())
+        Ok((usize::try_from(count).unwrap_or(usize::MAX), last_rowid))
     }
 
     /// Returns a sorter for each index tree the table has, and where its entries come from.
