@@ -69,6 +69,7 @@ These are the rows in `layering.toml` today:
 | `libc` | operating system boundary | `inillucent-vfs`, `inillucent-remote`, `inillucent-cli`, `inillucent-compat` |
 | `windows-sys` | operating system boundary | `inillucent-vfs`, `inillucent-remote`, `inillucent-cli`, `inillucent-compat` |
 | `memmap2` | operating system boundary | `inillucent-core` |
+| `libloading` | operating system boundary | `inillucent-core` |
 | `anyhow`, `thiserror` | error handling | `inillucent-core`, `inillucent-bench` |
 | `serde`, `serde_json` | data handling | `inillucent-core`, `inillucent-bench` |
 | `rayon`, `rand`, `ort`, `tokenizers` | numeric kernel | `inillucent-core`, `inillucent-bench` |
@@ -78,7 +79,7 @@ These are the rows in `layering.toml` today:
 | `postgres`, `pgvector` | benchmark baseline | `inillucent-bench` |
 
 `inillucent-core` is the retrieval engine: vector search, keyword search and embeddings. The numeric
-kernels do its arithmetic and tokenizing and decide nothing about SQL or storage.
+kernels do its arithmetic and tokenizing and decide nothing about SQL or storage. `libloading` loads the NVIDIA driver library so that `inillucent-core` can ask how many CUDA cards there are before it asks ONNX Runtime for one; `ort` already links the same version.
 `inillucent-bench` is a benchmark program. It uses `postgres` and `pgvector` to measure the
 PostgreSQL comparison, and no shipped program links `inillucent-bench`.
 

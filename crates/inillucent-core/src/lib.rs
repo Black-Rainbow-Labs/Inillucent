@@ -27,6 +27,8 @@
 
 pub mod binio;
 pub mod bm25;
+#[cfg(feature = "onnx")]
+mod cuda_probe;
 pub mod distance;
 pub mod embed;
 #[cfg(feature = "onnx")]

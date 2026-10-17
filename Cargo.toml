@@ -239,3 +239,5 @@ windows-sys = { version = "0.59", features = [
 # `embed_onnx.rs`, after building against the new candidate.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "load-dynamic", "cuda"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# The version `ort` already links for `load-dynamic`, so the CUDA driver probe adds no crate to the build.
+libloading = "=0.9.0"

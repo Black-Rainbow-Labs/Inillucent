@@ -819,12 +819,16 @@ pub(crate) fn build_session(model_path: &Path, options: &OnnxOptions) -> Result<
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         open_session(model_path, options)
     }));
-    match opened {
+    let result = match opened {
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!(
             "ONNX Runtime could not be loaded. Run `inillucent setup-embeddings runtime`, or set ORT_DYLIB_PATH to the full path of a libonnxruntime 1.22 library"
         )),
+    };
+    if result.is_err() {
+        crate::exit_hook::note_session_failed();
     }
+    result
 }
 
 /// Builds the session once ONNX Runtime is known to be loadable.
@@ -855,7 +859,18 @@ fn open_session(model_path: &Path, options: &OnnxOptions) -> Result<Session> {
             .map_err(|e| anyhow::anyhow!("setting the ONNX intra operator thread count: {e}"))?;
     }
     if let Device::Cuda(device_id) = options.device {
+        // **The driver is asked first** (see `cuda_probe`): ONNX Runtime's CUDA provider damages
+        // the heap at exit when it is loaded for a card that is not there.
+        if let Some(count) = crate::cuda_probe::device_count() {
+            if device_id < 0 || device_id >= count {
+                return Err(anyhow::anyhow!(
+                    "registering the CUDA execution provider on card {device_id}: the driver \
+                     reports {count} card(s). {CUDA_HELP}"
+                ));
+            }
+        }
         preload_cuda_dylibs();
+        crate::exit_hook::note_cuda_provider_asked();
         // error_on_failure, deliberately. ort's default is to log the failure and
         // fall back to the processor, which is the worst outcome available here: an
         // embedding run meant to take an hour silently becomes one that takes a day,
@@ -1340,6 +1355,44 @@ mod tests {
                 },
             }
         };
+    }
+
+    /// A card the NVIDIA driver does not have is refused before ONNX Runtime's CUDA provider loads.
+    ///
+    /// The provider writes into memory it has already freed when it is unloaded after it failed
+    /// to start (see `cuda_probe`), so the refusal has to come from the driver's count. ONNX
+    /// Runtime's own refusal names no count, and the provider is then marked as asked and failed,
+    /// so both assertions fail when the probe is skipped.
+    #[test]
+    fn a_card_the_driver_does_not_have_is_refused_before_the_provider_loads() {
+        let Some(count) = crate::cuda_probe::device_count() else {
+            inillucent_base::testing::skipping("no NVIDIA driver to ask how many cards there are");
+            return;
+        };
+        let Some(dir) = model_dir() else {
+            inillucent_base::testing::skipping("no ONNX weights found");
+            return;
+        };
+        let refused = OnnxEmbedder::open(
+            &dir,
+            OnnxOptions {
+                device: Device::Cuda(count.saturating_add(1)),
+                ..Default::default()
+            },
+        );
+        let Err(error) = refused else {
+            panic!(
+                "card {} of {count} opened a session",
+                count.saturating_add(1)
+            );
+        };
+        let said = format!("{error:#}");
+        assert!(
+            said.contains(&format!("the driver reports {count} card(s)")),
+            "the refusal came from ONNX Runtime and not from the driver's count: {said}"
+        );
+        assert!(said.contains("setup-embeddings runtime --gpu"), "{said}");
+        assert!(!crate::exit_hook::cuda_provider_failed());
     }
 
     #[test]

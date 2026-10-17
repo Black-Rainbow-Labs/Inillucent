@@ -158,9 +158,9 @@ sha256 = "a5cbcefa51bbf1a500e0cd6d0a96de1633eaa97e92f0f07444ecde33ffa695fd"
 
 [[amendment]]
 path = "crates/inillucent-core/Cargo.toml"
-ticket = "task-1970"
-reason = "the inillucent-base dev-dependency with its testing feature, so this crate's #[cfg(test)] modules can call the one skip helper (task-1969, 4.6)"
-sha256 = "d1da91d63e66a610e07d5e9c8d0e05362851e95db760882fe90027c25cde954f"
+ticket = "task-2275"
+reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
+sha256 = "4663dfb9452e68faea420bec6f0a70b4897e6797d83b98ea47fba7e6780cebf2"
 
 [[amendment]]
 path = "crates/inillucent-core/src/binio.rs"
@@ -173,6 +173,12 @@ path = "crates/inillucent-core/src/bm25.rs"
 ticket = "task-2209"
 reason = "keyword search sizes its per term, score and tier maps before filling them. Same results; checked by the search suites."
 sha256 = "da43b73b85eebc56a8a454769c7ebd332918076bbd1b4bbd63b49c8922dcc87f"
+
+[[amendment]]
+path = "crates/inillucent-core/src/cuda_probe.rs"
+ticket = "task-2275"
+reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
+sha256 = "a5f5bfaf8a6caaf2df15dcde8511d8e616dbc5402a151950d9428be8b68d9cc7"
 
 [[amendment]]
 path = "crates/inillucent-core/src/distance.rs"
@@ -188,15 +194,15 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed_onnx.rs"
-ticket = "task-2110"
-reason = "Keep ONNX Runtime environment reference from the first session build on every platform, exiting flag for the idle reaper, release_all for the C call inillucent_release_models"
-sha256 = "a6e45f6fd59237023961135b79c7687bab31ee8b46f4362f4e8527c0e776de16"
+ticket = "task-2275"
+reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
+sha256 = "8a577f64d905af0796e553828b6cdc61e16e9b4da15927ab3e203ee42934153b"
 
 [[amendment]]
 path = "crates/inillucent-core/src/exit_hook.rs"
-ticket = "task-2110"
-reason = "Bugs 22 and 26: keep_environment holds ONNX Runtime's environment, release_all backs inillucent_release_models, and environment_was_created tells the inillucent program on Windows to end its process without library detach once ONNX Runtime was loaded, because a CUDA or ONNX Runtime thread stopped by ExitProcess left the heap damaged (2 crashes in 600 runs before, 0 in 1,200 after). The module comment no longer says PHP calls inillucent_release_models; the PHP package loads no library. The unloader is passed to catch_unwind directly, as clippy asks."
-sha256 = "7d2a045470520aabf79779c1012cdbd59cc633ed133b5e33dd22034307ffb23c"
+ticket = "task-2275"
+reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
+sha256 = "0c275196c4379235941815d2168b2f208121c4deba2daef344ca00bda4cd7e33"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"
@@ -230,9 +236,9 @@ sha256 = "6d4363c67591748a4389df6ef1aba9b4d7a71557c730ddddbe189ccee532d038"
 
 [[amendment]]
 path = "crates/inillucent-core/src/lib.rs"
-ticket = "task-2167"
-reason = "Declares the exit_hook module, under the onnx feature."
-sha256 = "6468137bcda4ecbe2c13b3706e2fe9e58a5922ab4fea625d036c41e09565af6d"
+ticket = "task-2275"
+reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
+sha256 = "52532bba8f27b259787d4d7394ee3731d0e3bcfb632d9e3201b80647be8563e2"
 
 [[amendment]]
 path = "crates/inillucent-core/src/model.rs"

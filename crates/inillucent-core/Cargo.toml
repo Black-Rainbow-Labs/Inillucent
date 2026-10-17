@@ -26,12 +26,13 @@ bytemuck.workspace = true
 rand.workspace = true
 ort = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
 
 [features]
 default = []
 # Runs nomic-embed-text-v1.5 as ONNX in process. Off by default so the engine
 # stays free of a native library for callers that supply their own vectors.
-onnx = ["dep:ort", "dep:tokenizers"]
+onnx = ["dep:ort", "dep:tokenizers", "dep:libloading"]
 
 [dev-dependencies]
 # The one skip helper, `inillucent_base::testing::skipping`.

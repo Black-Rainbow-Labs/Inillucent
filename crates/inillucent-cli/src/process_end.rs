@@ -1,33 +1,32 @@
 //! Ends the `inillucent` program with the exit code it chose, without letting Windows run library
-//! detach code after ONNX Runtime was loaded.
+//! detach code after ONNX Runtime's CUDA execution provider failed to start.
 //!
-//! Invariant: **a process that loaded ONNX Runtime, or tried to and failed, exits with the exit
-//! code it chose.** Before this, about 1 process in 300 that printed the refusal for an
-//! `INILLUCENT_EMBED_DEVICE` of `cuda:99` ended with `STATUS_ACCESS_VIOLATION` (0xC0000005) when
-//! many programs ran at once.
+//! Invariant: **a process that loaded ONNX Runtime exits with the exit code it chose.** In 2.8.0
+//! about 1 process in 300 that printed the refusal for an `INILLUCENT_EMBED_DEVICE` of `cuda:99`
+//! ended with `STATUS_ACCESS_VIOLATION` (0xC0000005) when many programs ran at once, and 2.8.0
+//! ended every process that had loaded ONNX Runtime with `TerminateProcess`.
 //!
 //! ## What a debugger showed
 //!
-//! Two crash dumps, taken with `cdb` under the same load, had one thread left. Both stopped in
-//! `ntdll!RtlFreeHeap` called from a library's `DLL_PROCESS_DETACH` code during `ExitProcess`: one
-//! from `dbghelp`'s `atexit` destructors, one from `KERNELBASE!TipInitialize`. The freed block held
-//! `0xbaadf00d`, the heap's marker for a corrupted free list, so the heap itself was already
-//! damaged when detach started.
-//!
-//! `ExitProcess` ends every other thread before it calls the detach code of the loaded libraries.
-//! The CUDA and ONNX Runtime threads that are running at that moment can be in the middle of a
-//! heap operation. The detach code of an unrelated library then frees into a heap in that state.
-//! The environment reference that `inillucent_core::exit_hook::keep_environment` holds stops
-//! `ort`'s own release from being the last one, but it cannot stop those threads or the libraries
-//! that ONNX Runtime pulled in from running their detach code.
+//! Two crash dumps had stopped in `ntdll!RtlFreeHeap`, called from an unrelated library's
+//! `DLL_PROCESS_DETACH` code, on a heap that was already damaged. Full page heap found what
+//! damaged it. `cdb` stops the process at its creation, sets page heap in the process's own
+//! `NtGlobalFlag` and full page heap in `verifier!AVrfDphGlobalFlags` before the first heap is
+//! made, which needs no administrator rights. Every `cuda:99` process then stops at exit on
+//! `lock xadd dword ptr [rbx+8]` in `onnxruntime_providers_cuda`, called from `onnxruntime.dll`'s
+//! own static destructors: the release of a static `std::shared_ptr` whose control block the
+//! provider had already freed. A run on the processor, a run on a card that exists, and a session
+//! dropped before exit all end cleanly under full page heap.
 //!
 //! ## What this does
 //!
-//! On Windows, when ONNX Runtime was loaded, [`finish`] flushes standard output and standard
-//! error and calls `TerminateProcess` on the current process with the exit code. That ends the
-//! process without running any detach code, so nothing frees into the damaged heap. It is only
-//! called from the end of `main` in the `inillucent` program, never from the library crates, so a
-//! program that embeds the library keeps the normal exit.
+//! `inillucent_core::cuda_probe` asks the NVIDIA driver how many cards there are and refuses a
+//! card that is not there before ONNX Runtime's CUDA provider is loaded, which removes the crash
+//! for every program that embeds the library. A card that is there and still fails to start goes
+//! through the provider, and on Windows, when that happened, [`finish`] flushes standard output
+//! and standard error and calls `TerminateProcess` with the exit code, so no detach code runs.
+//! Every other run, including every run on the processor, exits normally again. It is only called
+//! from the end of `main` in the `inillucent` program, never from the library crates.
 
 use std::process::ExitCode;
 
@@ -39,11 +38,11 @@ fn number_of(code: ExitCode) -> Option<u8> {
     (0..=u8::MAX).find(|candidate| ExitCode::from(*candidate) == code)
 }
 
-/// Whether this process loaded ONNX Runtime, or tried to and created its environment.
-fn onnx_runtime_was_loaded() -> bool {
+/// Whether ONNX Runtime's CUDA execution provider loaded in this process and failed to start.
+fn cuda_provider_failed() -> bool {
     #[cfg(feature = "embed")]
     {
-        inillucent_core::exit_hook::environment_was_created()
+        inillucent_core::exit_hook::cuda_provider_failed()
     }
     #[cfg(not(feature = "embed"))]
     {
@@ -79,7 +78,7 @@ fn terminate_now(_code: u8) {}
 /// Call it with the value `main` is about to return.
 /// @param code - the exit status the program chose
 pub fn finish(code: ExitCode) -> ExitCode {
-    if cfg!(windows) && onnx_runtime_was_loaded() {
+    if cfg!(windows) && cuda_provider_failed() {
         if let Some(number) = number_of(code) {
             terminate_now(number);
         }

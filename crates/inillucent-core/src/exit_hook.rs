@@ -108,13 +108,36 @@ pub fn keep_environment() {
     }
 }
 
-/// Whether this process created ONNX Runtime's environment, which means the library was loaded.
+/// Whether ONNX Runtime's CUDA execution provider was asked to start in this process.
+static CUDA_PROVIDER_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a session failed to open after the CUDA execution provider was asked to start.
+static CUDA_PROVIDER_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Records that ONNX Runtime's CUDA execution provider is about to be asked to start.
 ///
-/// A program that must end without running library detach code asks this first. It is true
-/// after a session opened and after a session failed to open, because both create the
-/// environment.
-pub fn environment_was_created() -> bool {
-    KEPT_ENVIRONMENT.get().is_some()
+/// Called after `cuda_probe` found the card, so the provider's library is about to load.
+pub fn note_cuda_provider_asked() {
+    CUDA_PROVIDER_ASKED.store(true, Ordering::SeqCst);
+}
+
+/// Records that a session failed to open, which matters only when the CUDA provider was asked.
+pub fn note_session_failed() {
+    if CUDA_PROVIDER_ASKED.load(Ordering::SeqCst) {
+        CUDA_PROVIDER_FAILED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Whether ONNX Runtime's CUDA execution provider loaded in this process and then failed to start.
+///
+/// **The one state in which ONNX Runtime damages the heap at exit.** Its CUDA provider releases a
+/// static `std::shared_ptr` whose control block it had already freed, from `onnxruntime.dll`'s own
+/// static destructors (see `cuda_probe`). A program that must not crash at exit ends without
+/// running library detach code when this is true; the `inillucent` command line does. A card that
+/// is not there is refused before the provider loads, so this is the rarer failure of a card that
+/// is there and still does not start.
+pub fn cuda_provider_failed() -> bool {
+    CUDA_PROVIDER_FAILED.load(Ordering::SeqCst)
 }
 
 /// Whether the process has started to exit.

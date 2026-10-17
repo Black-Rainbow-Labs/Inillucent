@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 26] = [
+const UNSAFE_ALLOWED: [&str; 27] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -148,6 +148,13 @@ const UNSAFE_ALLOWED: [&str; 26] = [
     // file holds one declaration and one call, the call carries its SAFETY note,
     // and the handler catches every panic so none can unwind into the C runtime.
     "crates/inillucent-core/src/exit_hook.rs",
+    // **Asking the NVIDIA driver how many cards there are, before ONNX Runtime is
+    // asked for one.** ONNX Runtime's CUDA provider writes into freed memory at exit
+    // when it loaded for a card that is not there, which full page heap shows on
+    // every such process. The driver API is C, so loading it and calling `cuInit`
+    // and `cuDeviceGetCount` is FFI: one library load and three calls, each with
+    // its SAFETY note, and nothing kept but the count.
+    "crates/inillucent-core/src/cuda_probe.rs",
     "crates/inillucent-cli/src/interrupt.rs",
     // **How much stack the running thread has, added by task-2191.** The
     // standard library cannot say, and `on_a_sized_stack` needs to know whether

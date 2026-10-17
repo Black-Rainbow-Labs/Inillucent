@@ -827,6 +827,15 @@ name = "memmap2"
 category = "os-boundary"
 allowed_in = ["inillucent-core"]
 
+# Only `inillucent-core`, behind its `onnx` feature, to load the NVIDIA driver
+# library and ask how many CUDA cards there are before ONNX Runtime is asked for
+# one (`src/cuda_probe.rs`). `ort` already links the same version for its
+# `load-dynamic` feature, so the build gains no crate.
+[[external]]
+name = "libloading"
+category = "os-boundary"
+allowed_in = ["inillucent-core"]
+
 [[external]]
 name = "rand"
 category = "numeric-kernel"
