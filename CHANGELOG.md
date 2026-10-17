@@ -8,6 +8,94 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## 2.8.1, 17 October 2026
+
+**`UNION ALL` with `OFFSET` no longer evaluates the select list of the rows it skips.** SQLite hands
+a `UNION ALL`'s `OFFSET` to its arms, and each arm counts a row off before it computes its result
+columns, so in `SELECT a, CASE WHEN a=3 THEN json('x') END FROM s UNION ALL SELECT 8, 9 LIMIT 1
+OFFSET 5` the skipped third row never runs `json('x')`. 2.8.0 did this for one `SELECT` and still
+projected every arm's rows before the compound applied its `OFFSET`, so the skipped row raised
+`malformed JSON`. The arms now share one count of rows to skip, and each arm skips below its
+projection when nothing above it decides which rows survive. An arm with `DISTINCT`, an aggregate
+or a window still counts the rows it answers, and `UNION`, `INTERSECT`, `EXCEPT` and a sorted
+compound still apply the `OFFSET` to the finished answer, as SQLite does. Nine differential cases
+compare it with SQLite, and four of them failed before this change.
+
+**`ntile` reads its bucket count from the first row of each partition.** SQLite takes the argument
+when it steps a partition's first row and never reads it again, so
+`ntile(CASE WHEN a > 10 THEN 0 ELSE 2 END) OVER ()` answers every row in two buckets. The engine
+read the count on every row and failed at the eleventh with `argument of ntile must be a positive
+integer`. A window function whose value fails over a partition it computes whole, such as any call
+`OVER ()`, returns no row of that partition before the error, as in SQLite; new differential and
+Rust driver cases check it through the shell and the driver.
+
+**FTS3 and FTS4 `MATCH` binds its operators the way SQLite does.** `OR` binds tighter than two
+words side by side, so `x y OR z` is `x AND (y OR z)` where FTS5 would read `(x AND y) OR z`. A
+`-` term is taken out of where it stands and applied to the whole query, so `x -y NEAR/3 w` is
+`(x NEAR/3 w) NOT y` and not `x NOT (y NEAR/3 w)`, and `-x y` is `y NOT x` where it was refused.
+Parentheses only separate words, a `-` directly before a word inside another (`x-y`) is a `-` term,
+and a column name after a `-` is a word. 15 FTS4 and 3 FTS3 queries in the usage corpus compare the
+answers with SQLite, and 17 of them differed from it in 2.8.0. An FTS5 table refuses a character that no FTS5
+token starts with, so `MATCH 'x NEAR/3 y'` is `fts5: syntax error near "/"`, as in SQLite, where it
+matched nothing.
+
+**A correlated subquery over a table with no index finds its rows by a hash table when its key is
+an expression of the outer row.** A block such as `EXISTS (SELECT 1 FROM i WHERE i.k = o.a + 1)` or
+`(SELECT v FROM i WHERE i.n = lower(o.name))` read its whole table for every outer row; only a bare
+outer column was a key. The block now computes the expression once per outer row and looks it up in
+the table it builds once per execution. An expression that fails is left to the scan, which fails
+on the same row, and a function whose answer can change between calls, such as `random()`, keeps
+the scan. At 20,000 rows in each table the `EXISTS` went from 11.0 s to 76 ms and the `lower()` key
+from 41.2 s to 61 ms. On the full gate `correlated.exists.expression` went from 0.08x to 1.22x and
+`correlated.scalar.expression` from 0.28x to 54x against SQLite.
+
+**`INSERT ... SELECT` into an empty table past 32 MiB is as fast as it was before 2.8.0 moved its
+source rows to a file.** The rows were read back from the file, built and checked once to find a
+failing row before anything was written, and then read, built and checked a second time to write
+them. The build now checks each row once as it writes it. A row that fails, or a rowid that does not
+increase, ends the input, the tree of the rows before it is finished and given back by the
+statement's undo, and the statement reports the failure or hands the rows to the row by row insert,
+as before. Copying 3,000,000 rows of an integer key, an integer and a short text, two runs of four
+after a quiet window: 2.7.0 0.75 to 0.79 s, 2.8.0 1.05 to 1.08 s, now 0.76 to 0.79 s. With an index on
+the target: 1.34 to 1.40 s, 1.80 to 1.98 s and 1.53 to 1.57 s; the rest of that difference is the
+index's sort writing runs to a file, which is what keeps its memory bounded. Peak memory is 2.8.0's:
+161 MB, and 199 MB with the index, against 550 MB and 598 MB in 2.7.0.
+
+**A CUDA card that the driver does not have is refused before ONNX Runtime's CUDA provider loads,
+and the command line exits normally again.** About one process in 300 that asked for
+`INILLUCENT_EMBED_DEVICE=cuda:99` crashed at exit, and 2.8.0 worked around it by ending every
+process that had loaded ONNX Runtime with `TerminateProcess`. Full page heap shows the cause:
+ONNX Runtime's CUDA provider, unloaded after it failed to start, releases a static `shared_ptr`
+whose control block it had already freed, and writes into freed memory. The engine now asks the
+NVIDIA driver (`nvcuda.dll` or `libcuda.so.1`) how many cards there are first, and refuses a card
+that is not there with the same message, so the provider never loads for it. That covers the C
+library and the packages that load it too, which had no workaround. The command line
+now ends with `TerminateProcess` only after a CUDA provider loaded and then failed to start; a run
+on the processor, on a card that exists, or with `on-demand` residency exits normally and runs clean
+under full page heap. 600 runs each: `cuda:99` exits 1 every time, the processor exits 0 every time.
+
+**A range `DELETE` through the `Connection` is level with SQLite.** Bug 40 was a measurement of
+2.4.2 at 0.30x. On 2.8.0, both engines on the performance cores, 10 rounds, two runs after a quiet
+window: 1.03x and 1.00x. It is closed with those numbers.
+
+**Single row inserts into an indexed table are about 2% faster, and into a table with a `UNIQUE`
+index about 4%.** Three costs added since 2.4.2 are gone. An append to a full leaf of wide rows
+tried a splice and a sizing pass before the split it was always going to take; after one failed
+pack the tree now splits its next appends at once. The leaf sizing pass and the encoder read every
+value of a row twice to work out the wide row threshold, which only matters for a value longer than
+64 bytes. A `UNIQUE` probe that missed searched the leaf again to see whether the key could
+continue in the next leaf, where one comparison answers it. Six alternating runs after a quiet
+window, 40 rounds each: `write.insert.batch` 2.33x to 2.36x on 2.8.0 and 2.36x to 2.39x now, against
+2.56x to 2.59x on 2.4.2. The rest of that difference is the per row cost of the format 4 leaf
+encoder (narrow integer slots and per value classes), which is part of the file format.
+
+**Bug 23 did not reproduce under heavier load.** One run of `durability::process_readers` on
+29 September 2026 lost an acknowledged row under 24 way parallel load. A stress harness,
+`tools/stress-process-readers.mjs`, runs the suite many times at once beside busy loops: 1,200
+rounds, 2,400 runs of a writer and four readers that resynchronise after every commit, six copies at
+once beside eight busy loops, found no lost row and no gap. With the 960 runs of the previous release
+that is 3,360 runs. There is no code change.
+
 ## 2.8.0, 14 October 2026
 
 **A query that fails partway returns the rows before the failure through the C library and the

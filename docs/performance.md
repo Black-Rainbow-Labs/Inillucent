@@ -114,6 +114,14 @@ The four correlated subquery workloads, which the contract does not weight, are 
 `correlated.exists` 198%, `correlated.in` 28%, `correlated.exists.selective` 134% and
 `correlated.scalar.selective` 90%.
 
+Two later correlated workloads find their rows by an equality with an expression of the outer row
+over a column with no index: `correlated.exists.expression` keys on `'note ' || (a.id * 7)` and
+`correlated.scalar.expression` on `'note ' || (a.id + 1)`. They are not in the run above. Measured
+on 17 October 2026, medium fixture, performance cores, 10 rounds, two runs of each build alternated:
+`correlated.exists.expression` went from 0.08x to 1.22x and `correlated.scalar.expression` from
+0.28x to 54x, because the block now reads its table once into a hash table keyed on the expression
+where it read the whole table for every outer row.
+
 The fastest workloads: `scan.aggregate` 5,436% faster, `point.miss` 5,112%, `large.read` 4,335%,
 `point.rowid` 3,597%, `scan.group` 2,694%, `join.selective` 2,447%, `point.index` 1,919% and
 `range.covering` 1,737%.

@@ -660,7 +660,11 @@ of two words. FTS3 and FTS4 tables use the same index as FTS5, with `docid`, `sn
 `offsets()` and `matchinfo()`. Their `MATCH` reads the query language SQLite builds them with. A
 leading `-` excludes a term, `OR` and `NEAR` or `NEAR/n` in capitals are operators, a bare `NEAR` is
 `NEAR/10`, and `AND` and `NOT` are ordinary words, so `MATCH 'x NOT y'` finds rows that hold all three
-words. An external content table takes its rows from the table or view named by `content=`, and a
+words. The operators bind as SQLite binds them: `NEAR` tightest, then `OR`, then two words side by
+side, so `x y OR z` is `x AND (y OR z)`. A `-` term is taken out of where it stands and applied to the
+whole query, so `x -y NEAR/3 w` is `(x NEAR/3 w) NOT y`, and `-x y` is `y NOT x`. Parentheses only
+separate words. An FTS5 table refuses a character no FTS5 token starts with, so `MATCH 'x NEAR/3
+y'` on an FTS5 table is `fts5: syntax error near "/"`, as in SQLite. An external content table takes its rows from the table or view named by `content=`, and a
 scan of the full text table reads that table or view whether or not the index holds the rows yet.
 
 A token longer than 1000 bytes is cut to its first 1000 bytes, in the index and in a query alike, so
