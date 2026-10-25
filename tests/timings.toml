@@ -22,19 +22,19 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-base::lib"
-milliseconds = 377
+milliseconds = 376
 
 [[timing]]
 target = "inillucent-bench::inillucent-bench"
-milliseconds = 303606
+milliseconds = 187514
 
 [[timing]]
 target = "inillucent-catalog::lib"
-milliseconds = 777
+milliseconds = 1278
 
 [[timing]]
 target = "inillucent-cli::inillucent"
-milliseconds = 25
+milliseconds = 176
 
 [[timing]]
 target = "inillucent-cli::inillucent-shell"
@@ -42,59 +42,71 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-cli::lib"
-milliseconds = 176
+milliseconds = 3278
+
+[[timing]]
+target = "inillucent-compat::differential::add_column"
+milliseconds = 38302
 
 [[timing]]
 target = "inillucent-compat::differential::advanced_sql"
-milliseconds = 218454
+milliseconds = 138898
 
 [[timing]]
 target = "inillucent-compat::differential::attach"
-milliseconds = 50319
+milliseconds = 43593
 
 [[timing]]
 target = "inillucent-compat::differential::bulk_insert"
-milliseconds = 53818
+milliseconds = 31134
 
 [[timing]]
 target = "inillucent-compat::differential::catalog"
-milliseconds = 10785
+milliseconds = 10841
 
 [[timing]]
 target = "inillucent-compat::differential::cli"
-milliseconds = 817872
+milliseconds = 585338
 
 [[timing]]
 target = "inillucent-compat::differential::differential"
-milliseconds = 91352
+milliseconds = 45942
 
 [[timing]]
 target = "inillucent-compat::differential::differential_part8"
-milliseconds = 89332
+milliseconds = 176234
 
 [[timing]]
 target = "inillucent-compat::differential::dml_differential"
-milliseconds = 121367
+milliseconds = 113968
 
 [[timing]]
 target = "inillucent-compat::differential::dml_subqueries"
-milliseconds = 17288
+milliseconds = 16329
 
 [[timing]]
 target = "inillucent-compat::differential::foreign_keys"
-milliseconds = 54823
+milliseconds = 37021
 
 [[timing]]
 target = "inillucent-compat::differential::fts5"
-milliseconds = 65828
+milliseconds = 41807
 
 [[timing]]
 target = "inillucent-compat::differential::fts5_parity"
-milliseconds = 424112
+milliseconds = 313057
 
 [[timing]]
 target = "inillucent-compat::differential::group_by"
-milliseconds = 4779
+milliseconds = 3793
+
+[[timing]]
+target = "inillucent-compat::differential::index_build_spill"
+milliseconds = 30797
+
+[[timing]]
+target = "inillucent-compat::differential::insert_select_spill"
+milliseconds = 66326
 
 [[timing]]
 target = "inillucent-compat::differential::json"
@@ -102,191 +114,215 @@ milliseconds = 4280
 
 [[timing]]
 target = "inillucent-compat::differential::lifecycle"
-milliseconds = 777
+milliseconds = 2298
 
 [[timing]]
 target = "inillucent-compat::differential::merge_join"
-milliseconds = 11783
+milliseconds = 12789
 
 [[timing]]
 target = "inillucent-compat::differential::migrate_sqlite"
-milliseconds = 75833
+milliseconds = 64300
 
 [[timing]]
 target = "inillucent-compat::differential::new_engine_ddl"
-milliseconds = 5781
+milliseconds = 64486
 
 [[timing]]
 target = "inillucent-compat::differential::new_engine_differential"
-milliseconds = 176
+milliseconds = 2278
 
 [[timing]]
 target = "inillucent-compat::differential::new_engine_extents"
-milliseconds = 17790
+milliseconds = 133676
 
 [[timing]]
 target = "inillucent-compat::differential::new_engine_long_keys"
-milliseconds = 46304
+milliseconds = 684769
 
 [[timing]]
 target = "inillucent-compat::differential::new_engine_pragma"
-milliseconds = 776
+milliseconds = 12287
 
 [[timing]]
 target = "inillucent-compat::differential::new_engine_vtab"
-milliseconds = 9784
+milliseconds = 218178
 
 [[timing]]
 target = "inillucent-compat::differential::new_engine_writes"
-milliseconds = 19291
+milliseconds = 162377
 
 [[timing]]
 target = "inillucent-compat::differential::numeric_text"
-milliseconds = 1277
+milliseconds = 1298
+
+[[timing]]
+target = "inillucent-compat::differential::operator_spill"
+milliseconds = 16302
 
 [[timing]]
 target = "inillucent-compat::differential::oracle"
-milliseconds = 376
-
-[[timing]]
-target = "inillucent-compat::differential::ordering"
-milliseconds = 78841
-
-[[timing]]
-target = "inillucent-compat::differential::planner"
-milliseconds = 23790
-
-[[timing]]
-target = "inillucent-compat::differential::pragma"
-milliseconds = 32804
-
-[[timing]]
-target = "inillucent-compat::differential::registers"
 milliseconds = 1277
 
 [[timing]]
+target = "inillucent-compat::differential::ordering"
+milliseconds = 48266
+
+[[timing]]
+target = "inillucent-compat::differential::partial_rows"
+milliseconds = 9782
+
+[[timing]]
+target = "inillucent-compat::differential::planner"
+milliseconds = 20807
+
+[[timing]]
+target = "inillucent-compat::differential::pragma"
+milliseconds = 24797
+
+[[timing]]
+target = "inillucent-compat::differential::registers"
+milliseconds = 2284
+
+[[timing]]
 target = "inillucent-compat::differential::result_names_and_codes"
-milliseconds = 10786
+milliseconds = 10790
 
 [[timing]]
 target = "inillucent-compat::differential::rowid_hint"
-milliseconds = 13283
+milliseconds = 13787
 
 [[timing]]
 target = "inillucent-compat::differential::rtree"
-milliseconds = 19791
+milliseconds = 16790
 
 [[timing]]
 target = "inillucent-compat::differential::schema_forms"
-milliseconds = 119866
+milliseconds = 114423
 
 [[timing]]
 target = "inillucent-compat::differential::semantics"
-milliseconds = 388529
+milliseconds = 401968
 
 [[timing]]
 target = "inillucent-compat::differential::services"
-milliseconds = 3278
+milliseconds = 1777
 
 [[timing]]
 target = "inillucent-compat::differential::syntax"
-milliseconds = 176
+milliseconds = 1277
 
 [[timing]]
 target = "inillucent-compat::differential::temp_objects"
-milliseconds = 9784
+milliseconds = 11285
 
 [[timing]]
 target = "inillucent-compat::differential::trigger_depth"
-milliseconds = 64330
+milliseconds = 30421
 
 [[timing]]
 target = "inillucent-compat::differential::usage_corpus"
 milliseconds = 331769
 
 [[timing]]
+target = "inillucent-compat::durability::add_column_crash"
+milliseconds = 164079
+
+[[timing]]
 target = "inillucent-compat::durability::auto_vacuum_crash"
-milliseconds = 688802
+milliseconds = 924135
 
 [[timing]]
 target = "inillucent-compat::durability::btree_model"
-milliseconds = 1778
+milliseconds = 2779
 
 [[timing]]
 target = "inillucent-compat::durability::bulk_build_crash"
-milliseconds = 59813
+milliseconds = 101599
 
 [[timing]]
 target = "inillucent-compat::durability::bulk_insert_crash"
-milliseconds = 64317
+milliseconds = 105679
 
 [[timing]]
 target = "inillucent-compat::durability::busy_timeout"
-milliseconds = 24798
+milliseconds = 18655
+
+[[timing]]
+target = "inillucent-compat::durability::checkpoint_sync_crash"
+milliseconds = 99751
 
 [[timing]]
 target = "inillucent-compat::durability::concurrency"
-milliseconds = 13286
+milliseconds = 16289
 
 [[timing]]
 target = "inillucent-compat::durability::corruption"
-milliseconds = 1354111
+milliseconds = 1132764
 
 [[timing]]
 target = "inillucent-compat::durability::durability"
-milliseconds = 1042446
+milliseconds = 1280123
 
 [[timing]]
 target = "inillucent-compat::durability::encrypted_crash"
-milliseconds = 174963
+milliseconds = 204823
 
 [[timing]]
 target = "inillucent-compat::durability::environment"
-milliseconds = 83825
+milliseconds = 82757
 
 [[timing]]
 target = "inillucent-compat::durability::fault_shapes"
-milliseconds = 17789
+milliseconds = 20902
 
 [[timing]]
 target = "inillucent-compat::durability::fault_sweep"
-milliseconds = 75
+milliseconds = 176
 
 [[timing]]
 target = "inillucent-compat::durability::faults"
-milliseconds = 25
+milliseconds = 176
 
 [[timing]]
 target = "inillucent-compat::durability::file_damage"
-milliseconds = 48311
+milliseconds = 44174
 
 [[timing]]
 target = "inillucent-compat::durability::fold_protocol"
-milliseconds = 777
+milliseconds = 376
 
 [[timing]]
 target = "inillucent-compat::durability::free_map_checkpoint_crash"
-milliseconds = 92338
+milliseconds = 158674
+
+[[timing]]
+target = "inillucent-compat::durability::journal_restore_oplock"
+milliseconds = 1777
 
 [[timing]]
 target = "inillucent-compat::durability::large_transactions"
-milliseconds = 10284
+milliseconds = 10784
 
 [[timing]]
 target = "inillucent-compat::durability::log_oplock"
-milliseconds = 28294
+milliseconds = 31704
+
+[[timing]]
+target = "inillucent-compat::durability::log_roll_between_connections"
+milliseconds = 16820
 
 [[timing]]
 target = "inillucent-compat::durability::logical_split_crash"
-milliseconds = 133078
+milliseconds = 287115
 
 [[timing]]
 target = "inillucent-compat::durability::long_key_crash"
-milliseconds = 241451
+milliseconds = 421861
 
 [[timing]]
 target = "inillucent-compat::durability::multi_database_crash"
-milliseconds = 71326
+milliseconds = 84328
 
 [[timing]]
 target = "inillucent-compat::durability::new_engine_free_map_recovery"
@@ -294,11 +330,15 @@ milliseconds = 75
 
 [[timing]]
 target = "inillucent-compat::durability::new_engine_recovery_shapes"
-milliseconds = 11810
+milliseconds = 16293
+
+[[timing]]
+target = "inillucent-compat::durability::open_beside_a_reader"
+milliseconds = 14286
 
 [[timing]]
 target = "inillucent-compat::durability::overflow_crash"
-milliseconds = 163879
+milliseconds = 210454
 
 [[timing]]
 target = "inillucent-compat::durability::phase2_campaigns"
@@ -306,39 +346,39 @@ milliseconds = 176
 
 [[timing]]
 target = "inillucent-compat::durability::process_campaign"
-milliseconds = 1108059
+milliseconds = 670557
 
 [[timing]]
 target = "inillucent-compat::durability::process_concurrency"
-milliseconds = 411531
+milliseconds = 399925
 
 [[timing]]
 target = "inillucent-compat::durability::process_crash"
-milliseconds = 852356
+milliseconds = 573109
 
 [[timing]]
 target = "inillucent-compat::durability::process_create"
-milliseconds = 147387
+milliseconds = 159943
 
 [[timing]]
 target = "inillucent-compat::durability::process_interleavings"
-milliseconds = 16788
+milliseconds = 17838
 
 [[timing]]
 target = "inillucent-compat::durability::process_journal_handoff"
-milliseconds = 87828
+milliseconds = 76442
 
 [[timing]]
 target = "inillucent-compat::durability::process_maintenance"
-milliseconds = 64319
+milliseconds = 29905
 
 [[timing]]
 target = "inillucent-compat::durability::process_readers"
-milliseconds = 231420
+milliseconds = 170554
 
 [[timing]]
 target = "inillucent-compat::durability::process_schema_change"
-milliseconds = 9281
+milliseconds = 12826
 
 [[timing]]
 target = "inillucent-compat::durability::process_storm"
@@ -346,19 +386,31 @@ milliseconds = 171478
 
 [[timing]]
 target = "inillucent-compat::durability::read_only_connection"
-milliseconds = 3278
+milliseconds = 4778
+
+[[timing]]
+target = "inillucent-compat::durability::recovery_discard_runs_once"
+milliseconds = 2778
 
 [[timing]]
 target = "inillucent-compat::durability::reindex_crash"
-milliseconds = 237926
+milliseconds = 398460
+
+[[timing]]
+target = "inillucent-compat::durability::restored_copy_under_newer_log"
+milliseconds = 7281
 
 [[timing]]
 target = "inillucent-compat::durability::reused_key_extent"
-milliseconds = 5280
+milliseconds = 5781
 
 [[timing]]
 target = "inillucent-compat::durability::search_crash"
-milliseconds = 324976
+milliseconds = 553317
+
+[[timing]]
+target = "inillucent-compat::durability::shared_page_leak"
+milliseconds = 1278
 
 [[timing]]
 target = "inillucent-compat::durability::storage_failure"
@@ -366,111 +418,131 @@ milliseconds = 777
 
 [[timing]]
 target = "inillucent-compat::durability::story_nikaya_crash"
-milliseconds = 45312
+milliseconds = 31513
+
+[[timing]]
+target = "inillucent-compat::durability::two_connections_end_a_transaction"
+milliseconds = 5279
 
 [[timing]]
 target = "inillucent-compat::durability::vacuum_crash"
-milliseconds = 436577
+milliseconds = 555206
 
 [[timing]]
 target = "inillucent-compat::durability::wal_crash"
-milliseconds = 300333
+milliseconds = 487068
+
+[[timing]]
+target = "inillucent-compat::durability::wide_row_crash"
+milliseconds = 202951
 
 [[timing]]
 target = "inillucent-compat::e2e::budgets"
-milliseconds = 7783
+milliseconds = 7782
 
 [[timing]]
 target = "inillucent-compat::e2e::cli_arguments"
-milliseconds = 777
+milliseconds = 1277
 
 [[timing]]
 target = "inillucent-compat::e2e::cli_batch"
-milliseconds = 6781
+milliseconds = 4278
 
 [[timing]]
 target = "inillucent-compat::e2e::cli_commands"
-milliseconds = 136868
+milliseconds = 285213
 
 [[timing]]
 target = "inillucent-compat::e2e::cli_round_trips"
-milliseconds = 17786
+milliseconds = 24447
 
 [[timing]]
 target = "inillucent-compat::e2e::confinement"
-milliseconds = 12786
+milliseconds = 13792
 
 [[timing]]
 target = "inillucent-compat::e2e::dot_commands"
-milliseconds = 16787
+milliseconds = 21808
 
 [[timing]]
 target = "inillucent-compat::e2e::format_three"
-milliseconds = 7279
+milliseconds = 9331
 
 [[timing]]
 target = "inillucent-compat::e2e::held_inserts"
-milliseconds = 31795
+milliseconds = 29798
 
 [[timing]]
 target = "inillucent-compat::e2e::mcp_cancel"
-milliseconds = 3779
+milliseconds = 3341
 
 [[timing]]
 target = "inillucent-compat::e2e::mcp_per_call"
-milliseconds = 9282
+milliseconds = 14787
 
 [[timing]]
 target = "inillucent-compat::e2e::mcp_replay"
-milliseconds = 4280
+milliseconds = 3299
 
 [[timing]]
 target = "inillucent-compat::e2e::mcp_session"
-milliseconds = 15789
+milliseconds = 16794
 
 [[timing]]
 target = "inillucent-compat::e2e::mcp_wire"
-milliseconds = 22791
+milliseconds = 19793
 
 [[timing]]
 target = "inillucent-compat::e2e::migrate_realistic"
-milliseconds = 30297
+milliseconds = 33362
 
 [[timing]]
 target = "inillucent-compat::e2e::release_format"
-milliseconds = 1309719
+milliseconds = 1028386
 
 [[timing]]
 target = "inillucent-compat::e2e::setup_embeddings"
-milliseconds = 777
+milliseconds = 1277
 
 [[timing]]
 target = "inillucent-compat::e2e::shell_command_line"
-milliseconds = 1276
+milliseconds = 16844
 
 [[timing]]
 target = "inillucent-compat::e2e::shell_output"
+milliseconds = 1278
+
+[[timing]]
+target = "inillucent-compat::e2e::sqlite_dump_load"
+milliseconds = 4780
+
+[[timing]]
+target = "inillucent-compat::engine::add_column_without_rewrite"
 milliseconds = 776
 
 [[timing]]
 target = "inillucent-compat::engine::analyze_reopen"
-milliseconds = 50320
+milliseconds = 29217
 
 [[timing]]
 target = "inillucent-compat::engine::analyze_same_session"
-milliseconds = 4780
+milliseconds = 2788
+
+[[timing]]
+target = "inillucent-compat::engine::append_load_density"
+milliseconds = 10785
 
 [[timing]]
 target = "inillucent-compat::engine::auto_vacuum"
-milliseconds = 7280
+milliseconds = 9285
 
 [[timing]]
 target = "inillucent-compat::engine::autoindex_reopen"
-milliseconds = 6782
+milliseconds = 7782
 
 [[timing]]
 target = "inillucent-compat::engine::automatic_index_answers"
-milliseconds = 6779
+milliseconds = 14790
 
 [[timing]]
 target = "inillucent-compat::engine::automatic_index_speed"
@@ -478,135 +550,159 @@ milliseconds = 5278
 
 [[timing]]
 target = "inillucent-compat::engine::budget"
-milliseconds = 2778
+milliseconds = 2794
 
 [[timing]]
 target = "inillucent-compat::engine::bulk_insert_storage"
-milliseconds = 14787
-
-[[timing]]
-target = "inillucent-compat::engine::bulk_write_log"
-milliseconds = 5280
-
-[[timing]]
-target = "inillucent-compat::engine::chunk_text"
-milliseconds = 1778
-
-[[timing]]
-target = "inillucent-compat::engine::compiled_chain_reuse"
-milliseconds = 39311
-
-[[timing]]
-target = "inillucent-compat::engine::conformance"
-milliseconds = 176
-
-[[timing]]
-target = "inillucent-compat::engine::delete_order"
-milliseconds = 5280
-
-[[timing]]
-target = "inillucent-compat::engine::dml"
-milliseconds = 13787
-
-[[timing]]
-target = "inillucent-compat::engine::embed_direct_only"
-milliseconds = 5280
-
-[[timing]]
-target = "inillucent-compat::engine::encryption_at_rest"
-milliseconds = 39300
-
-[[timing]]
-target = "inillucent-compat::engine::expression_index_covering"
-milliseconds = 2278
-
-[[timing]]
-target = "inillucent-compat::engine::format_refusal"
 milliseconds = 17790
 
 [[timing]]
+target = "inillucent-compat::engine::bulk_write_log"
+milliseconds = 5282
+
+[[timing]]
+target = "inillucent-compat::engine::chunk_text"
+milliseconds = 3778
+
+[[timing]]
+target = "inillucent-compat::engine::compiled_chain_reuse"
+milliseconds = 26201
+
+[[timing]]
+target = "inillucent-compat::engine::conformance"
+milliseconds = 1278
+
+[[timing]]
+target = "inillucent-compat::engine::connection_isolation"
+milliseconds = 6280
+
+[[timing]]
+target = "inillucent-compat::engine::delete_order"
+milliseconds = 4780
+
+[[timing]]
+target = "inillucent-compat::engine::derived_table_lookup_work"
+milliseconds = 777
+
+[[timing]]
+target = "inillucent-compat::engine::dml"
+milliseconds = 18792
+
+[[timing]]
+target = "inillucent-compat::engine::embed_direct_only"
+milliseconds = 3780
+
+[[timing]]
+target = "inillucent-compat::engine::encryption_at_rest"
+milliseconds = 171443
+
+[[timing]]
+target = "inillucent-compat::engine::expression_index_covering"
+milliseconds = 3301
+
+[[timing]]
+target = "inillucent-compat::engine::format_refusal"
+milliseconds = 11196
+
+[[timing]]
 target = "inillucent-compat::engine::fts5_bulk_edits"
-milliseconds = 9780
-
-[[timing]]
-target = "inillucent-compat::engine::fts5_legacy_layout"
-milliseconds = 9285
-
-[[timing]]
-target = "inillucent-compat::engine::functions"
-milliseconds = 16788
-
-[[timing]]
-target = "inillucent-compat::engine::hostile"
-milliseconds = 42309
-
-[[timing]]
-target = "inillucent-compat::engine::levers"
-milliseconds = 376
-
-[[timing]]
-target = "inillucent-compat::engine::limited_writes"
-milliseconds = 12787
-
-[[timing]]
-target = "inillucent-compat::engine::long_keys_at_every_page_size"
-milliseconds = 625768
-
-[[timing]]
-target = "inillucent-compat::engine::maintenance_speed"
-milliseconds = 5280
-
-[[timing]]
-target = "inillucent-compat::engine::max_page_count"
-milliseconds = 8281
-
-[[timing]]
-target = "inillucent-compat::engine::module_stages"
-milliseconds = 185922
-
-[[timing]]
-target = "inillucent-compat::engine::multi_database_commit"
 milliseconds = 13787
 
 [[timing]]
+target = "inillucent-compat::engine::fts5_commit_cost"
+milliseconds = 118629
+
+[[timing]]
+target = "inillucent-compat::engine::fts5_legacy_layout"
+milliseconds = 8783
+
+[[timing]]
+target = "inillucent-compat::engine::fts5_segments"
+milliseconds = 73032
+
+[[timing]]
+target = "inillucent-compat::engine::functions"
+milliseconds = 12296
+
+[[timing]]
+target = "inillucent-compat::engine::hostile"
+milliseconds = 34568
+
+[[timing]]
+target = "inillucent-compat::engine::import_memory"
+milliseconds = 4779
+
+[[timing]]
+target = "inillucent-compat::engine::levers"
+milliseconds = 8782
+
+[[timing]]
+target = "inillucent-compat::engine::limited_writes"
+milliseconds = 12286
+
+[[timing]]
+target = "inillucent-compat::engine::long_index_keys_small_page"
+milliseconds = 176
+
+[[timing]]
+target = "inillucent-compat::engine::long_keys_at_every_page_size"
+milliseconds = 394039
+
+[[timing]]
+target = "inillucent-compat::engine::maintenance_speed"
+milliseconds = 7809
+
+[[timing]]
+target = "inillucent-compat::engine::max_page_count"
+milliseconds = 13288
+
+[[timing]]
+target = "inillucent-compat::engine::module_stages"
+milliseconds = 108268
+
+[[timing]]
+target = "inillucent-compat::engine::multi_database_commit"
+milliseconds = 14290
+
+[[timing]]
 target = "inillucent-compat::engine::multi_database_names"
-milliseconds = 19790
+milliseconds = 15290
 
 [[timing]]
 target = "inillucent-compat::engine::multi_database_participants"
-milliseconds = 5281
+milliseconds = 4780
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_connect"
-milliseconds = 9284
+milliseconds = 8790
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_create"
-milliseconds = 29801
+milliseconds = 16400
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_explain"
-milliseconds = 6781
+milliseconds = 7282
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_extent_packing"
-milliseconds = 19789
+milliseconds = 23343
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_log_lead"
-milliseconds = 6782
+milliseconds = 6781
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_log_retire"
-milliseconds = 367037
+milliseconds = 251071
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_page_ownership"
-milliseconds = 4279
+milliseconds = 82527
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_rollback"
-milliseconds = 7282
+milliseconds = 7783
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_search"
@@ -614,55 +710,59 @@ milliseconds = 3780
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_slt"
-milliseconds = 76
+milliseconds = 2278
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_statement"
-milliseconds = 6280
+milliseconds = 7814
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_subquery"
-milliseconds = 22797
+milliseconds = 16836
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_surface"
-milliseconds = 93850
+milliseconds = 86962
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_tree_identity"
-milliseconds = 5281
+milliseconds = 4779
 
 [[timing]]
 target = "inillucent-compat::engine::new_engine_vtab_stream"
-milliseconds = 2778
+milliseconds = 2819
 
 [[timing]]
 target = "inillucent-compat::engine::order_limit_walk"
-milliseconds = 4278
+milliseconds = 6335
 
 [[timing]]
 target = "inillucent-compat::engine::page_sizes"
-milliseconds = 360507
+milliseconds = 282156
 
 [[timing]]
 target = "inillucent-compat::engine::plan_cache"
-milliseconds = 11786
+milliseconds = 9284
 
 [[timing]]
 target = "inillucent-compat::engine::planner_choices"
-milliseconds = 22790
+milliseconds = 23800
 
 [[timing]]
 target = "inillucent-compat::engine::pqs_differential"
-milliseconds = 8783
+milliseconds = 7780
 
 [[timing]]
 target = "inillucent-compat::engine::prepared_schema"
-milliseconds = 2778
+milliseconds = 1794
 
 [[timing]]
 target = "inillucent-compat::engine::put_stages"
-milliseconds = 127883
+milliseconds = 98603
+
+[[timing]]
+target = "inillucent-compat::engine::range_delete_work"
+milliseconds = 12283
 
 [[timing]]
 target = "inillucent-compat::engine::readonly_pragmas"
@@ -670,119 +770,163 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-compat::engine::reentrant_connection"
-milliseconds = 176
+milliseconds = 3778
 
 [[timing]]
 target = "inillucent-compat::engine::reindex_without_rowid"
-milliseconds = 6781
+milliseconds = 6281
 
 [[timing]]
-target = "inillucent-compat::engine::rowid_after_tail_delete"
-milliseconds = 4780
-
-[[timing]]
-target = "inillucent-compat::engine::schema_function_policy"
-milliseconds = 6782
-
-[[timing]]
-target = "inillucent-compat::engine::scratch_memory_flat"
-milliseconds = 6280
-
-[[timing]]
-target = "inillucent-compat::engine::search"
-milliseconds = 95350
-
-[[timing]]
-target = "inillucent-compat::engine::search_facet_compare"
-milliseconds = 13783
-
-[[timing]]
-target = "inillucent-compat::engine::search_fusion"
-milliseconds = 5780
-
-[[timing]]
-target = "inillucent-compat::engine::search_recall"
-milliseconds = 12282
-
-[[timing]]
-target = "inillucent-compat::engine::search_rerank"
-milliseconds = 4781
-
-[[timing]]
-target = "inillucent-compat::engine::segment_delta_chain"
-milliseconds = 10784
-
-[[timing]]
-target = "inillucent-compat::engine::segment_merge_bound"
-milliseconds = 9283
-
-[[timing]]
-target = "inillucent-compat::engine::segmented_generations"
-milliseconds = 17290
-
-[[timing]]
-target = "inillucent-compat::engine::space_reuse"
-milliseconds = 63826
-
-[[timing]]
-target = "inillucent-compat::engine::sql"
-milliseconds = 1278
-
-[[timing]]
-target = "inillucent-compat::engine::storage"
-milliseconds = 376
-
-[[timing]]
-target = "inillucent-compat::engine::subquery_values"
-milliseconds = 9785
-
-[[timing]]
-target = "inillucent-compat::engine::tlp_differential"
-milliseconds = 33803
-
-[[timing]]
-target = "inillucent-compat::engine::torn_page_with_image"
-milliseconds = 25
-
-[[timing]]
-target = "inillucent-compat::engine::unique_leaf_boundary"
-milliseconds = 9782
-
-[[timing]]
-target = "inillucent-compat::engine::usage_paths"
-milliseconds = 51813
-
-[[timing]]
-target = "inillucent-compat::engine::vacuum_on_vfs"
-milliseconds = 176
-
-[[timing]]
-target = "inillucent-compat::engine::vector"
-milliseconds = 187397
-
-[[timing]]
-target = "inillucent-compat::engine::vector_edges"
-milliseconds = 35801
-
-[[timing]]
-target = "inillucent-compat::engine::vector_metric"
-milliseconds = 94855
-
-[[timing]]
-target = "inillucent-compat::engine::vtab"
-milliseconds = 3779
-
-[[timing]]
-target = "inillucent-compat::engine::vtab_lifecycle"
+target = "inillucent-compat::engine::rollback_restores_modules"
 milliseconds = 3278
 
 [[timing]]
+target = "inillucent-compat::engine::rowid_after_tail_delete"
+milliseconds = 2778
+
+[[timing]]
+target = "inillucent-compat::engine::schema_function_policy"
+milliseconds = 5280
+
+[[timing]]
+target = "inillucent-compat::engine::scratch_memory_flat"
+milliseconds = 9783
+
+[[timing]]
+target = "inillucent-compat::engine::search"
+milliseconds = 95301
+
+[[timing]]
+target = "inillucent-compat::engine::search_facet_compare"
+milliseconds = 15289
+
+[[timing]]
+target = "inillucent-compat::engine::search_facet_filter"
+milliseconds = 7280
+
+[[timing]]
+target = "inillucent-compat::engine::search_fusion"
+milliseconds = 4779
+
+[[timing]]
+target = "inillucent-compat::engine::search_recall"
+milliseconds = 14793
+
+[[timing]]
+target = "inillucent-compat::engine::search_rerank"
+milliseconds = 3794
+
+[[timing]]
+target = "inillucent-compat::engine::search_tokenizer"
+milliseconds = 5779
+
+[[timing]]
+target = "inillucent-compat::engine::segment_delta_chain"
+milliseconds = 12814
+
+[[timing]]
+target = "inillucent-compat::engine::segment_merge_bound"
+milliseconds = 8782
+
+[[timing]]
+target = "inillucent-compat::engine::segmented_generations"
+milliseconds = 12433
+
+[[timing]]
+target = "inillucent-compat::engine::space_reuse"
+milliseconds = 48231
+
+[[timing]]
+target = "inillucent-compat::engine::spill_memory"
+milliseconds = 75629
+
+[[timing]]
+target = "inillucent-compat::engine::sql"
+milliseconds = 17325
+
+[[timing]]
+target = "inillucent-compat::engine::storage"
+milliseconds = 3279
+
+[[timing]]
+target = "inillucent-compat::engine::streaming_memory"
+milliseconds = 8280
+
+[[timing]]
+target = "inillucent-compat::engine::streaming_rows"
+milliseconds = 13285
+
+[[timing]]
+target = "inillucent-compat::engine::subquery_values"
+milliseconds = 7784
+
+[[timing]]
+target = "inillucent-compat::engine::tlp_differential"
+milliseconds = 26803
+
+[[timing]]
+target = "inillucent-compat::engine::torn_page_with_image"
+milliseconds = 176
+
+[[timing]]
+target = "inillucent-compat::engine::transaction_memory"
+milliseconds = 21791
+
+[[timing]]
+target = "inillucent-compat::engine::unique_leaf_boundary"
+milliseconds = 13788
+
+[[timing]]
+target = "inillucent-compat::engine::usage_paths"
+milliseconds = 41436
+
+[[timing]]
+target = "inillucent-compat::engine::vacuum_attached_database"
+milliseconds = 8782
+
+[[timing]]
+target = "inillucent-compat::engine::vacuum_on_vfs"
+milliseconds = 4280
+
+[[timing]]
+target = "inillucent-compat::engine::vector"
+milliseconds = 140712
+
+[[timing]]
+target = "inillucent-compat::engine::vector_edges"
+milliseconds = 28839
+
+[[timing]]
+target = "inillucent-compat::engine::vector_index_agreement"
+milliseconds = 4779
+
+[[timing]]
+target = "inillucent-compat::engine::vector_metric"
+milliseconds = 47665
+
+[[timing]]
+target = "inillucent-compat::engine::vector_rename"
+milliseconds = 5279
+
+[[timing]]
+target = "inillucent-compat::engine::vtab"
+milliseconds = 4810
+
+[[timing]]
+target = "inillucent-compat::engine::vtab_lifecycle"
+milliseconds = 3801
+
+[[timing]]
 target = "inillucent-compat::engine::vtab_refused_connect"
-milliseconds = 4278
+milliseconds = 3808
 
 [[timing]]
 target = "inillucent-compat::engine::wal"
-milliseconds = 9785
+milliseconds = 7784
+
+[[timing]]
+target = "inillucent-compat::engine::wide_rows"
+milliseconds = 3278
 
 [[timing]]
 target = "inillucent-compat::inillucent-perfhistory"
@@ -790,463 +934,463 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-compat::lib"
-milliseconds = 18287
+milliseconds = 17794
 
 [[timing]]
 target = "inillucent-compat::matrix::compound"
-milliseconds = 153379
+milliseconds = 132320
 
 [[timing]]
 target = "inillucent-compat::matrix::constraint"
-milliseconds = 199929
+milliseconds = 181361
 
 [[timing]]
 target = "inillucent-compat::matrix::cte"
-milliseconds = 147872
+milliseconds = 145797
 
 [[timing]]
 target = "inillucent-compat::matrix::ddl_index"
-milliseconds = 192397
+milliseconds = 246736
 
 [[timing]]
 target = "inillucent-compat::matrix::ddl_table#0/2"
-milliseconds = 238953
+milliseconds = 205620
 
 [[timing]]
 target = "inillucent-compat::matrix::ddl_table#1/2"
-milliseconds = 193407
+milliseconds = 212897
 
 [[timing]]
 target = "inillucent-compat::matrix::ddl_view"
-milliseconds = 208436
+milliseconds = 215200
 
 [[timing]]
 target = "inillucent-compat::matrix::delete#0/2"
-milliseconds = 90834
+milliseconds = 86069
 
 [[timing]]
 target = "inillucent-compat::matrix::delete#1/2"
-milliseconds = 132364
+milliseconds = 170003
 
 [[timing]]
 target = "inillucent-compat::matrix::expression#0/2"
-milliseconds = 150872
+milliseconds = 159388
 
 [[timing]]
 target = "inillucent-compat::matrix::expression#1/2"
-milliseconds = 174913
+milliseconds = 146619
 
 [[timing]]
 target = "inillucent-compat::matrix::function#0/2"
-milliseconds = 154374
+milliseconds = 165547
 
 [[timing]]
 target = "inillucent-compat::matrix::function#1/2"
-milliseconds = 147368
+milliseconds = 134646
 
 [[timing]]
 target = "inillucent-compat::matrix::insert#0/2"
-milliseconds = 138367
+milliseconds = 186725
 
 [[timing]]
 target = "inillucent-compat::matrix::insert#1/2"
-milliseconds = 232422
+milliseconds = 208765
 
 [[timing]]
 target = "inillucent-compat::matrix::join"
-milliseconds = 192899
+milliseconds = 166668
 
 [[timing]]
 target = "inillucent-compat::matrix::lists"
-milliseconds = 3277
+milliseconds = 784243
 
 [[timing]]
 target = "inillucent-compat::matrix::maintenance"
-milliseconds = 228930
+milliseconds = 253774
 
 [[timing]]
 target = "inillucent-compat::matrix::pragma"
-milliseconds = 75326
+milliseconds = 90383
 
 [[timing]]
 target = "inillucent-compat::matrix::retained#0/3"
-milliseconds = 165411
+milliseconds = 223627
 
 [[timing]]
 target = "inillucent-compat::matrix::retained#1/3"
-milliseconds = 214416
+milliseconds = 231301
 
 [[timing]]
 target = "inillucent-compat::matrix::retained#2/3"
-milliseconds = 126856
+milliseconds = 213082
 
 [[timing]]
 target = "inillucent-compat::matrix::schema"
-milliseconds = 103855
+milliseconds = 84225
 
 [[timing]]
 target = "inillucent-compat::matrix::select#0/2"
-milliseconds = 137862
+milliseconds = 153619
 
 [[timing]]
 target = "inillucent-compat::matrix::select#1/2"
-milliseconds = 112353
+milliseconds = 139683
 
 [[timing]]
 target = "inillucent-compat::matrix::subquery"
-milliseconds = 146369
+milliseconds = 161762
 
 [[timing]]
 target = "inillucent-compat::matrix::transaction"
-milliseconds = 115354
+milliseconds = 137735
 
 [[timing]]
 target = "inillucent-compat::matrix::trigger#0/2"
-milliseconds = 224416
+milliseconds = 274022
 
 [[timing]]
 target = "inillucent-compat::matrix::trigger#1/2"
-milliseconds = 203905
+milliseconds = 229135
 
 [[timing]]
 target = "inillucent-compat::matrix::update#0/2"
-milliseconds = 172896
+milliseconds = 229894
 
 [[timing]]
 target = "inillucent-compat::matrix::update#1/2"
-milliseconds = 154375
+milliseconds = 216310
 
 [[timing]]
 target = "inillucent-compat::matrix::vector"
-milliseconds = 17790
+milliseconds = 13976
 
 [[timing]]
 target = "inillucent-compat::matrix::vtab"
-milliseconds = 70319
+milliseconds = 60100
 
 [[timing]]
 target = "inillucent-compat::matrix::window"
-milliseconds = 245961
+milliseconds = 154388
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::compound#0/3"
-milliseconds = 1902646
+milliseconds = 1573055
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::compound#1/3"
-milliseconds = 2020603
+milliseconds = 1731437
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::compound#2/3"
-milliseconds = 1843466
+milliseconds = 1488024
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::constraint#0/2"
-milliseconds = 694021
+milliseconds = 552911
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::constraint#1/2"
-milliseconds = 919779
+milliseconds = 691579
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::cte#0/4"
-milliseconds = 1301125
+milliseconds = 1164419
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::cte#1/4"
-milliseconds = 1372634
+milliseconds = 796951
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::cte#2/4"
-milliseconds = 1669844
+milliseconds = 1280415
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::cte#3/4"
-milliseconds = 1528304
+milliseconds = 1167779
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::ddl_index#0/2"
-milliseconds = 1066939
+milliseconds = 824573
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::ddl_index#1/2"
-milliseconds = 1325665
+milliseconds = 1134970
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::ddl_table#0/3"
-milliseconds = 1535322
+milliseconds = 1402525
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::ddl_table#1/3"
-milliseconds = 1442830
+milliseconds = 1308715
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::ddl_table#2/3"
-milliseconds = 2056300
+milliseconds = 1918405
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::ddl_view#0/2"
-milliseconds = 1364639
+milliseconds = 1141031
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::ddl_view#1/2"
-milliseconds = 1712754
+milliseconds = 1326281
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::delete#0/3"
-milliseconds = 1309097
+milliseconds = 1088814
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::delete#1/3"
-milliseconds = 1165524
+milliseconds = 899224
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::delete#2/3"
-milliseconds = 951893
+milliseconds = 642342
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#0/8"
-milliseconds = 1739296
+milliseconds = 1413577
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#1/8"
-milliseconds = 1905788
+milliseconds = 1737881
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#2/8"
-milliseconds = 1921535
+milliseconds = 1961868
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#3/8"
-milliseconds = 1765496
+milliseconds = 1459927
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#4/8"
-milliseconds = 1775141
+milliseconds = 1569831
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#5/8"
-milliseconds = 400150
+milliseconds = 1785332
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#6/8"
-milliseconds = 1891063
+milliseconds = 1767884
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::expression#7/8"
-milliseconds = 2411145
+milliseconds = 2014377
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::function#0/6"
-milliseconds = 2080269
+milliseconds = 2019076
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::function#1/6"
-milliseconds = 2030770
+milliseconds = 1993878
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::function#2/6"
-milliseconds = 2078992
+milliseconds = 2110279
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::function#3/6"
-milliseconds = 1954081
+milliseconds = 1941916
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::function#4/6"
-milliseconds = 1952737
+milliseconds = 1903107
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::function#5/6"
-milliseconds = 2269606
+milliseconds = 2204520
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::insert#0/4"
-milliseconds = 1377239
+milliseconds = 1195264
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::insert#1/4"
-milliseconds = 1371704
+milliseconds = 1162069
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::insert#2/4"
-milliseconds = 1237579
+milliseconds = 945284
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::insert#3/4"
-milliseconds = 1607805
+milliseconds = 1380727
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::join#0/4"
-milliseconds = 1388062
+milliseconds = 1251166
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::join#1/4"
-milliseconds = 1563294
+milliseconds = 1328931
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::join#2/4"
-milliseconds = 1586293
+milliseconds = 1379160
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::join#3/4"
-milliseconds = 1491504
+milliseconds = 1069769
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::maintenance#0/2"
-milliseconds = 1281096
+milliseconds = 1020751
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::maintenance#1/2"
-milliseconds = 1393660
+milliseconds = 1165024
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::pragma"
-milliseconds = 971400
+milliseconds = 761194
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::retained"
-milliseconds = 484636
+milliseconds = 452222
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::schema"
-milliseconds = 793200
+milliseconds = 562584
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::select#0/4"
-milliseconds = 1796343
+milliseconds = 1442617
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::select#1/4"
-milliseconds = 1878247
+milliseconds = 1542899
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::select#2/4"
-milliseconds = 1654158
+milliseconds = 1614385
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::select#3/4"
-milliseconds = 1559316
+milliseconds = 1482056
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::subquery#0/4"
-milliseconds = 1763881
+milliseconds = 1387610
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::subquery#1/4"
-milliseconds = 1653841
+milliseconds = 895520
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::subquery#2/4"
-milliseconds = 1692378
+milliseconds = 1432077
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::subquery#3/4"
-milliseconds = 1738883
+milliseconds = 926312
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#0/8"
-milliseconds = 510569
+milliseconds = 412315
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#1/8"
-milliseconds = 453805
+milliseconds = 423266
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#2/8"
-milliseconds = 530124
+milliseconds = 502257
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#3/8"
-milliseconds = 424100
+milliseconds = 416581
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#4/8"
-milliseconds = 454563
+milliseconds = 456560
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#5/8"
-milliseconds = 443911
+milliseconds = 416764
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#6/8"
-milliseconds = 470537
+milliseconds = 422414
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::surfaces#7/8"
-milliseconds = 497604
+milliseconds = 446157
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::transaction#0/2"
-milliseconds = 533627
+milliseconds = 474660
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::transaction#1/2"
-milliseconds = 802604
+milliseconds = 591234
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::trigger#0/3"
-milliseconds = 1661895
+milliseconds = 1466615
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::trigger#1/3"
-milliseconds = 1557832
+milliseconds = 1314370
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::trigger#2/3"
-milliseconds = 1716507
+milliseconds = 1314792
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::update#0/3"
-milliseconds = 2043948
+milliseconds = 1763295
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::update#1/3"
-milliseconds = 1942344
+milliseconds = 1587238
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::update#2/3"
-milliseconds = 1289115
+milliseconds = 1068301
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::vector"
-milliseconds = 183421
+milliseconds = 180354
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::vtab"
-milliseconds = 1047942
+milliseconds = 724240
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::window#0/6"
-milliseconds = 1751900
+milliseconds = 1471399
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::window#1/6"
-milliseconds = 2002619
+milliseconds = 1728231
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::window#2/6"
-milliseconds = 1666337
+milliseconds = 1452667
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::window#3/6"
-milliseconds = 1715377
+milliseconds = 1430323
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::window#4/6"
-milliseconds = 1591108
+milliseconds = 1493609
 
 [[timing]]
 target = "inillucent-compat::matrix_deep::window#5/6"
-milliseconds = 1316155
+milliseconds = 1147069
 
 [[timing]]
 target = "inillucent-compat::nightly::free_map_page_at_the_end"
-milliseconds = 18287
+milliseconds = 29065
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#0/20"
-milliseconds = 16287803
+milliseconds = 13376289
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#0/8"
@@ -1254,7 +1398,7 @@ milliseconds = 3637612
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#1/20"
-milliseconds = 17510999
+milliseconds = 14649332
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#1/8"
@@ -1262,47 +1406,47 @@ milliseconds = 3596070
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#10/20"
-milliseconds = 17314089
+milliseconds = 14657400
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#11/20"
-milliseconds = 16735550
+milliseconds = 13757633
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#12/20"
-milliseconds = 2709506
+milliseconds = 10709412
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#13/20"
-milliseconds = 16257275
+milliseconds = 13498901
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#14/20"
-milliseconds = 16884656
+milliseconds = 14049861
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#15/20"
-milliseconds = 16657034
+milliseconds = 13865179
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#16/20"
-milliseconds = 2480670
+milliseconds = 10381678
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#17/20"
-milliseconds = 16687559
+milliseconds = 13990495
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#18/20"
-milliseconds = 16845211
+milliseconds = 14306552
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#19/20"
-milliseconds = 17280853
+milliseconds = 14700371
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#2/20"
-milliseconds = 16287308
+milliseconds = 13402804
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#2/8"
@@ -1310,7 +1454,7 @@ milliseconds = 3688136
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#3/20"
-milliseconds = 11045529
+milliseconds = 12791346
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#3/8"
@@ -1318,7 +1462,7 @@ milliseconds = 3596579
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#4/20"
-milliseconds = 17027287
+milliseconds = 14125013
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#4/8"
@@ -1326,7 +1470,7 @@ milliseconds = 3727162
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#5/20"
-milliseconds = 16575965
+milliseconds = 13552880
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#5/8"
@@ -1334,7 +1478,7 @@ milliseconds = 3460486
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#6/20"
-milliseconds = 16514428
+milliseconds = 13479390
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#6/8"
@@ -1342,7 +1486,7 @@ milliseconds = 3678628
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#7/20"
-milliseconds = 15845040
+milliseconds = 13037167
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#7/8"
@@ -1350,43 +1494,51 @@ milliseconds = 3553540
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#8/20"
-milliseconds = 16751601
+milliseconds = 13679504
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix#9/20"
-milliseconds = 10639276
+milliseconds = 12471749
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix_random#0/4"
-milliseconds = 1587674
+milliseconds = 1375313
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix_random#1/4"
-milliseconds = 1570610
+milliseconds = 1409410
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix_random#2/4"
-milliseconds = 1583782
+milliseconds = 1396550
 
 [[timing]]
 target = "inillucent-compat::nightly::matrix_random#3/4"
-milliseconds = 1406799
+milliseconds = 1328886
 
 [[timing]]
 target = "inillucent-compat::nightly::release_format_history"
-milliseconds = 576674
+milliseconds = 719465
+
+[[timing]]
+target = "inillucent-compat::nightly::research_corpus"
+milliseconds = 632714
+
+[[timing]]
+target = "inillucent-compat::nightly::storm_nightly"
+milliseconds = 674720
 
 [[timing]]
 target = "inillucent-compat::nightly::story_large_table_nightly"
-milliseconds = 170381
+milliseconds = 220216
 
 [[timing]]
 target = "inillucent-compat::perf::processor_share"
-milliseconds = 8280
+milliseconds = 8281
 
 [[timing]]
 target = "inillucent-compat::retrieval::bulk_embed"
-milliseconds = 135477
+milliseconds = 252971
 
 [[timing]]
 target = "inillucent-compat::retrieval::bulk_embed_cuda"
@@ -1394,19 +1546,19 @@ milliseconds = 32002
 
 [[timing]]
 target = "inillucent-compat::retrieval::embed_settings"
-milliseconds = 4811
+milliseconds = 46035
 
 [[timing]]
 target = "inillucent-compat::retrieval::rag_verify"
-milliseconds = 72925
+milliseconds = 106738
 
 [[timing]]
 target = "inillucent-compat::retrieval::rerank"
-milliseconds = 17817
+milliseconds = 28665
 
 [[timing]]
 target = "inillucent-compat::retrieval::rerank_absent"
-milliseconds = 3278
+milliseconds = 2785
 
 [[timing]]
 target = "inillucent-compat::tooling::affinity"
@@ -1414,15 +1566,15 @@ milliseconds = 76
 
 [[timing]]
 target = "inillucent-compat::tooling::ci_workflows"
-milliseconds = 25
+milliseconds = 75
 
 [[timing]]
 target = "inillucent-compat::tooling::cli_import"
-milliseconds = 777
+milliseconds = 792
 
 [[timing]]
 target = "inillucent-compat::tooling::command_parity"
-milliseconds = 25
+milliseconds = 76
 
 [[timing]]
 target = "inillucent-compat::tooling::coverage_floor"
@@ -1434,7 +1586,7 @@ milliseconds = 176
 
 [[timing]]
 target = "inillucent-compat::tooling::documentation"
-milliseconds = 777
+milliseconds = 2778
 
 [[timing]]
 target = "inillucent-compat::tooling::escapes"
@@ -1442,31 +1594,31 @@ milliseconds = 76
 
 [[timing]]
 target = "inillucent-compat::tooling::gates_fail_closed"
-milliseconds = 80832
+milliseconds = 890943
 
 [[timing]]
 target = "inillucent-compat::tooling::harness"
-milliseconds = 47808
+milliseconds = 28268
 
 [[timing]]
 target = "inillucent-compat::tooling::matrix_inventory"
-milliseconds = 2778
+milliseconds = 4805
 
 [[timing]]
 target = "inillucent-compat::tooling::policy"
-milliseconds = 124355
+milliseconds = 244017
 
 [[timing]]
 target = "inillucent-compat::tooling::scenarios"
-milliseconds = 25
+milliseconds = 75
 
 [[timing]]
 target = "inillucent-compat::tooling::selection"
-milliseconds = 377
+milliseconds = 776
 
 [[timing]]
 target = "inillucent-compat::tooling::string_literals"
-milliseconds = 1277
+milliseconds = 19358
 
 [[timing]]
 target = "inillucent-compat::tooling::workload_freshness"
@@ -1474,91 +1626,95 @@ milliseconds = 788
 
 [[timing]]
 target = "inillucent-core::lib"
-milliseconds = 70021
+milliseconds = 106508
 
 [[timing]]
 target = "inillucent-driver-capi::abi"
-milliseconds = 25
+milliseconds = 777
 
 [[timing]]
 target = "inillucent-driver-capi::conformance"
-milliseconds = 227982
+milliseconds = 290909
 
 [[timing]]
 target = "inillucent-driver-capi::lib"
-milliseconds = 777
+milliseconds = 2278
 
 [[timing]]
 target = "inillucent-driver-capi::python_conformance"
-milliseconds = 36798
+milliseconds = 162023
 
 [[timing]]
 target = "inillucent-driver::capability"
-milliseconds = 777
+milliseconds = 45816
 
 [[timing]]
 target = "inillucent-driver::conformance"
-milliseconds = 777
+milliseconds = 36323
 
 [[timing]]
 target = "inillucent-driver::import"
-milliseconds = 777
+milliseconds = 5280
 
 [[timing]]
 target = "inillucent-driver::lib"
 milliseconds = 25
 
 [[timing]]
+target = "inillucent-driver::partial_rows"
+milliseconds = 6281
+
+[[timing]]
 target = "inillucent-driver::session"
-milliseconds = 175
+milliseconds = 2278
 
 [[timing]]
 target = "inillucent-driver::statement"
-milliseconds = 18291
+milliseconds = 16318
 
 [[timing]]
 target = "inillucent-driver::threads"
-milliseconds = 11786
+milliseconds = 526640
 
 [[timing]]
 target = "inillucent-driver::transaction"
-milliseconds = 8782
+milliseconds = 13288
 
 [[timing]]
 target = "inillucent-engine::lib"
-milliseconds = 92856
+milliseconds = 49562
 
 [[timing]]
 target = "inillucent-exec::lib"
-milliseconds = 75
+milliseconds = 376
 
 [[timing]]
 target = "inillucent-ext::lib"
-milliseconds = 176
+milliseconds = 777
 
 [[timing]]
 target = "inillucent-migrate::cli"
-milliseconds = 4780
+milliseconds = 4835
 
 [[timing]]
 target = "inillucent-migrate::corpus"
-milliseconds = 22295
+milliseconds = 27880
 
 [[timing]]
 target = "inillucent-migrate::equivalence"
-milliseconds = 4780
+milliseconds = 4790
 
 [[timing]]
 target = "inillucent-migrate::lib"
-milliseconds = 6781
+milliseconds = 6782
 
 [[timing]]
 target = "inillucent-migrate::migration"
-milliseconds = 32802
+milliseconds = 26806
 
 [[timing]]
 target = "inillucent-model::campaign"
-milliseconds = 75
+milliseconds = 777
 
 [[timing]]
 target = "inillucent-model::lib"
@@ -1566,7 +1722,7 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-model::logical_split_crash"
-milliseconds = 777
+milliseconds = 1277
 
 [[timing]]
 target = "inillucent-model::minimal"
@@ -1574,15 +1730,15 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-model::redo_bytes"
-milliseconds = 176
+milliseconds = 780
 
 [[timing]]
 target = "inillucent-pool::fault_campaign"
-milliseconds = 777
+milliseconds = 377
 
 [[timing]]
 target = "inillucent-pool::fuzz_seeded"
-milliseconds = 25
+milliseconds = 75
 
 [[timing]]
 target = "inillucent-pool::journal_ordering"
@@ -1590,19 +1746,19 @@ milliseconds = 6782
 
 [[timing]]
 target = "inillucent-pool::lease"
-milliseconds = 76
+milliseconds = 777
 
 [[timing]]
 target = "inillucent-pool::lib"
-milliseconds = 5781
+milliseconds = 5780
 
 [[timing]]
 target = "inillucent-remote::budget"
-milliseconds = 75834
+milliseconds = 51080
 
 [[timing]]
 target = "inillucent-remote::lib"
-milliseconds = 5280
+milliseconds = 6354
 
 [[timing]]
 target = "inillucent-remote::live_mysql"
@@ -1614,11 +1770,11 @@ milliseconds = 16
 
 [[timing]]
 target = "inillucent-remote::procedure"
-milliseconds = 777
+milliseconds = 9292
 
 [[timing]]
 target = "inillucent-remote::protocol"
-milliseconds = 777
+milliseconds = 13788
 
 [[timing]]
 target = "inillucent-remote::transport"
@@ -1634,23 +1790,23 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-sim::lib"
-milliseconds = 25
-
-[[timing]]
-target = "inillucent-sim::simulator"
 milliseconds = 76
 
 [[timing]]
+target = "inillucent-sim::simulator"
+milliseconds = 176
+
+[[timing]]
 target = "inillucent-sql::lib"
-milliseconds = 25
+milliseconds = 376
 
 [[timing]]
 target = "inillucent-sqlite-reader::lib"
-milliseconds = 25
+milliseconds = 178
 
 [[timing]]
 target = "inillucent-storage::lib"
-milliseconds = 176
+milliseconds = 1278
 
 [[timing]]
 target = "inillucent-transaction::lib"
@@ -1658,7 +1814,7 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-tree::fuzz_seeded"
-milliseconds = 176
+milliseconds = 377
 
 [[timing]]
 target = "inillucent-tree::lib"
@@ -1666,11 +1822,15 @@ milliseconds = 376
 
 [[timing]]
 target = "inillucent-tree::long_keys"
-milliseconds = 75
+milliseconds = 376
 
 [[timing]]
 target = "inillucent-tree::relocate"
-milliseconds = 176
+milliseconds = 377
+
+[[timing]]
+target = "inillucent-tree::short_leaves"
+milliseconds = 776
 
 [[timing]]
 target = "inillucent-tree::value_round_trip"
@@ -1678,31 +1838,31 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-tree::write_campaign"
-milliseconds = 377
+milliseconds = 1314
 
 [[timing]]
 target = "inillucent-txn::durability"
-milliseconds = 75
+milliseconds = 176
 
 [[timing]]
 target = "inillucent-txn::lib"
-milliseconds = 376
+milliseconds = 778
 
 [[timing]]
 target = "inillucent-txn::transactions"
-milliseconds = 176
+milliseconds = 76
 
 [[timing]]
 target = "inillucent-value::lib"
-milliseconds = 176
+milliseconds = 377
 
 [[timing]]
 target = "inillucent-vfs::conformance"
-milliseconds = 376
+milliseconds = 2288
 
 [[timing]]
 target = "inillucent-vfs::crypt"
-milliseconds = 776
+milliseconds = 2785
 
 [[timing]]
 target = "inillucent-vfs::lib"
@@ -1714,11 +1874,11 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent-vfs::windows_locks"
-milliseconds = 25
+milliseconds = 1277
 
 [[timing]]
 target = "inillucent-wal::fuzz_seeded"
-milliseconds = 25
+milliseconds = 777
 
 [[timing]]
 target = "inillucent-wal::lib"
@@ -1730,7 +1890,7 @@ milliseconds = 777
 
 [[timing]]
 target = "inillucent-wal::recovery"
-milliseconds = 75
+milliseconds = 176
 
 [[timing]]
 target = "inillucent-wal::wal_model"
@@ -1738,27 +1898,27 @@ milliseconds = 75
 
 [[timing]]
 target = "inillucent::application"
-milliseconds = 100355
+milliseconds = 102296
 
 [[timing]]
 target = "inillucent::budget"
-milliseconds = 4278
+milliseconds = 5280
 
 [[timing]]
 target = "inillucent::durability"
-milliseconds = 9783
+milliseconds = 48340
 
 [[timing]]
 target = "inillucent::durability_arms"
-milliseconds = 93847
+milliseconds = 84381
 
 [[timing]]
 target = "inillucent::edges"
-milliseconds = 1778
+milliseconds = 13787
 
 [[timing]]
 target = "inillucent::hillclimb_answers"
-milliseconds = 2278
+milliseconds = 13371
 
 [[timing]]
 target = "inillucent::lib"
@@ -1766,29 +1926,29 @@ milliseconds = 25
 
 [[timing]]
 target = "inillucent::smoke"
-milliseconds = 776
+milliseconds = 15788
 
 [[timing]]
 target = "inillucent::story_edges"
-milliseconds = 146871
+milliseconds = 226341
 
 [[timing]]
 target = "inillucent::story_ledger_day"
-milliseconds = 136884
+milliseconds = 115808
 
 [[timing]]
 target = "inillucent::story_ledger_day_nightly"
-milliseconds = 27257757
+milliseconds = 23649286
 
 [[timing]]
 target = "inillucent::story_nikaya"
-milliseconds = 74823
+milliseconds = 70661
 
 [[timing]]
 target = "inillucent::story_rag"
-milliseconds = 175399
+milliseconds = 125277
 
 [[timing]]
 target = "inillucent::story_workload_replay"
-milliseconds = 77344
+milliseconds = 43554
 
