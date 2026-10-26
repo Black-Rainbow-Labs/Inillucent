@@ -66,6 +66,18 @@
 .PARAMETER WhatIf
     Print the plan and change nothing.
 
+.PARAMETER DeadlineHours
+    How long after it starts the nightly stops whatever program it is running, kills that program's
+    whole process tree, and records the night as red. Must stay below the scheduled task's own
+    limit, which register-nightly.ps1 sets to 8 hours. 0 means no deadline.
+
+    The scheduler's limit stops only this pwsh. Everything it started keeps running: the night of
+    2026-10-26 stopped at 09:51 with three targets left, and Task Scheduler's stop at 10:00 left
+    about twenty `nightly-<hash>.exe` shards and their `sqlite-oracle.exe` children running for
+    hours with nobody to report to. That happened on four of the six nights from 2026-10-21, and on
+    each of them the night wrote no latest.json and filed no ticket. A job object cannot hold those
+    processes, for the reason Enter-ProcessorShare gives, so the nightly stops its own work first.
+
 .EXAMPLE
     pwsh packaging/nightly.ps1 -WhatIf
     pwsh packaging/nightly.ps1
@@ -81,7 +93,8 @@ param(
     [switch] $SkipPublish,
     [switch] $NoCommit,
     [switch] $NoTicket,
-    [switch] $WhatIf
+    [switch] $WhatIf,
+    [double] $DeadlineHours = 7.75
 )
 
 $ErrorActionPreference = 'Stop'
@@ -100,6 +113,10 @@ $evidencePath = Get-NightlyEvidencePath -MainCheckout $main
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
 $runDir = Join-Path $main "_agent_output/nightly/$stamp"
 $steps = [ordered]@{}
+$deadline = if ($DeadlineHours -gt 0) { (Get-Date).AddHours($DeadlineHours) } else { [datetime]::MaxValue }
+# The exit code Invoke-Native answers for a program the deadline stopped, or never started: the one
+# `timeout` uses.
+$deadlineExitCode = 124
 
 function Write-Step {
     <#
@@ -119,6 +136,12 @@ function Invoke-Native {
     .SYNOPSIS
         Runs a program, copying what it prints to the console and to a log, and returns its exit code.
 
+    .DESCRIPTION
+        When the night's deadline passes while the program runs, a watcher on another thread kills
+        the process tree of every program this script has running, and this returns
+        $deadlineExitCode. Past the deadline it starts nothing and returns $deadlineExitCode at once.
+        See -DeadlineHours.
+
     .PARAMETER Log
         The file its output is appended to.
 
@@ -129,12 +152,49 @@ function Invoke-Native {
         Its arguments.
     #>
     param([string] $Log, [string] $Program, [string[]] $Arguments)
-    & $Program @Arguments 2>&1 | ForEach-Object {
-        $text = "$_"
-        Write-Host $text
-        Add-Content -LiteralPath $Log -Value $text
+    if ((Get-Date) -ge $deadline) {
+        Add-Content -LiteralPath $Log -Value "not started: the nightly passed its deadline at $($deadline.ToUniversalTime().ToString('u')): $Program"
+        return $deadlineExitCode
     }
-    return $LASTEXITCODE
+    $watcher = Start-DeadlineWatcher
+    try {
+        & $Program @Arguments 2>&1 | ForEach-Object {
+            $text = "$_"
+            Write-Host $text
+            Add-Content -LiteralPath $Log -Value $text
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        Stop-Job -Job $watcher
+        Remove-Job -Job $watcher -Force
+    }
+    if ((Get-Date) -ge $deadline) {
+        Add-Content -LiteralPath $Log -Value "stopped: the nightly reached its deadline at $($deadline.ToUniversalTime().ToString('u')) while $Program was running"
+        return $deadlineExitCode
+    }
+    return $code
+}
+
+function Start-DeadlineWatcher {
+    <#
+    .SYNOPSIS
+        Starts a thread that waits for the night's deadline, then kills the process tree of every
+        program this script has running.
+
+    .DESCRIPTION
+        A thread in this process rather than a process of its own, so it ends with this script and
+        can never outlive it. It kills by tree from each direct child, which reaches the test shards
+        under inillucent-testrun and the oracles under the shards. This script's own console host is
+        left alone: killing it would end this script before it could write the night's evidence.
+    #>
+    Start-ThreadJob -ArgumentList $PID, $deadline -ScriptBlock {
+        param([int] $Parent, [datetime] $Deadline)
+        while ((Get-Date) -lt $Deadline) { Start-Sleep -Seconds 15 }
+        foreach ($child in Get-CimInstance Win32_Process -Filter "ParentProcessId=$Parent") {
+            if ($child.Name -eq 'conhost.exe') { continue }
+            & taskkill.exe /T /F /PID $child.ProcessId | Out-Null
+        }
+    }
 }
 
 function Initialize-Worktree {
@@ -197,6 +257,7 @@ function Invoke-Suite {
         0 { return 'green' }
         1 { return 'red: the suite ran and was red' }
         2 { return 'red: the suite did not run; nothing was graded' }
+        $deadlineExitCode { return "red: the suite was still running at the nightly's deadline, $($deadline.ToUniversalTime().ToString('u')), and was stopped" }
         default { return "red: the runner answered $code" }
     }
 }
@@ -504,6 +565,7 @@ if ($WhatIf) {
     Write-Host "   the last night: $last"
     Write-Host '   would fetch origin, move the worktree to the branch, and exit 0 if that commit is already green'
     Write-Host '   would run: inillucent-testrun --cadence nightly --strict --record --summary'
+    if ($DeadlineHours -gt 0) { Write-Host "   would stop whatever is still running $DeadlineHours hours after it starts, and record the night as red" }
     if (-not $SkipRelease) { Write-Host '   would run: release-all.ps1 -Targets all (five builds in parallel, fat LTO, signed and notarised)' }
     if (-not $SkipRelease -and -not $SkipGates) { Write-Host '   would run: inillucent-fullgate, inillucent-writegate, inillucent-scorecard on the medium fixture' }
     if (-not $SkipRelease -and -not $SkipPublish) { Write-Host '   would replace the rolling nightly pre release on GitHub, at the commit it built' }
