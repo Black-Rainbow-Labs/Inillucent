@@ -1135,8 +1135,10 @@ mod tests {
     /// make every case below pass for the wrong reason.
     #[test]
     fn confinement_refuses_a_path_that_climbs_out() {
-        let root = std::env::temp_dir().join("inillucent-cli-confine");
-        std::fs::create_dir_all(&root).unwrap();
+        let root = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-cli-confine-{}",
+            std::process::id()
+        ));
         let context = Context {
             // A unit test builds its own context and has no directory to read.
             strays: Vec::new(),
@@ -1178,7 +1180,10 @@ mod tests {
     /// the message a person reads says which of the two things went wrong.
     #[test]
     fn a_refusal_through_a_link_names_the_target() {
-        let base = std::env::temp_dir().join("inillucent-cli-confine-link");
+        let base = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-cli-confine-link-{}",
+            std::process::id()
+        ));
         let root = base.join("root");
         let outside = base.join("outside");
         std::fs::create_dir_all(&root).unwrap();

@@ -541,15 +541,15 @@ mod tests {
     /// What is recorded is what is read back.
     #[test]
     fn a_recorded_pass_reads_back() {
-        let dir = std::env::temp_dir().join(format!("inillucent-quiet-{}", std::process::id()));
+        let dir = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-quiet-{}",
+            std::process::id()
+        ));
         let path = dir.join("medium.tsv");
-        let _ = std::fs::remove_file(&path);
         let written = pass(&KEYS, 123.4);
         assert_eq!(record(&path, &written).expect("recorded"), 3);
         let rows = parse(&std::fs::read_to_string(&path).expect("read back"));
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|row| (row.nanos - 123.4).abs() < 1e-9));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 }

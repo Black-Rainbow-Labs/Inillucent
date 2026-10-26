@@ -463,6 +463,17 @@ it located to `<target>/inillucent-testrun/artifacts.json` and names that file i
 such a list and starts no cargo, which is how `gates_fail_closed` runs its
 nested runners without building a second workspace.
 
+**It gives the run a temporary folder of its own and removes it at the end.**
+Before anything starts, the runner makes `<temp>/inillucent-tests/run-<pid>`
+and points `TMP`, `TEMP` and `TMPDIR` at it, so every cargo build and every test
+process the run starts writes its temporary files there. When the run ends the
+folder is removed. A run that was killed leaves its folder behind, and the next
+run removes it once the process that made it has gone: on Windows the folder
+holds a file the run keeps open with no sharing, and on Unix the process id in
+the name is checked. On 2026-10-25 the system temporary directory on the
+development machine held 105,562 `inillucent-*` folders that the tests had made
+and never removed, and a program that lists that directory pays for every entry.
+
 **A machine may declare what it lacks.** `tests/prerequisites.local.toml` is
 gitignored and holds `absent = [...]`, and `--absent <name>` adds to it for
 one run, which is how CI declares what a runner cannot have. Under `--strict`, a
@@ -972,6 +983,17 @@ and `inillucent-hotprofile` exist for it.
 suite module in one of `inillucent-compat`'s tier directories, add its row
 to `tests/selection.toml` — `crates/inillucent-compat/tests/tooling/selection.rs` will
 fail until you do, and its message names the target.
+
+**A test that writes files.** Make its folder with
+`inillucent_base::testing::ScratchDir::new(name)` and keep the guard for as long
+as anything uses a path inside it. The guard removes the folder when it drops,
+so a plain `cargo test` leaves nothing behind either, and it keeps the folder
+when the test failed, so the files are there to read. A helper that makes the
+folder and hands back a path inside it returns the guard with the path, because
+a guard dropped on return removes the folder under the caller. Declare the guard
+before the database that lives in it, so the database closes first. A crate
+reaches the guard by turning on the `testing` feature of `inillucent-base` in its
+`[dev-dependencies]`.
 
 **A tier.** Add a `[[tier]]` row and move targets into it. A declared tier that
 holds nothing fails `every_tier_is_declared`, so a tier cannot be added

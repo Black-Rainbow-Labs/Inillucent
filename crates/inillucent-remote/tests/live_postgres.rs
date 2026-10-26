@@ -57,20 +57,26 @@ fn url() -> Option<ConnectionUrl> {
     }
 }
 
-/// Returns a scratch path nothing else is using.
+/// Returns a fresh folder and the path of a database file inside it.
+///
+/// **The folder holds every file a migration writes.** The staging file, the
+/// report and the engine's numbered log segments sit beside the destination, so
+/// removing the folder removes all of them. The caller binds the guard with a
+/// named binding and keeps it for the whole test, because the folder is removed
+/// when the guard drops.
 ///
 /// @param name - what to call it
-fn scratch(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "inillucent-remote-{name}-{}-{}.rdb",
+fn scratch(name: &str) -> (inillucent_base::testing::ScratchDir, PathBuf) {
+    let directory = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-remote-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0)
     ));
-    path
+    let path = directory.join(format!("{name}.rdb"));
+    (directory, path)
 }
 
 /// Returns one column of one row as text.
@@ -97,7 +103,7 @@ fn text_of(database: &Database, sql: &str) -> String {
 #[test]
 fn a_live_postgres_database_migrates_verified_and_reads_back() {
     let Some(url) = url() else { return };
-    let destination = scratch("postgres");
+    let (_scratch, destination) = scratch("postgres");
     let plan = Plan::new(url, &destination);
     let report = migrate(&plan).expect("the migration runs");
 
@@ -227,15 +233,6 @@ fn a_live_postgres_database_migrates_verified_and_reads_back() {
 
     let _ = connection;
     drop(database);
-    let _ = std::fs::remove_file(&destination);
-    let report_path = destination.with_file_name(format!(
-        "{}.migration-report.md",
-        destination
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
-    let _ = std::fs::remove_file(&report_path);
 }
 
 /// A second migration to the same path is refused, rather than overwriting a
@@ -243,7 +240,7 @@ fn a_live_postgres_database_migrates_verified_and_reads_back() {
 #[test]
 fn a_destination_that_exists_is_refused() {
     let Some(url) = url() else { return };
-    let destination = scratch("exists");
+    let (_scratch, destination) = scratch("exists");
     std::fs::write(&destination, b"not a database").expect("the file is written");
     let error = migrate(&Plan::new(url, &destination)).expect_err("refuses");
     assert!(
@@ -259,7 +256,6 @@ fn a_destination_that_exists_is_refused() {
         b"not a database".to_vec(),
         "the existing file was not touched"
     );
-    let _ = std::fs::remove_file(&destination);
 }
 
 /// The catalog read finds the schema the fixture declares, including the

@@ -727,6 +727,17 @@ pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
+    /// Makes an empty folder for one test; the folder is removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole test.
+    ///
+    /// @param name - what to name the folder after
+    fn scratch(name: &str) -> inillucent_base::testing::ScratchDir {
+        inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-install-{name}-{}",
+            std::process::id()
+        ))
+    }
+
     /// The runtime directory is named for its version, so two versions coexist.
     #[test]
     fn each_runtime_version_gets_its_own_directory() {
@@ -772,14 +783,11 @@ mod tests {
     /// A directory with a tokenizer and no weights is not a model.
     #[test]
     fn half_a_model_does_not_count_as_one() {
-        let dir = std::env::temp_dir().join("inillucent-install-half-model");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("half-model");
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
         assert!(!complete_model(&dir), "no weights");
         std::fs::write(dir.join("model.onnx"), "not really a graph").unwrap();
         assert!(complete_model(&dir));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A manifest naming a different weights file is what decides completeness.
@@ -789,9 +797,7 @@ mod tests {
     /// choice becomes unusable.
     #[test]
     fn the_manifest_decides_which_weights_file_has_to_be_there() {
-        let dir = std::env::temp_dir().join("inillucent-install-named-weights");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("named-weights");
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(
             dir.join("model.json"),
@@ -805,14 +811,12 @@ mod tests {
         );
         std::fs::write(dir.join("model_int8.onnx"), "the right one").unwrap();
         assert!(complete_model(&dir));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The state file round trips, and a model is replaced rather than doubled.
     #[test]
     fn recording_a_model_twice_leaves_one_record() {
-        let root = std::env::temp_dir().join("inillucent-install-state");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = scratch("state");
         let mut state = State::default();
         state.put_model(InstalledModel {
             id: "m".to_string(),
@@ -831,7 +835,6 @@ mod tests {
 
         write_state(&root, &state).unwrap();
         assert_eq!(read_state(&root), Some(state));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// `INILLUCENT_ONNX_DIR` is only used for the model it actually holds.
@@ -845,26 +848,23 @@ mod tests {
     #[test]
     fn the_override_directory_is_only_used_for_the_model_it_holds() {
         let _held = env_guard();
-        let dir = std::env::temp_dir().join("inillucent-install-override");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("override");
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(dir.join("model.onnx"), "weights").unwrap();
         std::fs::write(dir.join("model.json"), r#"{"id":"model-a","dims":768,"mrl_widths":[768],"prefixes":{"query":"","document":"","clustering":"","classification":""},"pooling":"mean","max_tokens":512}"#).unwrap();
 
         let previous = std::env::var(MODEL_DIR_VAR).ok();
-        std::env::set_var(MODEL_DIR_VAR, &dir);
-        assert_eq!(model_dir("model-a").as_deref(), Some(dir.as_path()));
+        std::env::set_var(MODEL_DIR_VAR, dir.path());
+        assert_eq!(model_dir("model-a").as_deref(), Some(dir.path()));
         assert_ne!(
             model_dir("model-b").as_deref(),
-            Some(dir.as_path()),
+            Some(dir.path()),
             "a directory holding model-a is not model-b"
         );
         match previous {
             Some(value) => std::env::set_var(MODEL_DIR_VAR, value),
             None => std::env::remove_var(MODEL_DIR_VAR),
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A directory with no manifest still answers for the baseline model, which
@@ -872,32 +872,26 @@ mod tests {
     #[test]
     fn a_directory_with_no_manifest_still_answers_for_the_baseline_model() {
         let _held = env_guard();
-        let dir = std::env::temp_dir().join("inillucent-install-unmanifested");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("unmanifested");
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(dir.join("model.onnx"), "weights").unwrap();
 
         let previous = std::env::var(MODEL_DIR_VAR).ok();
-        std::env::set_var(MODEL_DIR_VAR, &dir);
-        assert_eq!(model_dir(DEFAULT_MODEL).as_deref(), Some(dir.as_path()));
-        assert_ne!(model_dir("something-else").as_deref(), Some(dir.as_path()));
+        std::env::set_var(MODEL_DIR_VAR, dir.path());
+        assert_eq!(model_dir(DEFAULT_MODEL).as_deref(), Some(dir.path()));
+        assert_ne!(model_dir("something-else").as_deref(), Some(dir.path()));
         match previous {
             Some(value) => std::env::set_var(MODEL_DIR_VAR, value),
             None => std::env::remove_var(MODEL_DIR_VAR),
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A state file that does not parse reads as absent.
     #[test]
     fn an_unreadable_state_file_does_not_stop_a_lookup() {
-        let root = std::env::temp_dir().join("inillucent-install-bad-state");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = scratch("bad-state");
         std::fs::write(state_path(&root), "{ this is not json").unwrap();
         assert_eq!(read_state(&root), None);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// `INILLUCENT_HOME` wins over the platform directory.
@@ -943,15 +937,13 @@ mod tests {
     #[test]
     fn a_pack_is_found_by_name() {
         let _held = env_guard();
-        let folder = std::env::temp_dir().join("inillucent-install-tokenizers");
-        let _ = std::fs::remove_dir_all(&folder);
-        std::fs::create_dir_all(&folder).unwrap();
+        let folder = scratch("tokenizers");
         let example = include_str!("../../../examples/tokenizers/pt-br.json");
         std::fs::write(folder.join("pt-br.json"), example).unwrap();
         std::fs::write(folder.join("notes.txt"), "not a pack").unwrap();
         {
             let _named = TokenizerDir::set(&folder);
-            assert_eq!(tokenizer_folder(), folder);
+            assert_eq!(tokenizer_folder(), folder.path());
             assert_eq!(
                 tokenizer_pack("pt-br"),
                 Ok(Some(Pack::parse(example).unwrap()))
@@ -968,7 +960,6 @@ mod tests {
             assert_eq!(tokenizer_pack("pt-br"), Ok(None));
             assert!(installed_tokenizers().is_empty());
         }
-        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     /// A file installed under one name that holds a pack named another is
@@ -976,9 +967,7 @@ mod tests {
     #[test]
     fn a_file_that_names_another_pack_is_refused() {
         let _held = env_guard();
-        let folder = std::env::temp_dir().join("inillucent-install-misnamed");
-        let _ = std::fs::remove_dir_all(&folder);
-        std::fs::create_dir_all(&folder).unwrap();
+        let folder = scratch("misnamed");
         std::fs::write(
             folder.join("x.json"),
             r#"{"format":1,"name":"y","stemmer":"none"}"#,
@@ -997,6 +986,5 @@ mod tests {
             assert!(matches!(tokenizer_pack("broken"), Err(PackError::Json(_))));
             assert_eq!(installed_tokenizers(), vec!["broken", "x"]);
         }
-        std::fs::remove_dir_all(&folder).unwrap();
     }
 }

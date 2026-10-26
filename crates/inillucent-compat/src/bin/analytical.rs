@@ -46,6 +46,7 @@ use std::process::{Command, ExitCode};
 use std::rc::Rc;
 use std::time::Instant;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::perf::{eat_borrowed, run_sqlite};
 use inillucent_compat::perf::{Digest, Paired, Sample};
@@ -174,8 +175,13 @@ fn run(
 
     // The plan file both arms read. Written once, so there is one copy of the
     // SQL and neither side can drift from it.
-    let plan_path =
-        std::env::temp_dir().join(format!("inillucent-analytical-{}.plan", std::process::id()));
+    // In a folder the guard removes when this function returns; every run used
+    // to leave its plan file in the temporary directory.
+    let plan_folder = ScratchDir::try_at(
+        std::env::temp_dir().join(format!("inillucent-analytical-{}", std::process::id())),
+    )
+    .map_err(|error| format!("could not make a folder for the plan: {error}"))?;
+    let plan_path = plan_folder.join("workloads.plan");
     std::fs::write(&plan_path, plan_file(repeat, scale, rows))
         .map_err(|error| format!("could not write the plan: {error}"))?;
 

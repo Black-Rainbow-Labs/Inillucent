@@ -125,9 +125,10 @@ mod tests {
     /// file is refused rather than read as an empty passphrase.
     #[test]
     fn a_key_file_is_read_without_its_line_end() {
-        let directory =
-            std::env::temp_dir().join(format!("inillucent-keys-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-keys-{}",
+            std::process::id()
+        ));
         let path = directory.join("key.txt");
         std::fs::write(&path, "hunter2\r\n").unwrap();
         let key = read_key_file(path.to_str().unwrap()).unwrap();
@@ -137,7 +138,6 @@ mod tests {
         std::fs::write(&path, format!("x'{}'\n", "ab".repeat(32))).unwrap();
         let key = read_key_file(path.to_str().unwrap()).unwrap();
         assert!(format!("{key:?}").contains("raw"));
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// Inside `opening_without_key` nothing is opened with the key, and

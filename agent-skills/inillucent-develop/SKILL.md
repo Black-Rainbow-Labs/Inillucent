@@ -237,6 +237,13 @@ where a test goes. The common cases:
 | what every language binding must answer | a case in `drivers/conformance/suite.json` | |
 | a cost that must not change | `crates/inillucent/tests/budget.rs` | `perf` |
 
+A test that writes files makes its folder with `inillucent_base::testing::ScratchDir::new(name)`,
+which removes the folder when the guard drops and keeps it when the test failed. Keep the guard
+alive for as long as anything uses a path inside it, and declare it before the database that lives
+in it. A helper that returns a path inside the folder returns the guard with it.
+`inillucent-testrun` also points `TMP`, `TEMP` and `TMPDIR` at a folder of its own for each run and
+removes it when the run ends.
+
 A new `tests/*.rs` file needs a row in `tests/selection.toml`. Without the row, the `selection` suite
 fails and names the target. In `inillucent-compat`, a suite is a module of its tier binary: a file
 in `tests/<tier>/`, a `mod` line in `tests/<tier>/main.rs`, and a row with `name = "<tier>"` and

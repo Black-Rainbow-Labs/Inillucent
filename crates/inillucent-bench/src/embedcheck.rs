@@ -556,13 +556,17 @@ mod tests {
     use inillucent_core::model::{ModelManifest, Pooling, Prefixes};
     use inillucent_core::store::ChunkInput;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+    use inillucent_base::testing::ScratchDir;
+
+    /// Makes an empty folder for one test; the folder is removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole test.
+    ///
+    /// @param name - what to name the folder after
+    fn scratch(name: &str) -> ScratchDir {
+        ScratchDir::new(&format!(
             "inillucent-embedcheck-{}-{name}",
             std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        ))
     }
 
     /// Two installed models, so a header naming one can be pointed at the other.
@@ -674,7 +678,6 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("model-b"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -684,7 +687,6 @@ mod tests {
         let corpus = corpus_with(header_naming(&mine));
         let resolved = model_for(&corpus, &root.join("models"), None, "model.onnx").unwrap();
         assert_eq!(resolved.manifest.id, "model-a");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -705,7 +707,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("carries no provenance"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Build a sample where every chunk reproduces cleanly, so a test can put one
@@ -889,6 +890,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no model directory model-a"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 }

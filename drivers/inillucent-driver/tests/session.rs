@@ -19,19 +19,23 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_driver::Database;
 
-/// Returns a scratch database nothing else is using.
+/// Returns a scratch directory guard and the path of a database inside it that
+/// nothing else is using. The directory, with the database's log files, is
+/// removed when the guard drops, so the caller keeps it until the database is
+/// closed.
 ///
 /// @param tag - what to name it after
-fn scratch(tag: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "inillucent-driver-session-{}-{tag}-{:?}.db",
+fn scratch(tag: &str) -> (ScratchDir, PathBuf) {
+    let directory = ScratchDir::new(&format!(
+        "inillucent-driver-session-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_file(&path);
-    path
+    let path = directory.join("session.db");
+    (directory, path)
 }
 
 /// A temporary table survives a caller that connects per call.
@@ -40,7 +44,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// for each statement, and nothing but the session number travels between them.
 #[test]
 fn a_temp_table_survives_a_connection_per_call() {
-    let path = scratch("temp");
+    let (_directory, path) = scratch("temp");
     let database = Database::open(&path).expect("the database opens");
     let session = database.session().session();
 
@@ -75,7 +79,6 @@ fn a_temp_table_survives_a_connection_per_call() {
     );
 
     drop(database);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// A connection reports a session number, and two connections report two.
@@ -84,7 +87,7 @@ fn a_temp_table_survives_a_connection_per_call() {
 /// connections that share it and different for one that does not.
 #[test]
 fn a_session_number_identifies_the_connection_that_reported_it() {
-    let path = scratch("number");
+    let (_directory, path) = scratch("number");
     let database = Database::open(&path).expect("the database opens");
 
     let first = database.session().session();
@@ -102,7 +105,6 @@ fn a_session_number_identifies_the_connection_that_reported_it() {
     );
 
     drop(database);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// A connection pragma set once holds for every later call in the session.
@@ -113,7 +115,7 @@ fn a_session_number_identifies_the_connection_that_reported_it() {
 /// a caller that forgot had foreign keys quietly off.
 #[test]
 fn a_connection_pragma_holds_for_the_whole_session() {
-    let path = scratch("pragma");
+    let (_directory, path) = scratch("pragma");
     let database = Database::open(&path).expect("the database opens");
     let session = database.session().session();
 
@@ -137,7 +139,6 @@ fn a_connection_pragma_holds_for_the_whole_session() {
     );
 
     drop(database);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Each connection's counters belong to it alone.
@@ -149,7 +150,7 @@ fn a_connection_pragma_holds_for_the_whole_session() {
 /// pool handed every thread whichever numbers the last statement set.
 #[test]
 fn a_connection_reads_its_own_counters_after_another_connection_writes() {
-    let path = scratch("counters");
+    let (_directory, path) = scratch("counters");
     let database = Database::open(&path).expect("the database opens");
     let first = database.session();
     let second = database.session();
@@ -191,5 +192,4 @@ fn a_connection_reads_its_own_counters_after_another_connection_writes() {
     );
 
     drop(database);
-    let _ = std::fs::remove_file(&path);
 }

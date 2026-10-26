@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::oracle::{Driver, Op};
 use inillucent_compat::workspace_root;
@@ -39,16 +40,18 @@ fn oracle_path() -> Option<PathBuf> {
 
 /// Builds a small fixture and imports it into the new engine.
 ///
+/// Returns the scratch directory guard with the database. The directory is
+/// removed when the guard drops, so the caller binds the guard first and keeps
+/// it for as long as the database is open.
+///
 /// @param tag - what to name the scratch directory after
-fn engine(tag: &str) -> Option<ImportedDatabase> {
+fn engine(tag: &str) -> Option<(ScratchDir, ImportedDatabase)> {
     let program = oracle_path()?;
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-pragma-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
     let path = directory.join("shop.db");
     let mut oracle = Driver::start("sqlite", &program).expect("the oracle starts");
     oracle
@@ -65,10 +68,9 @@ fn engine(tag: &str) -> Option<ImportedDatabase> {
             .expect("the exec runs");
         assert!(observed.ok, "the fixture did not build: {sql}");
     }
-    Some(
-        ImportedDatabase::import(path, 8_192)
-            .unwrap_or_else(|error| panic!("the fixture did not import: {:?}", error.detail())),
-    )
+    let database = ImportedDatabase::import(path, 8_192)
+        .unwrap_or_else(|error| panic!("the fixture did not import: {:?}", error.detail()));
+    Some((directory, database))
 }
 
 /// Runs one pragma and returns its rows as text.
@@ -104,7 +106,7 @@ fn no_oracle() {
 
 #[test]
 fn the_schema_pragmas_describe_the_new_engine_s_schema() {
-    let Some(mut engine) = engine("schema") else {
+    let Some((_scratch, mut engine)) = engine("schema") else {
         return no_oracle();
     };
     let columns = ask(&mut engine, "PRAGMA table_info(items)");
@@ -164,7 +166,7 @@ fn the_schema_pragmas_describe_the_new_engine_s_schema() {
 
 #[test]
 fn the_pager_pragmas_describe_the_new_engine_s_file() {
-    let Some(mut engine) = engine("pager") else {
+    let Some((_scratch, mut engine)) = engine("pager") else {
         return no_oracle();
     };
     assert_eq!(
@@ -201,7 +203,7 @@ fn the_pager_pragmas_describe_the_new_engine_s_file() {
 
 #[test]
 fn the_policy_pragmas_are_honoured_flags() {
-    let Some(mut engine) = engine("policy") else {
+    let Some((_scratch, mut engine)) = engine("policy") else {
         return no_oracle();
     };
     assert_eq!(
@@ -247,7 +249,7 @@ fn the_policy_pragmas_are_honoured_flags() {
 
 #[test]
 fn a_pragma_with_one_setting_reports_it_and_refuses_any_other() {
-    let Some(mut engine) = engine("fixed") else {
+    let Some((_scratch, mut engine)) = engine("fixed") else {
         return no_oracle();
     };
     // `delete` is the default because the reference's is, and because the
@@ -309,7 +311,7 @@ fn a_pragma_with_one_setting_reports_it_and_refuses_any_other() {
 
 #[test]
 fn an_unknown_pragma_is_silent_on_the_new_engine() {
-    let Some(mut engine) = engine("silent") else {
+    let Some((_scratch, mut engine)) = engine("silent") else {
         return no_oracle();
     };
     // SQLite's own answer to a pragma it has never heard of: no rows, no error.
@@ -392,7 +394,7 @@ fn an_unknown_pragma_is_silent_on_the_new_engine() {
 
 #[test]
 fn the_integrity_check_walks_every_new_engine_tree() {
-    let Some(mut engine) = engine("integrity") else {
+    let Some((_scratch, mut engine)) = engine("integrity") else {
         return no_oracle();
     };
     assert_eq!(

@@ -11,6 +11,12 @@
 //! numbered log segments and every copy of that list elsewhere forgot the
 //! segments.
 //!
+//! And it holds [`ScratchDir`], the one way a test makes a folder in the
+//! system temporary directory, because a folder that nothing removes stays
+//! there for good. On 2026-10-25 `%TEMP%` on the development machine held
+//! 105,562 `inillucent-*` folders left by this workspace's tests, and every
+//! program that lists that directory paid for each of them.
+//!
 //! **Why this is in the bottom crate rather than in the test harness
 //! (task-1969, 4.6).** `inillucent_compat::differential::skipping` was the
 //! original home, and three crates could not reach it: the layering contract
@@ -120,9 +126,180 @@ pub fn remove_database(path: &std::path::Path) {
     }
 }
 
+/// A fresh folder in the system temporary directory, removed when the guard is
+/// dropped.
+///
+/// **Every test that makes a folder in `%TEMP%` makes it through this.** The
+/// helpers it replaced each built a unique name from the process id, a tag and
+/// the thread id, created the folder, and returned a bare `PathBuf`, so every
+/// run of every suite added folders and nothing ever took one away.
+/// `inillucent-testrun` now points `TMP`, `TEMP` and `TMPDIR` at a folder of
+/// its own and removes it when the run ends, but a plain `cargo test` has no
+/// runner around it, and this guard is what makes that leave nothing either.
+///
+/// **A failing test keeps its folder.** The drop does nothing while the
+/// thread is panicking, so the files a failed assertion was about are still
+/// there to read. Under the runner they go with the run's folder.
+///
+/// **Keep the guard alive for as long as anything uses a path inside it.** It
+/// dereferences to the folder's [`Path`], so `scratch.join("a.rdb")` reads the
+/// way the old `PathBuf` did. A helper that returns only a path inside the
+/// folder drops the guard on return and removes the folder under the caller,
+/// so such a helper returns the guard alongside the path. Locals drop in the
+/// reverse of the order they were declared, so declaring the guard before the
+/// database that lives in it closes the database before the folder goes.
+#[must_use = "the folder is removed as soon as the guard is dropped"]
+#[derive(Debug)]
+pub struct ScratchDir {
+    path: std::path::PathBuf,
+}
+
+impl ScratchDir {
+    /// Makes an empty folder called `name` in the system temporary directory.
+    ///
+    /// A folder left at that name by an earlier run is removed first, so the
+    /// test starts from nothing. `name` should already be unique to the test
+    /// and the process: the callers put the process id and the thread id in it,
+    /// because tests in one binary run in parallel.
+    ///
+    /// @param name - the folder's name, without a directory
+    pub fn new(name: &str) -> ScratchDir {
+        ScratchDir::at(std::env::temp_dir().join(name))
+    }
+
+    /// Makes an empty folder at `path` and removes it when the guard drops.
+    ///
+    /// For a test whose folder lives somewhere other than directly in the
+    /// temporary directory. Anything already at `path` is removed first.
+    ///
+    /// @param path - where the folder goes
+    pub fn at(path: std::path::PathBuf) -> ScratchDir {
+        match ScratchDir::try_at(path.clone()) {
+            Ok(scratch) => scratch,
+            Err(error) => panic!(
+                "the scratch folder {} was not made: {error}",
+                path.display()
+            ),
+        }
+    }
+
+    /// Makes an empty folder at `path`, or says why it could not.
+    ///
+    /// For a measurement program that reports a folder it cannot make as an
+    /// error of its own rather than a panic.
+    ///
+    /// @param path - where the folder goes
+    pub fn try_at(path: std::path::PathBuf) -> std::io::Result<ScratchDir> {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)?;
+        Ok(ScratchDir { path })
+    }
+
+    /// Returns the folder.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Gives up the guard and keeps the folder, returning where it is.
+    ///
+    /// For a program that keeps its files only when they are evidence, such
+    /// as a gate whose two databases disagreed.
+    pub fn keep(self) -> std::path::PathBuf {
+        let mut kept = std::mem::ManuallyDrop::new(self);
+        std::mem::take(&mut kept.path)
+    }
+}
+
+impl std::ops::Deref for ScratchDir {
+    type Target = std::path::Path;
+
+    /// Returns the folder, so the guard reads like the `PathBuf` it replaced.
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for ScratchDir {
+    /// Returns the folder, for functions that take `impl AsRef<Path>`.
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    /// Removes the folder, unless the thread is panicking.
+    ///
+    /// The removal ignores errors. On Windows a file that is still open cannot
+    /// be removed, and a test that leaked a handle should not fail for it in
+    /// its cleanup.
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folder exists while the guard is alive and is gone after it drops,
+    /// files and all, and a second guard at the same name starts empty.
+    #[test]
+    fn a_scratch_folder_is_removed_when_its_guard_drops() {
+        let name = format!("inillucent-scratch-guard-{}", std::process::id());
+        let kept;
+        {
+            let scratch = ScratchDir::new(&name);
+            kept = scratch.to_path_buf();
+            std::fs::create_dir_all(scratch.join("inner")).expect("a nested folder");
+            std::fs::write(scratch.join("inner/a.rdb"), b"x").expect("a file");
+            assert!(kept.join("inner/a.rdb").is_file());
+            let again = ScratchDir::new(&format!("{name}-second"));
+            assert_eq!(
+                std::fs::read_dir(again.path()).expect("it lists").count(),
+                0
+            );
+        }
+        assert!(!kept.exists(), "{} was left behind", kept.display());
+        assert!(!std::env::temp_dir().join(format!("{name}-second")).exists());
+    }
+
+    /// A folder left by an earlier run at the same name is emptied, so a test
+    /// never reads the last run's files.
+    #[test]
+    fn a_scratch_folder_starts_empty_over_a_leftover() {
+        let path = std::env::temp_dir().join(format!(
+            "inillucent-scratch-leftover-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("the leftover folder");
+        std::fs::write(path.join("stale.rdb"), b"x").expect("a stale file");
+        let scratch = ScratchDir::at(path.clone());
+        assert_eq!(
+            std::fs::read_dir(scratch.path()).expect("it lists").count(),
+            0
+        );
+        drop(scratch);
+        assert!(!path.exists());
+    }
+
+    /// A test that fails keeps its folder, so the files it was about can be
+    /// read afterwards.
+    #[test]
+    fn a_failing_test_keeps_its_scratch_folder() {
+        let path =
+            std::env::temp_dir().join(format!("inillucent-scratch-panics-{}", std::process::id()));
+        let inside = path.clone();
+        let outcome = std::thread::spawn(move || {
+            let _scratch = ScratchDir::at(inside);
+            panic!("the test failed");
+        })
+        .join();
+        assert!(outcome.is_err());
+        assert!(path.is_dir(), "a failed test's folder was removed");
+        std::fs::remove_dir_all(&path).expect("cleanup");
+    }
 
     /// Every numbered segment goes with the database, and a database whose
     /// name is a prefix of this one's is left alone.

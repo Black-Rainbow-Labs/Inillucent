@@ -208,20 +208,25 @@ impl Manifest {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
+    /// Makes an empty folder and names a manifest file inside it.
+    ///
+    /// The folder is removed when the returned guard drops, so each test binds
+    /// the guard with a named binding and keeps it for the whole test.
+    ///
+    /// @param name - what to name the folder after
+    fn scratch(name: &str) -> (inillucent_base::testing::ScratchDir, PathBuf) {
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
             "inillucent-migrate-manifest-{name}-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&path);
-        path
+        let path = directory.join("manifest.txt");
+        (directory, path)
     }
 
     /// A manifest reads back what it wrote, in order.
     #[test]
     fn a_manifest_reads_back_what_it_wrote() {
-        let path = scratch("roundtrip");
+        let (_scratch, path) = scratch("roundtrip");
         {
             let mut manifest = Manifest::open(&path).expect("opened");
             manifest.record("source.path", "/tmp/index").expect("wrote");
@@ -232,25 +237,23 @@ mod tests {
         assert_eq!(reopened.last("source.path"), Some("/tmp/index"));
         assert_eq!(reopened.checkpoint("chunk"), 1000);
         assert_eq!(reopened.checkpoint("document"), 0);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A stage is finished only once it has been recorded.
     #[test]
     fn a_stage_is_finished_only_when_recorded() {
-        let path = scratch("stages");
+        let (_scratch, path) = scratch("stages");
         let mut manifest = Manifest::open(&path).expect("opened");
         assert!(!manifest.finished("schema"));
         manifest.record("stage", "schema").expect("wrote");
         assert!(manifest.finished("schema"));
         assert!(!manifest.finished("verify"));
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A verification line carries its verdict and its detail.
     #[test]
     fn a_verification_carries_its_verdict() {
-        let path = scratch("verify");
+        let (_scratch, path) = scratch("verify");
         let mut manifest = Manifest::open(&path).expect("opened");
         manifest
             .record("verify", "counts ok 128 documents")
@@ -262,19 +265,17 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.first().map(|entry| entry.1).unwrap_or(false));
         assert!(!results.get(1).map(|entry| entry.1).unwrap_or(true));
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A newline in a value cannot break the line format.
     #[test]
     fn a_value_cannot_break_the_format() {
-        let path = scratch("newline");
+        let (_scratch, path) = scratch("newline");
         let mut manifest = Manifest::open(&path).expect("opened");
         manifest
             .record("verify", "bm25 fail it went\nwrong")
             .expect("wrote");
         let reopened = Manifest::open(&path).expect("reopened");
         assert_eq!(reopened.entries().len(), 1);
-        let _ = std::fs::remove_file(&path);
     }
 }

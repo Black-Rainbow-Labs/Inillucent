@@ -614,9 +614,10 @@ mod tests {
             resident.push(&held);
         }
 
-        let directory =
-            std::env::temp_dir().join(format!("inillucent-filed-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&directory);
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-filed-{}",
+            std::process::id()
+        ));
         let path = directory.join("vectors.raw");
         let raw = resident.raw().expect("a resident set has a buffer");
         std::fs::write(&path, bytemuck::cast_slice(raw)).expect("the vectors are written");
@@ -674,8 +675,6 @@ mod tests {
             promoted.raw().expect("resident"),
             resident.raw().expect("resident")
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// `new` and its old callers keep answering for cosine, unchanged.

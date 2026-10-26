@@ -34,32 +34,32 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_base::PrimaryCode;
 use inillucent_engine::connect::Database;
 use inillucent_tree::datum::OwnedDatum;
 
-/// Returns a fresh, empty directory for one test's files.
+/// Returns a fresh, empty directory for one test's files, removed when the
+/// returned guard drops.
 ///
 /// @param tag - what to name the directory after
-fn scratch(tag: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+fn scratch(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-edges-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
-    directory
+    ))
 }
 
-/// Opens a fresh database for one test.
+/// Opens a fresh database for one test. The directory guard is returned first
+/// so the caller keeps it alive until the database has been dropped.
 ///
 /// @param tag - what to name the directory after
-fn fresh(tag: &str) -> (PathBuf, Database) {
+fn fresh(tag: &str) -> (ScratchDir, PathBuf, Database) {
     let directory = scratch(tag);
     let path = directory.join("edges.rdb");
     let database = Database::open(&path).expect("the database opens");
-    (path, database)
+    (directory, path, database)
 }
 
 /// Returns the single cell a one-row, one-column answer holds.
@@ -82,7 +82,7 @@ fn cell(rows: &[Vec<OwnedDatum>]) -> OwnedDatum {
 /// of.
 #[test]
 fn aggregates_over_an_empty_table_are_defined() {
-    let (_path, database) = fresh("empty-aggregate");
+    let (_directory, _path, database) = fresh("empty-aggregate");
     let connection = database.session();
     connection
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -117,7 +117,7 @@ fn aggregates_over_an_empty_table_are_defined() {
 /// common way a constraint is implemented wrongly.
 #[test]
 fn a_unique_index_admits_many_nulls() {
-    let (_path, database) = fresh("unique-null");
+    let (_directory, _path, database) = fresh("unique-null");
     let connection = database.session();
     connection
         .execute_batch(
@@ -146,7 +146,7 @@ fn a_unique_index_admits_many_nulls() {
 /// Integers at the ends of their range survive a write and a read.
 #[test]
 fn integers_at_the_edges_round_trip() {
-    let (path, database) = fresh("integer-edges");
+    let (_directory, path, database) = fresh("integer-edges");
     {
         let connection = database.session();
         connection
@@ -181,7 +181,7 @@ fn integers_at_the_edges_round_trip() {
 /// A blob keeps every byte, including a zero in the middle and none at all.
 #[test]
 fn blobs_keep_their_bytes() {
-    let (path, database) = fresh("blobs");
+    let (_directory, path, database) = fresh("blobs");
     let awkward: Vec<u8> = vec![0x00, 0xff, 0x00, 0x41, 0x00];
     {
         let connection = database.session();
@@ -230,7 +230,7 @@ fn blobs_keep_their_bytes() {
 /// A value wider than a page goes out to an extent and comes back whole.
 #[test]
 fn a_value_larger_than_a_page_round_trips() {
-    let (path, database) = fresh("extents");
+    let (_directory, path, database) = fresh("extents");
     // The default page is 32 KiB; a quarter of a megabyte is comfortably
     // several extents rather than one page with a little spilled.
     let long: String = "abcdefghij".repeat(26_214);
@@ -269,7 +269,7 @@ fn a_value_larger_than_a_page_round_trips() {
 /// Text that is not ASCII survives, and its length is in characters.
 #[test]
 fn text_outside_ascii_survives() {
-    let (path, database) = fresh("unicode");
+    let (_directory, path, database) = fresh("unicode");
     let samples = ["naïve", "日本語", "🛟 lifebuoy", "Straße"];
     {
         let connection = database.session();
@@ -319,7 +319,7 @@ fn text_outside_ascii_survives() {
 /// `NOCASE` compares without case, and only for the column that declared it.
 #[test]
 fn a_collation_applies_where_it_was_declared() {
-    let (_path, database) = fresh("collation");
+    let (_directory, _path, database) = fresh("collation");
     let connection = database.session();
     connection
         .execute_batch(
@@ -349,7 +349,7 @@ fn a_collation_applies_where_it_was_declared() {
 /// `LIMIT` and `OFFSET` at their boundaries.
 #[test]
 fn limit_and_offset_at_the_boundaries() {
-    let (_path, database) = fresh("limits");
+    let (_directory, _path, database) = fresh("limits");
     let connection = database.session();
     connection
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -374,7 +374,7 @@ fn limit_and_offset_at_the_boundaries() {
 /// Dividing by zero is null rather than an error, and the modulus agrees.
 #[test]
 fn division_by_zero_is_null() {
-    let (_path, database) = fresh("divide");
+    let (_directory, _path, database) = fresh("divide");
     let connection = database.session();
     assert_eq!(
         cell(&connection.query("SELECT 1 / 0").expect("the query runs")),
@@ -394,7 +394,7 @@ fn division_by_zero_is_null() {
 /// An identifier that needs quoting keeps working, including a reserved word.
 #[test]
 fn quoted_identifiers_work() {
-    let (_path, database) = fresh("quoting");
+    let (_directory, _path, database) = fresh("quoting");
     let connection = database.session();
     connection
         .execute_batch(
@@ -428,7 +428,7 @@ fn quoted_identifiers_work() {
 /// statement declared and `Statement::bind` checks against it.
 #[test]
 fn binding_out_of_range_is_refused() {
-    let (_path, database) = fresh("binding");
+    let (_directory, _path, database) = fresh("binding");
     let connection = database.session();
     connection
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
@@ -473,7 +473,7 @@ fn binding_out_of_range_is_refused() {
 /// wearing a different hat - and it is exactly what a naive `clear` does.
 #[test]
 fn clearing_bindings_keeps_the_range_check() {
-    let (_path, database) = fresh("clear-binding");
+    let (_directory, _path, database) = fresh("clear-binding");
     let connection = database.session();
     connection
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -496,7 +496,7 @@ fn clearing_bindings_keeps_the_range_check() {
 /// error - it just says there is no more.
 #[test]
 fn a_statement_resets_and_ends_cleanly() {
-    let (_path, database) = fresh("lifecycle");
+    let (_directory, _path, database) = fresh("lifecycle");
     let connection = database.session();
     connection
         .execute_batch(
@@ -531,7 +531,7 @@ fn a_statement_resets_and_ends_cleanly() {
 /// leaves the connection usable.
 #[test]
 fn a_bad_column_leaves_the_connection_usable() {
-    let (_path, database) = fresh("bad-column");
+    let (_directory, _path, database) = fresh("bad-column");
     let connection = database.session();
     connection
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -553,7 +553,7 @@ fn a_bad_column_leaves_the_connection_usable() {
 /// An empty statement, and one that is only a comment, are not errors.
 #[test]
 fn an_empty_statement_is_not_an_error() {
-    let (_path, database) = fresh("empty-statement");
+    let (_directory, _path, database) = fresh("empty-statement");
     let connection = database.session();
     connection
         .execute_batch("")
@@ -582,7 +582,7 @@ fn an_empty_statement_is_not_an_error() {
 /// and there is one opinion about statement boundaries instead of two.
 #[test]
 fn execute_batch_creates_a_trigger() {
-    let (_path, database) = fresh("batch-trigger");
+    let (_directory, _path, database) = fresh("batch-trigger");
     let connection = database.session();
     connection
         .execute_batch(
@@ -614,7 +614,7 @@ fn execute_batch_creates_a_trigger() {
 /// for an insert, an update, a delete and an upsert.
 #[test]
 fn execute_batch_keeps_the_change_of_a_returning_statement() {
-    let (_path, database) = fresh("batch-returning");
+    let (_directory, _path, database) = fresh("batch-returning");
     let connection = database.session();
     connection
         .execute_batch(
@@ -648,7 +648,7 @@ fn execute_batch_keeps_the_change_of_a_returning_statement() {
 /// statement. All three are ordinary things for a caller to pass.
 #[test]
 fn a_batch_may_be_trivia() {
-    let (_path, database) = fresh("batch-trivia");
+    let (_directory, _path, database) = fresh("batch-trivia");
     let connection = database.session();
     connection
         .execute_batch("")
@@ -681,7 +681,7 @@ fn a_batch_may_be_trivia() {
 /// the rowid survives a reopen.
 #[test]
 fn an_implicit_rowid_is_stable_across_a_reopen() {
-    let (path, database) = fresh("rowid");
+    let (_directory, path, database) = fresh("rowid");
     {
         let connection = database.session();
         connection
@@ -719,7 +719,7 @@ fn an_implicit_rowid_is_stable_across_a_reopen() {
 /// that no longer exists, which is a wrong answer rather than an error.
 #[test]
 fn a_schema_change_reaches_an_open_connection() {
-    let (_path, database) = fresh("schema-change");
+    let (_directory, _path, database) = fresh("schema-change");
     let connection = database.session();
     connection
         .execute_batch(

@@ -572,6 +572,9 @@ fn main() -> ExitCode {
         }
     };
     limit_processor_share(&options);
+    // Held until `main` returns, so every cargo build and test process this run
+    // starts writes its temporary files in a folder the drop removes.
+    let _run_folder = enter_run_folder();
     match run(&options) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -601,6 +604,26 @@ fn limit_processor_share(options: &Options) {
         std::env::set_var("CARGO_BUILD_JOBS", jobs.to_string());
     }
     println!("{}", entered.describe(options.cpu_percent, processors));
+}
+
+/// Gives this run a temporary folder of its own and points `TMP`, `TEMP` and
+/// `TMPDIR` at it, after removing the folders of runs that have ended.
+///
+/// Tests that make a folder remove it themselves through
+/// `inillucent_base::testing::ScratchDir`. This catches everything else: a
+/// test that failed and kept its folder, a program's own temporary file, a
+/// file a test held open when its folder was removed. Without it the system
+/// temporary directory gained thousands of `inillucent-*` folders a run.
+fn enter_run_folder() -> Option<inillucent_compat::run_temp::RunFolder> {
+    let folder = inillucent_compat::run_temp::enter(&inillucent_compat::run_temp::default_parent());
+    match &folder {
+        Some(folder) => println!("temporary files go in {}", folder.path().display()),
+        None => eprintln!(
+            "inillucent-testrun: could not make a temporary folder for this run; using {}",
+            std::env::temp_dir().display()
+        ),
+    }
+    folder
 }
 
 /// Selects, builds, runs and reports. Returns whether everything passed.

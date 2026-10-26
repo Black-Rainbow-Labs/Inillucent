@@ -20,15 +20,15 @@ sha256 = "99c47dc3dfa4ad44fcc52207778baafad736673f3f941526ffe5da963e663dd6"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/corpus.rs"
-ticket = "task-1973"
-reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. Doc comments on len, load_from_postgres and load_cache."
-sha256 = "51481630369add08d37508f8ddbac2ae5dd552feda58bc44f3914ee0e7ed1510"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "4238efa39d146b654638f8ddd09be64264428808d6f2afe5065be37d8c55c1de"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/embedcheck.rs"
-ticket = "task-2158"
-reason = "task-2158: the test manifest names its kind, a bi encoder, because ModelManifest gained the kind field. No change to what the test checks."
-sha256 = "5fabf9326cc46ceec6b61793c6c788fd0f71574c0cafb732800ffa94f4deabc2"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "8cf76bb23b0affc1b7865e816a9518f7f8c74aa60c138a8593b363acbbd8dec1"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/engine.rs"
@@ -44,9 +44,9 @@ sha256 = "27557ced0f24df8d887b329b2a92e408aaaafc856fcdeaa4dac3b7306e91c253"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/gradeembed.rs"
-ticket = "task-2110"
-reason = "Bug 5: a manifest can say runnable false, for a model whose vectors come from outside (the Qwen3 teachers), and an installed arm that fails to open fails the arm tests rather than skipping"
-sha256 = "be730b4033a68e3ca632e3af9d4636b856d7c0e6ca0299eaed2a67d1593cdb9a"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "403de0a1037f318c1112747ae6de45126dd5004fc1e3f47d2fce2422962d60a9"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/gradeembed/card.rs"
@@ -80,9 +80,9 @@ sha256 = "641c0bafaaaa7821837056b1f26a50d8211e10693074d87df99ab9868754bf9e"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/models.rs"
-ticket = "task-2217"
-reason = "a string literal that held the indentation of a joined line is one line again"
-sha256 = "43b80e0a6d91dd9f826a65426e41ef600f6cd51224e31840add9f9d5b9eaff6e"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "45a784d369d918eeb45810cd6188c8c3fb47eaa47bee8495eed09618f679742d"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/queryset.rs"
@@ -110,9 +110,9 @@ sha256 = "6c4871ee82a2fb419d0b1989b9e964eda7dbe3c82401cba6bdd48a128ac3a8c6"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/runs.rs"
-ticket = "task-1973"
-reason = "task-1973 turned on the four lints and missing_docs for this crate (#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)] on main.rs). 191 sites answered; every one in this file now propagates a caught error or reads through .get(). No measurement changed: the crate's 178 tests pass unchanged. Doc comments on written, dir and host_facts."
-sha256 = "ab97d168e77fe4bbe9bc57da7ee278d9467c4673c72f6af6d8e497b2f08d01eb"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "3556ae802508a3d194050a760d803638b4cb03b6e7e3335715281b16caa9b6bb"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/scenarios.rs"
@@ -146,9 +146,9 @@ sha256 = "fa7a8835c1902cb0416076044c595c8bd41be314ae9a51061b19727e03f31dc2"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/truncation.rs"
-ticket = "task-2158"
-reason = "task-2158: the test manifest names its kind, a bi encoder, because ModelManifest gained the kind field. No change to what the test checks."
-sha256 = "23cc5f3da17c99e162acbfca9b39325ce9e0417e56439239355eaf5ac8b67dc0"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "3197b61f6e65f9f369882163c7d5433c73a8393ff29a35ddff9288283c42662c"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/tune.rs"
@@ -212,9 +212,9 @@ sha256 = "c1c16dcb7d765bdf32aa3e0664f9e21a572f90037f56ef8849cfc4a6e30a2f52"
 
 [[amendment]]
 path = "crates/inillucent-core/src/flat.rs"
-ticket = "task-2209"
-reason = "the exact vector scan splits its work into tasks of at least 2,048 vectors. Same results; checked by the search suites."
-sha256 = "b034924d8df5e6adea39f46a8a66be40d53753f4651c6462bb6812ab8aab9b99"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "bf5f02da6854749ba80d520d64461d4d4b4449e5027e0f44346fb1607aae12e5"
 
 [[amendment]]
 path = "crates/inillucent-core/src/hnsw.rs"
@@ -230,9 +230,9 @@ sha256 = "9ab31d3d3a9ac703d640ed5a13d1725ba95009357d35512ec063a91c1426304d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/install.rs"
-ticket = "task-2248"
-reason = "Tokenizer packs: the tokenizer folder (INILLUCENT_TOKENIZER_DIR when set, and only it, else <home>/tokenizers), the lookup by name that refuses a file naming another pack, the size checked read, and the sorted list of installed names. Two tests under env_guard."
-sha256 = "6d4363c67591748a4389df6ef1aba9b4d7a71557c730ddddbe189ccee532d038"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "d0aae4d6505726b198c082de2f497c20a53d60954579f80fa12c9124042fdc06"
 
 [[amendment]]
 path = "crates/inillucent-core/src/lib.rs"
@@ -242,15 +242,15 @@ sha256 = "52532bba8f27b259787d4d7394ee3731d0e3bcfb632d9e3201b80647be8563e2"
 
 [[amendment]]
 path = "crates/inillucent-core/src/model.rs"
-ticket = "task-2161"
-reason = "task-2161: ModelManifest::read and write return anyhow::Result instead of Result<_, String>, and a test checks a caller's context reaches the error. No change to what a manifest holds."
-sha256 = "99e6623fdd7f1026b6829b901ebc2b8107b7ddd3c6abc37cd4518de3fdfaa9ba"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "a6d63d879202f313b21a3f588aa295998c7f1a09f52bb37385a6f21fbeeafb11"
 
 [[amendment]]
 path = "crates/inillucent-core/src/persist.rs"
-ticket = "task-2209"
-reason = "a search segment is read from bytes already in memory without copying each section; reading_from_memory_agrees_with_reading_a_stream checks it against the stream reader."
-sha256 = "fc2996adde4e4646c332fb091d9a313c206c5f65485714539fb62c0deaa99907"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "d38b2057af57bb76fa70b29c2ee8bb220cb3c144ae5f35b7b88dad6189680594"
 
 [[amendment]]
 path = "crates/inillucent-core/src/quantize.rs"
@@ -278,9 +278,9 @@ sha256 = "824db2f2a57ddb63805e88c6a34350d9ae8eda9b20f3989e1afd6b9b62726e47"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"
-ticket = "task-2217"
-reason = "a test assertion message that held the indentation of a joined line is one line again"
-sha256 = "0788bef043d67c3ae8d5f563e5c9c2252635bfc03766463dd5c4468bfc3db42a"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "0f6a523f95b739cc1e52ebcd030e7658d5037e3e19688f27159c594d1729823d"
 
 [[amendment]]
 path = "crates/inillucent-core/src/tokenize.rs"
@@ -314,9 +314,9 @@ sha256 = "689184215601d4c4541bf2d612c06a5e93e26e3adcf0539051562c9ff6502cd8"
 
 [[amendment]]
 path = "crates/inillucent-core/src/vectors.rs"
-ticket = "task-2068"
-reason = "read_exact_at is pub(crate) so the filed text arena can use the same positional read the filed vectors do."
-sha256 = "dfa1613a5b921453856c3822f6add1db9a8245400860a07c9c5918895cf69b23"
+ticket = "task-2367"
+reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
+sha256 = "cf9489f4533ea8f5d95a86c9e026148ee6beaea973b52af9e72b981f207c58e6"
 
 [[amendment]]
 path = "inillucent-scorecard.json"

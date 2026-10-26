@@ -158,33 +158,25 @@ fn dial(address: &str) -> Stream {
     Stream::from_socket(socket)
 }
 
-/// Returns a scratch path nothing else is using.
+/// Returns a fresh folder and the path of a database file inside it.
+///
+/// **The folder holds every file a migration writes.** The staging file and the
+/// report sit beside the destination, so removing the folder removes all of
+/// them. The caller binds the guard with a named binding and keeps it for the
+/// whole test, because the folder is removed when the guard drops.
 ///
 /// @param name - what to call it
-fn scratch(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "inillucent-protocol-{name}-{}-{}.rdb",
+fn scratch(name: &str) -> (inillucent_base::testing::ScratchDir, PathBuf) {
+    let directory = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-protocol-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0)
     ));
-    path
-}
-
-/// Removes a migration's output and its report.
-///
-/// @param destination - the published path
-fn clean(destination: &Path) {
-    let _ = std::fs::remove_file(destination);
-    let name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let _ = std::fs::remove_file(destination.with_file_name(format!("{name}.migration-report.md")));
-    let _ = std::fs::remove_file(destination.with_file_name(format!(".{name}.staging")));
+    let path = directory.join(format!("{name}.rdb"));
+    (directory, path)
 }
 
 /// Reports where two byte strings first differ, for a readable failure.
@@ -222,7 +214,7 @@ fn replay_postgres(file: &str, url: &str, name: &str) -> inillucent_remote::Repo
     let (address, said) = serve(recorded.server);
     let parsed = ConnectionUrl::parse(&url.replace("HOSTPORT", &address)).expect("parses");
     let mut source = PostgresSource::over(dial(&address), &parsed).expect("the handshake runs");
-    let destination = scratch(name);
+    let (_scratch, destination) = scratch(name);
     let report = run(&Plan::new(parsed, &destination), &mut source).expect("the migration runs");
     source.finish();
     let produced = said.recv().unwrap_or_default();
@@ -232,7 +224,6 @@ fn replay_postgres(file: &str, url: &str, name: &str) -> inillucent_remote::Repo
         "the client's own bytes changed since the recording. {}",
         first_difference(&produced, &recorded.client)
     );
-    clean(&destination);
     report
 }
 
@@ -276,7 +267,7 @@ fn a_replayed_migration_publishes_the_same_values_a_live_one_did() {
     ))
     .expect("parses");
     let mut source = PostgresSource::over(dial(&address), &url).expect("the handshake runs");
-    let destination = scratch("pg-values");
+    let (_scratch, destination) = scratch("pg-values");
     let report = run(&Plan::new(url, &destination), &mut source).expect("the migration runs");
     source.finish();
     let _ = said.recv();
@@ -304,7 +295,6 @@ fn a_replayed_migration_publishes_the_same_values_a_live_one_did() {
     );
     let _ = connection;
     drop(database);
-    clean(&destination);
 }
 
 /// A whole migration over a recorded `mysql_native_password` login. The
@@ -319,7 +309,7 @@ fn a_recorded_mysql_native_password_migration_replays_byte_for_byte() {
     ))
     .expect("parses");
     let mut source = MysqlSource::over(dial(&address), &url).expect("the handshake runs");
-    let destination = scratch("my-native");
+    let (_scratch, destination) = scratch("my-native");
     let report = run(&Plan::new(url, &destination), &mut source).expect("the migration runs");
     source.finish();
     let produced = said.recv().unwrap_or_default();
@@ -333,7 +323,6 @@ fn a_recorded_mysql_native_password_migration_replays_byte_for_byte() {
     assert!(report.server.starts_with("MySQL 8.4"), "{}", report.server);
     assert_eq!(report.tables.len(), 4);
     assert_eq!(report.rows(), 10);
-    clean(&destination);
 }
 
 /// An account with **no** password answers with an empty response rather than
@@ -346,7 +335,7 @@ fn a_recorded_mysql_passwordless_login_replays_byte_for_byte() {
     let url = ConnectionUrl::parse(&format!("mysql://root@{address}/inillucent_migrate_test"))
         .expect("parses");
     let mut source = MysqlSource::over(dial(&address), &url).expect("the handshake runs");
-    let destination = scratch("my-root");
+    let (_scratch, destination) = scratch("my-root");
     let report = run(&Plan::new(url, &destination), &mut source).expect("the migration runs");
     source.finish();
     let produced = said.recv().unwrap_or_default();
@@ -357,7 +346,6 @@ fn a_recorded_mysql_passwordless_login_replays_byte_for_byte() {
         first_difference(&produced, &recorded.client)
     );
     assert!(report.passed(), "{:?}", report.failures());
-    clean(&destination);
 }
 
 // ---------------------------------------------------------------------------

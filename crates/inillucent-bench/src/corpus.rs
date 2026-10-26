@@ -571,11 +571,14 @@ mod tests {
     use super::*;
     use inillucent_core::model::{ModelManifest, Prefixes};
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("inillucent-corpus-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    use inillucent_base::testing::ScratchDir;
+
+    /// Makes an empty folder for one test; the folder is removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole test.
+    ///
+    /// @param name - what to name the folder after
+    fn scratch(name: &str) -> ScratchDir {
+        ScratchDir::new(&format!("inillucent-corpus-{}-{name}", std::process::id()))
     }
 
     fn chunk(i: usize, content: &str) -> ChunkInput {
@@ -649,7 +652,6 @@ mod tests {
             );
             assert_eq!(read.vectors[i], written.vectors[i]);
         }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The header alone must be readable without paying for the vectors, because
@@ -664,7 +666,6 @@ mod tests {
             read_header(&path).unwrap(),
             load_cache(&path).unwrap().header
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A cache the harness has never seen is refused with its own first bytes in
@@ -677,7 +678,6 @@ mod tests {
         let err = read_header(&path).unwrap_err().to_string();
         assert!(err.contains("is not a cache this harness reads"), "{err}");
         assert!(err.contains("NOTACACH"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The corpus digest is taken over the chunks rather than over a file, and

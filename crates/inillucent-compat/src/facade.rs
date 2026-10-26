@@ -39,15 +39,52 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_base::DbResult;
 use inillucent_engine::connect::Database as Engine;
 use inillucent_tree::datum::{owned_row_values, OwnedDatum};
 use inillucent_value::Value;
 
+/// The engine handle, with the staging folder it was imported from when it has
+/// one.
+///
+/// **The folder is removed when the last holder of the engine lets go.** The
+/// database, every connection and every statement share one `Rc<Held>`, so a
+/// connection that outlives the `Database` it came from keeps the staging folder
+/// alive too. The fields drop in the order they are declared, so the engine
+/// closes its files before the folder is removed.
+struct Held {
+    /// The engine every call goes to.
+    engine: Engine,
+    /// The folder a staged import was copied into, removed on drop.
+    _staging: Option<ScratchDir>,
+}
+
+impl Held {
+    /// Wraps an engine that lives in a folder this value does not own.
+    ///
+    /// @param engine - the open engine
+    fn plain(engine: Engine) -> Held {
+        Held {
+            engine,
+            _staging: None,
+        }
+    }
+}
+
+impl std::ops::Deref for Held {
+    type Target = Engine;
+
+    /// Returns the engine, so calls read the way they did before the wrapper.
+    fn deref(&self) -> &Engine {
+        &self.engine
+    }
+}
+
 /// An open database file.
 pub struct Database {
     /// The engine, shared with every connection opened from it.
-    engine: Rc<Engine>,
+    engine: Rc<Held>,
 }
 
 impl Database {
@@ -56,7 +93,7 @@ impl Database {
     /// @param path - the database file
     pub fn open(path: impl AsRef<Path>) -> DbResult<Database> {
         Ok(Database {
-            engine: Rc::new(Engine::open(path)?),
+            engine: Rc::new(Held::plain(Engine::open(path)?)),
         })
     }
 
@@ -74,7 +111,7 @@ impl Database {
     /// @param frames - how many frames the buffer pool holds
     pub fn open_at(path: impl AsRef<Path>, page_size: usize, frames: usize) -> DbResult<Database> {
         Ok(Database {
-            engine: Rc::new(Engine::open_at(path, page_size, frames)?),
+            engine: Rc::new(Held::plain(Engine::open_at(path, page_size, frames)?)),
         })
     }
 
@@ -108,7 +145,7 @@ impl Database {
     /// @param path - the SQLite database the oracle built
     pub fn import(path: impl AsRef<Path>) -> DbResult<Database> {
         Ok(Database {
-            engine: Rc::new(Engine::import(path)?),
+            engine: Rc::new(Held::plain(Engine::import(path)?)),
         })
     }
 
@@ -120,20 +157,30 @@ impl Database {
     /// which is how two of them turned up in `git status`. Staging first also
     /// means a failed import cannot touch the fixture every other suite reads.
     ///
+    /// The scratch directory is removed when the database and every connection
+    /// and statement made from it have been dropped. Two calls with the same
+    /// `tag` in one process share a directory name, so a caller that opens the
+    /// same fixture twice at once gives each call its own tag.
+    ///
     /// @param source - the tracked SQLite fixture
     /// @param tag - a name for the scratch directory, unique per suite
     pub fn import_staged(source: impl AsRef<Path>, tag: &str) -> DbResult<Database> {
         let source = source.as_ref();
-        let directory =
-            std::env::temp_dir().join(format!("inillucent-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).map_err(|error| {
-            inillucent_base::error::misuse(format!("cannot make {}: {error}", directory.display()))
+        let path = std::env::temp_dir().join(format!("inillucent-{tag}-{}", std::process::id()));
+        let directory = ScratchDir::try_at(path.clone()).map_err(|error| {
+            inillucent_base::error::misuse(format!("cannot make {}: {error}", path.display()))
         })?;
         let staged = directory.join(source.file_name().unwrap_or_default());
         std::fs::copy(source, &staged).map_err(|error| {
             inillucent_base::error::misuse(format!("cannot stage {}: {error}", source.display()))
         })?;
-        Database::import(staged)
+        let engine = Engine::import(staged)?;
+        Ok(Database {
+            engine: Rc::new(Held {
+                engine,
+                _staging: Some(directory),
+            }),
+        })
     }
 
     /// Returns what the page cache has been asked to do, across every
@@ -203,7 +250,7 @@ impl Database {
 /// A connection to a database.
 pub struct Connection {
     /// The database, held so a connection can outlive the handle it came from.
-    engine: Rc<Engine>,
+    engine: Rc<Held>,
     /// Which connection this is, so that every call is the same one.
     session: u64,
 }
@@ -400,7 +447,7 @@ pub struct Statement<'connection> {
     /// The engine's statement.
     inner: inillucent_engine::connect::Statement<'connection>,
     /// The database, so the statement can be described after it is compiled.
-    engine: Rc<Engine>,
+    engine: Rc<Held>,
     /// The statement's own text, kept for [`Statement::explain`].
     sql: String,
     /// The connection it was compiled on, so a plan is described against the

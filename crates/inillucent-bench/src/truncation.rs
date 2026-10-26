@@ -116,8 +116,10 @@ mod tests {
     /// 0.36 per cent on the card, and the number gate C3 is read from.
     #[test]
     fn a_served_arm_counts_its_truncation_like_a_loaded_one() {
-        let dir = std::env::temp_dir().join("inillucent-served-truncation");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-served-truncation-{}",
+            std::process::id()
+        ));
         write_word_tokenizer(&dir);
         let path = dir.to_string_lossy().to_string();
 
@@ -161,6 +163,5 @@ mod tests {
             "a served arm has the same tokenizer and must reach the same count: \
              {served} against {loaded}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

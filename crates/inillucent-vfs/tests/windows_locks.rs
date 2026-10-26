@@ -26,19 +26,21 @@ use inillucent_vfs::contract::{FileLock, OpenOptions, Vfs, VfsFile};
 use inillucent_vfs::os::OsVfs;
 use inillucent_vfs::path::DbPath;
 
-/// Creates a fresh directory for one test and returns the database path in it.
+/// Creates a fresh directory for one test and returns its guard and the
+/// database path in it.
+///
+/// The directory is removed when the guard drops, so the caller binds the guard
+/// with a named binding and keeps it for the whole test, declared before any
+/// handle opened on the database.
 ///
 /// @param name - the test's name
-fn scratch(name: &str) -> DbPath {
-    let mut root = std::env::temp_dir();
-    root.push(format!(
-        "inillucent-vfs-windows-locks/{name}-{}",
+fn scratch(name: &str) -> (inillucent_base::testing::ScratchDir, DbPath) {
+    let guard = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-vfs-windows-locks-{name}-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("the temporary directory is writable");
-    root.push("db.rdb");
-    DbPath::new(root)
+    let path = DbPath::new(guard.join("db.rdb"));
+    (guard, path)
 }
 
 /// Opens one handle on the database, creating it when it is not there.
@@ -61,7 +63,7 @@ fn handle(vfs: &OsVfs, path: &DbPath) -> Box<dyn VfsFile> {
 /// have to meet.
 #[test]
 fn a_second_handle_in_this_process_is_refused_the_read_lock() {
-    let path = scratch("exclusive");
+    let (_scratch, path) = scratch("exclusive");
     let vfs = OsVfs::new();
     let writer = handle(&vfs, &path);
     let reader = handle(&vfs, &path);
@@ -106,7 +108,7 @@ fn a_second_handle_in_this_process_is_refused_the_read_lock() {
 /// twenty microseconds.
 #[test]
 fn a_reader_retries_the_pending_byte_before_reporting_busy() {
-    let path = scratch("pending");
+    let (_scratch, path) = scratch("pending");
     let vfs = OsVfs::new();
     let writer = handle(&vfs, &path);
     let reader = handle(&vfs, &path);
@@ -141,7 +143,7 @@ fn a_reader_retries_the_pending_byte_before_reporting_busy() {
 /// make two connections to one database take turns.
 #[test]
 fn two_readers_in_this_process_share_the_file() {
-    let path = scratch("two-readers");
+    let (_scratch, path) = scratch("two-readers");
     let vfs = OsVfs::new();
     let first = handle(&vfs, &path);
     let second = handle(&vfs, &path);
@@ -175,7 +177,7 @@ fn two_readers_in_this_process_share_the_file() {
 /// process is exactly the case that distinguishes the two implementations.
 #[test]
 fn a_reserved_lock_is_visible_to_another_handle_here() {
-    let path = scratch("reserved");
+    let (_scratch, path) = scratch("reserved");
     let vfs = OsVfs::new();
     let writer = handle(&vfs, &path);
     let reader = handle(&vfs, &path);

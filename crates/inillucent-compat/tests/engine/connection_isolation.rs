@@ -9,20 +9,19 @@
 //! `ROLLBACK`: an acknowledged write was lost with nothing reported. SQLite and
 //! Python's `sqlite3` isolate two connections and refuse the second writer.
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_base::PrimaryCode;
 use inillucent_engine::connect::Database;
 use inillucent_tree::datum::OwnedDatum;
 
-/// A scratch directory of this test's own.
+/// A scratch directory of this test's own, removed when the returned guard drops.
 ///
 /// @param name - what to call it
-fn scratch(name: &str) -> std::path::PathBuf {
-    let directory = std::env::temp_dir()
-        .join("inillucent-connection-isolation")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the scratch directory is made");
-    directory
+fn scratch(name: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
+        "inillucent-connection-isolation-{}-{name}",
+        std::process::id()
+    ))
 }
 
 /// Reads the one number a `SELECT count(*)` answers.
@@ -38,22 +37,27 @@ fn count_of(rows: Vec<Vec<OwnedDatum>>) -> i64 {
 /// Makes a database holding an empty table `t`, and a second connection that does not wait for a
 /// lock, so a refusal shows at once.
 ///
+/// Returns the scratch directory guard with the database. The directory is
+/// removed when the guard drops, so the caller binds the guard first and keeps
+/// it for as long as the database is open.
+///
 /// @param name - the test's name
-fn database_with_a_table(name: &str) -> Database {
-    let database = Database::open(scratch(name).join("isolated.rdb")).expect("the file opens");
+fn database_with_a_table(name: &str) -> (ScratchDir, Database) {
+    let directory = scratch(name);
+    let database = Database::open(directory.join("isolated.rdb")).expect("the file opens");
     // Session 1 is the one the test's first `session()` would get, so the first connection of
     // each test is the one the open made.
     database
         .session_as(1)
         .execute_batch("CREATE TABLE t (a INTEGER)")
         .expect("the table is made");
-    database
+    (directory, database)
 }
 
 /// A `BEGIN` on one connection is not joined by the other, and the other reads nothing of it.
 #[test]
 fn a_second_connection_does_not_read_the_first_ones_uncommitted_rows() {
-    let database = database_with_a_table("dirty_read");
+    let (_scratch, database) = database_with_a_table("dirty_read");
     let first = database.session();
     let second = database.session();
     first.execute_batch("BEGIN").expect("BEGIN");
@@ -97,7 +101,7 @@ fn a_second_connection_does_not_read_the_first_ones_uncommitted_rows() {
 /// A write through the second connection is not undone by the first one's `ROLLBACK`.
 #[test]
 fn a_rollback_on_one_connection_does_not_undo_a_write_through_another() {
-    let database = database_with_a_table("lost_write");
+    let (_scratch, database) = database_with_a_table("lost_write");
     let first = database.session();
     let second = database.session();
     first.execute_batch("BEGIN").expect("BEGIN");
@@ -124,7 +128,7 @@ fn a_rollback_on_one_connection_does_not_undo_a_write_through_another() {
 /// A second writer is refused with `busy`, as a writer in a second process is.
 #[test]
 fn a_second_writer_is_refused_busy_while_the_first_holds_the_file() {
-    let database = database_with_a_table("busy");
+    let (_scratch, database) = database_with_a_table("busy");
     let first = database.session();
     let second = database.session();
     second
@@ -151,7 +155,7 @@ fn a_second_writer_is_refused_busy_while_the_first_holds_the_file() {
 /// `temp` tables, which were already scoped to a connection, stay scoped to it.
 #[test]
 fn a_temporary_table_belongs_to_the_connection_that_made_it() {
-    let database = database_with_a_table("temp");
+    let (_scratch, database) = database_with_a_table("temp");
     let first = database.session();
     let second = database.session();
     first
@@ -166,7 +170,7 @@ fn a_temporary_table_belongs_to_the_connection_that_made_it() {
 /// A session continued with `session_as` runs on the same engine, so its transaction goes on.
 #[test]
 fn a_continued_session_keeps_its_transaction() {
-    let database = database_with_a_table("continued");
+    let (_scratch, database) = database_with_a_table("continued");
     let _first = database.session();
     let number = database.session().session();
     database
@@ -193,7 +197,7 @@ fn a_continued_session_keeps_its_transaction() {
 /// Releasing a session rolls its transaction back and gives the file to the next writer.
 #[test]
 fn releasing_a_session_ends_its_transaction() {
-    let database = database_with_a_table("released");
+    let (_scratch, database) = database_with_a_table("released");
     let _first = database.session();
     let number = database.session().session();
     database
@@ -248,7 +252,7 @@ fn two_connections_of_a_memory_database_have_a_transaction_each() {
 /// Releasing the first session rolls its transaction back too, though its engine stays.
 #[test]
 fn releasing_the_first_session_ends_its_transaction() {
-    let database = database_with_a_table("released_first");
+    let (_scratch, database) = database_with_a_table("released_first");
     let first = database.session();
     let number = first.session();
     first

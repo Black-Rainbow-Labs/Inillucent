@@ -597,12 +597,11 @@ mod tests {
     #[test]
     fn a_filed_set_returns_what_the_resident_set_returns() {
         let (resident, store) = fixture(6_000);
-        let directory = std::env::temp_dir().join(format!(
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
             "inillucent-flat-filed-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::create_dir_all(&directory);
         let path = directory.join("vectors.raw");
         std::fs::write(
             &path,
@@ -647,7 +646,6 @@ mod tests {
                 );
             }
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// Pins the defect the streaming path had: it computed `1.0 - dot(stored,
@@ -684,12 +682,11 @@ mod tests {
         resident.push(&[0.9, 0.1, 0.0, 0.0]);
         let query = [1.0f32, 0.0, 0.0, 0.0];
 
-        let directory = std::env::temp_dir().join(format!(
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
             "inillucent-flat-l2-streaming-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::create_dir_all(&directory);
         let path = directory.join("vectors.raw");
         std::fs::write(
             &path,
@@ -714,6 +711,5 @@ mod tests {
             Some(1),
             "the streaming path answered by cosine, not by the L2 metric this set was built under"
         );
-        let _ = std::fs::remove_file(&path);
     }
 }

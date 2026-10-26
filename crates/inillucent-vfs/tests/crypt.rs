@@ -56,17 +56,13 @@ fn the_encrypting_vfs_passes_the_conformance_suite() {
     assert!(report.is_clean(), "{}", report.to_text());
     assert!(report.passed() >= 24, "{}", report.to_text());
 
-    let mut root = std::env::temp_dir();
-    root.push(format!(
+    let root = inillucent_base::testing::ScratchDir::new(&format!(
         "inillucent-vfs-crypt-conformance-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("the directory is made");
     let crypt = CryptVfs::new(Arc::new(OsVfs::new()), key()).expect("made");
-    let report = conformance::run(&crypt, &DbPath::new(root.clone()));
+    let report = conformance::run(&crypt, &DbPath::new(root.to_path_buf()));
     assert!(report.is_clean(), "{}", report.to_text());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A deterministic generator, so a failing sequence can be replayed.

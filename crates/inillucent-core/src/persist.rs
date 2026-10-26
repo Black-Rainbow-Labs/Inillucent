@@ -1742,14 +1742,16 @@ mod tests {
         index
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
+    /// Makes an empty folder for one test; the folder is removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole test
+    /// and declares it before any index loaded from it.
+    ///
+    /// @param name - what to name the folder after
+    fn temp_dir(name: &str) -> inillucent_base::testing::ScratchDir {
+        inillucent_base::testing::ScratchDir::new(&format!(
             "inillucent-persist-test-{name}-{}",
             std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&p);
-        p
+        ))
     }
 
     /// **A loaded index answers with the same chunk text, reading it from the file.**
@@ -1801,8 +1803,6 @@ mod tests {
                 "chunk {chunk} changed when the text was read into memory"
             );
         }
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1844,8 +1844,6 @@ mod tests {
             .map(|h| h.chunk)
             .collect();
         assert_eq!(la, lb, "the lexical index did not survive the round trip");
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1874,7 +1872,6 @@ mod tests {
             let b = loaded.compile(&filter).pass_count();
             assert_eq!(a, b, "pass count differed for {filter:?}");
         }
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1900,7 +1897,6 @@ mod tests {
             deleted_after > 0,
             "the fixture should contain a deleted document"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1923,16 +1919,13 @@ mod tests {
             format!("{err:#}").contains("format version"),
             "expected a version complaint, got: {err:#}"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_file_that_is_not_an_index_is_refused() {
         let dir = temp_dir("garbage");
-        fs::create_dir_all(&dir).unwrap();
         fs::write(path(&dir, "config.bin"), b"this is not an index at all").unwrap();
         assert!(load(&dir).map(|_| ()).is_err());
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The defect this format version exists to fix. An index built with every
@@ -1985,8 +1978,6 @@ mod tests {
         assert_eq!(a.mmr_lambda, b.mmr_lambda);
         assert_eq!(a.adaptive_fusion, b.adaptive_fusion);
         assert_eq!(format!("{:?}", a.adaptive), format!("{:?}", b.adaptive));
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The settings surviving is not the point on its own; the point is that the
@@ -2023,8 +2014,6 @@ mod tests {
             .collect();
         assert_eq!(a, b, "the reopened index ranked differently");
         assert!(!a.is_empty(), "the fixture should return hits at all");
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2044,7 +2033,6 @@ mod tests {
             generation_dir(&dir, first).join("store.bin").exists(),
             "the superseded generation was removed while a reader could still hold it"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A crash during a save must leave the previous index openable. Simulated by
@@ -2064,7 +2052,6 @@ mod tests {
         let reopened = load(&dir).unwrap();
         assert_eq!(reopened.store().n_chunks(), index.store().n_chunks());
         assert!(is_readable(&dir));
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A reader that is handed a generation number and finds the directory gone
@@ -2096,7 +2083,6 @@ mod tests {
             load(&dir).unwrap().store().n_chunks(),
             index.store().n_chunks()
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A corrupt file is refused rather than retried. Re-reading a pointer cannot
@@ -2117,16 +2103,13 @@ mod tests {
             format!("{error:#}").contains("index file") || format!("{error:#}").contains("header"),
             "expected a header complaint, got: {error:#}"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_directory_that_was_never_saved_to_is_not_readable() {
         let dir = temp_dir("empty");
-        fs::create_dir_all(&dir).unwrap();
         assert!(!is_readable(&dir));
         assert!(load(&dir).is_err());
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Only three generations may ever be on disk: the live one and one superseded
@@ -2145,7 +2128,6 @@ mod tests {
             "{} generations left on disk: {generations:?}",
             generations.len()
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The reason the lexical index is now a file: deriving it means running the
@@ -2178,7 +2160,6 @@ mod tests {
                 assert_eq!(l.matched_terms, r.matched_terms);
             }
         }
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Everything the new store format carries has to come back: flags, named
@@ -2246,7 +2227,6 @@ mod tests {
         // And the document lookup rebuilds over live documents only, so a
         // tombstoned document stays tombstoned across a restart.
         assert!(!loaded.tombstone("slack", "d3"));
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A reopened index must be appendable, which means every counter the append
@@ -2284,7 +2264,6 @@ mod tests {
         // And it saves again, into a further generation.
         save(&loaded, &dir).unwrap();
         assert_eq!(load(&dir).unwrap().store().n_chunks(), before + 1);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Every index already on disk was written under the engine's old name, whose
@@ -2319,7 +2298,6 @@ mod tests {
         let generation = fs::read_to_string(dir.join("current")).unwrap();
         let config = fs::read(dir.join(generation.trim()).join("config.bin")).unwrap();
         assert_eq!(&config[..8], MAGIC);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Rewrites a generation's `config.bin` JSON body in place, keeping the
@@ -2372,7 +2350,6 @@ mod tests {
             .vector_search(&query, &filter, 5, Some(64))
             .expect("the query is this index's width and finite")
             .is_empty());
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A metric this build does not have is refused, the same rule
@@ -2396,7 +2373,6 @@ mod tests {
             format!("{error:#}").contains("manhattan"),
             "the refusal should name the unrecognised metric: {error:#}"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// An L2 index round trips: the metric survives, the vectors keep their
@@ -2434,7 +2410,6 @@ mod tests {
             .map(|n| n.chunk)
             .collect();
         assert_eq!(a, b, "the L2 graph did not survive the round trip");
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The byte-stream form (`write_index`/`read_index`, what a shadow table

@@ -25,6 +25,7 @@
 //! is the same claim ("the lever changed what runs") in terms the new engine
 //! can answer.
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_engine::connect::{Connection, Database};
 use inillucent_sql::plan::Levers;
 use inillucent_tree::datum::OwnedDatum;
@@ -119,9 +120,10 @@ const INDEXED_WRITES: [&str; 3] = [
 /// Turning the covering-index lever off changes the plan and not the answer.
 #[test]
 fn the_covering_index_arm_changes_the_plan_and_not_the_answer() {
-    let directory = std::env::temp_dir().join("inillucent-levers-covering");
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the scratch directory is made");
+    let directory = ScratchDir::new(&format!(
+        "inillucent-levers-covering-{}",
+        std::process::id()
+    ));
     let database = fixture(&directory.join("arm.db"));
     let connection = database.session();
 
@@ -143,7 +145,6 @@ fn the_covering_index_arm_changes_the_plan_and_not_the_answer() {
             "the two arms disagree about the answer: {sql}"
         );
     }
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// Turning the ordered-walk lever off changes the plan and not the answer.
@@ -152,9 +153,7 @@ fn the_covering_index_arm_changes_the_plan_and_not_the_answer() {
 /// failure is silent: rows in the wrong order look exactly like rows.
 #[test]
 fn the_ordered_walk_arm_changes_the_plan_and_not_the_answer() {
-    let directory = std::env::temp_dir().join("inillucent-levers-ordered");
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the scratch directory is made");
+    let directory = ScratchDir::new(&format!("inillucent-levers-ordered-{}", std::process::id()));
     let database = fixture(&directory.join("arm.db"));
     let connection = database.session();
 
@@ -176,15 +175,12 @@ fn the_ordered_walk_arm_changes_the_plan_and_not_the_answer() {
             "the two arms disagree about the answer: {sql}"
         );
     }
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// Turning the streaming-group lever off changes the plan and not the answer.
 #[test]
 fn the_streaming_group_arm_changes_the_plan_and_not_the_answer() {
-    let directory = std::env::temp_dir().join("inillucent-levers-grouped");
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the scratch directory is made");
+    let directory = ScratchDir::new(&format!("inillucent-levers-grouped-{}", std::process::id()));
     let database = fixture(&directory.join("arm.db"));
     let connection = database.session();
 
@@ -206,7 +202,6 @@ fn the_streaming_group_arm_changes_the_plan_and_not_the_answer() {
             "the two arms disagree about the answer: {sql}"
         );
     }
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// Turning the indexed-write lever off changes the plan and not the outcome.
@@ -217,9 +212,7 @@ fn the_streaming_group_arm_changes_the_plan_and_not_the_answer() {
 /// "the write did the same thing" actually means.
 #[test]
 fn the_indexed_write_arm_changes_the_plan_and_not_the_outcome() {
-    let directory = std::env::temp_dir().join("inillucent-levers-writes");
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the scratch directory is made");
+    let directory = ScratchDir::new(&format!("inillucent-levers-writes-{}", std::process::id()));
     let survey = "SELECT id, key, category, label FROM main_table ORDER BY id";
 
     let mut outcomes = Vec::new();
@@ -247,7 +240,6 @@ fn the_indexed_write_arm_changes_the_plan_and_not_the_outcome() {
         outcomes.get(1),
         "the two arms left different tables behind"
     );
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// A statement prepared before the arm moved keeps the arm it was compiled
@@ -258,9 +250,10 @@ fn the_indexed_write_arm_changes_the_plan_and_not_the_outcome() {
 /// arm, and the measurement would silently be of a mixture.
 #[test]
 fn a_prepared_statement_keeps_the_arm_it_was_compiled_under() {
-    let directory = std::env::temp_dir().join("inillucent-levers-prepared");
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the scratch directory is made");
+    let directory = ScratchDir::new(&format!(
+        "inillucent-levers-prepared-{}",
+        std::process::id()
+    ));
     let database = fixture(&directory.join("arm.db"));
     let connection = database.session();
     let sql = COVERING_READS.first().copied().unwrap_or("SELECT 1");
@@ -285,7 +278,6 @@ fn a_prepared_statement_keeps_the_arm_it_was_compiled_under() {
         early_rows, late_rows,
         "a statement compiled under one arm must still answer correctly after the arm moved"
     );
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 // **The checkpoint-budget arm test is gone, not rewritten.** It compared a

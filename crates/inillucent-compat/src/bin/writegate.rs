@@ -60,6 +60,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::affinity::{self, Placement};
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::perf::bind_value;
@@ -368,13 +369,18 @@ fn run(fixture: &Path, settings: &Settings, placement: &Placement) -> Result<Opt
         );
     }
 
-    let plan_path =
-        std::env::temp_dir().join(format!("inillucent-writegate-{}.plan", std::process::id()));
+    // **One folder for the plan and the copies, removed when the run ends.**
+    // Every run used to leave a plan file and a folder of database copies in
+    // the temporary directory, and 1,190 of those folders were found there.
+    // The guard removes the folder on every return, including the early ones
+    // a refused workload takes; a disagreement keeps it below.
+    let scratch = ScratchDir::try_at(
+        std::env::temp_dir().join(format!("inillucent-writegate-{}", std::process::id())),
+    )
+    .map_err(|error| format!("could not make a scratch directory: {error}"))?;
+    let plan_path = scratch.join("workloads.plan");
     std::fs::write(&plan_path, plan.render())
         .map_err(|error| format!("could not write the plan: {error}"))?;
-    let scratch = std::env::temp_dir().join(format!("inillucent-writegate-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch)
-        .map_err(|error| format!("could not make a scratch directory: {error}"))?;
 
     let mut measured: Vec<Paired> = plan
         .workloads
@@ -493,6 +499,12 @@ fn run(fixture: &Path, settings: &Settings, placement: &Placement) -> Result<Opt
         "## gate: {}",
         inillucent_compat::quiet::gate_line(graded, passed)
     );
+    // The two databases are the evidence for a digest that did not match, so a
+    // disagreement keeps them. Anything else is removed with the guard.
+    if measured.iter().any(|entry| !entry.agreed) {
+        let kept = scratch.keep();
+        println!("  a workload disagreed; the two databases are kept in {kept:?}");
+    }
     Ok(graded.then_some(passed))
 }
 

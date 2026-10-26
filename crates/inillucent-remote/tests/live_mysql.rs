@@ -53,20 +53,26 @@ fn url() -> Option<ConnectionUrl> {
     }
 }
 
-/// Returns a scratch path nothing else is using.
+/// Returns a fresh folder and the path of a database file inside it.
+///
+/// **The folder holds every file a migration writes.** The staging file, the
+/// report and the engine's numbered log segments sit beside the destination, so
+/// removing the folder removes all of them. The caller binds the guard with a
+/// named binding and keeps it for the whole test, because the folder is removed
+/// when the guard drops.
 ///
 /// @param name - what to call it
-fn scratch(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "inillucent-remote-{name}-{}-{}.rdb",
+fn scratch(name: &str) -> (inillucent_base::testing::ScratchDir, PathBuf) {
+    let directory = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-remote-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0)
     ));
-    path
+    let path = directory.join(format!("{name}.rdb"));
+    (directory, path)
 }
 
 /// Returns one column of one row as text.
@@ -93,7 +99,7 @@ fn text_of(database: &Database, sql: &str) -> String {
 #[test]
 fn a_live_mysql_database_migrates_verified_and_reads_back() {
     let Some(url) = url() else { return };
-    let destination = scratch("mysql");
+    let (_scratch, destination) = scratch("mysql");
     let report = migrate(&Plan::new(url, &destination)).expect("the migration runs");
 
     for check in &report.checks {
@@ -199,15 +205,6 @@ fn a_live_mysql_database_migrates_verified_and_reads_back() {
     );
 
     drop(database);
-    let _ = std::fs::remove_file(&destination);
-    let report_path = destination.with_file_name(format!(
-        "{}.migration-report.md",
-        destination
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
-    let _ = std::fs::remove_file(&report_path);
 }
 
 /// The catalog read finds the schema the fixture declares, with the column
@@ -272,7 +269,7 @@ fn the_catalog_is_read_before_a_single_row_moves() {
 #[test]
 fn a_destination_that_exists_is_refused() {
     let Some(url) = url() else { return };
-    let destination = scratch("mysql-exists");
+    let (_scratch, destination) = scratch("mysql-exists");
     std::fs::write(&destination, b"not a database").expect("the file is written");
     let error = migrate(&Plan::new(url, &destination)).expect_err("refuses");
     assert!(
@@ -283,5 +280,4 @@ fn a_destination_that_exists_is_refused() {
         "{}",
         error.detail().unwrap_or_else(|| error.message())
     );
-    let _ = std::fs::remove_file(&destination);
 }

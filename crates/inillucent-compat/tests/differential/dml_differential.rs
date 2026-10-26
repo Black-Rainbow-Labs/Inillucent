@@ -917,26 +917,19 @@ fn vacuum_matches_sqlite() {
 /// rather than leaving them for a reopen that would never see them.
 #[test]
 fn vacuum_carries_an_attached_database_across_like_sqlite() {
+    use inillucent_base::testing::ScratchDir;
     use inillucent_compat::newengine::ImportedDatabase;
     use inillucent_exec::physical::Params;
 
-    let main_path = std::env::temp_dir().join(format!(
-        "inillucent-vacuum-attach-main-{}.rdb",
-        std::process::id()
-    ));
-    let file_aux_path = std::env::temp_dir().join(format!(
-        "inillucent-vacuum-attach-aux-{}.rdb",
-        std::process::id()
-    ));
-    // Removed here as well as at the end. The two names hold nothing but this
-    // process id, Windows hands process ids back out, and the removal below
-    // runs only when every assertion passed - so one failed run leaves both
-    // files behind and the next run that draws the same id creates `main.t`
-    // against a database that already has it. That is the defect task-1978
-    // found in `plan_cache.rs`, which had the same kind of name and no removal
-    // at all.
-    let _ = std::fs::remove_file(&main_path);
-    let _ = std::fs::remove_file(&file_aux_path);
+    // Both files live in a folder of their own that starts empty. The name
+    // holds nothing but this process id, Windows hands process ids back out,
+    // and a failed run keeps its folder, so the next run that draws the same id
+    // would otherwise create `main.t` against a database that already has it.
+    // `ScratchDir::new` removes any leftover first. The folder is declared
+    // before the engine, so the engine closes before the folder is removed.
+    let directory = ScratchDir::new(&format!("inillucent-vacuum-attach-{}", std::process::id()));
+    let main_path = directory.join("main.rdb");
+    let file_aux_path = directory.join("aux.rdb");
     let mut engine =
         ImportedDatabase::create(main_path.clone(), 4096, 256).expect("main is created");
     engine
@@ -990,8 +983,6 @@ fn vacuum_carries_an_attached_database_across_like_sqlite() {
         "the :memory: attachment's row must survive VACUUM of main"
     );
     drop(engine);
-    let _ = std::fs::remove_file(&main_path);
-    let _ = std::fs::remove_file(&file_aux_path);
 }
 
 /// `AUTOINCREMENT`, and the `sqlite_sequence` table that makes it work.

@@ -173,11 +173,11 @@ mod tests {
     /// A directory with no pointer is refused rather than guessed at.
     #[test]
     fn a_directory_with_no_pointer_is_refused() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("inillucent-migrate-empty-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&path);
+        let path = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-migrate-empty-{}",
+            std::process::id()
+        ));
         assert!(Source::open(&path).is_err());
-        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// The digest lines are the whole set, in a stable order.

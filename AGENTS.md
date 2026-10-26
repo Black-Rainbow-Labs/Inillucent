@@ -250,6 +250,12 @@ run exits 1. `--timeout <secs>` replaces the budget, and `--timeout 0` removes i
 budget. `inillucent::story_ledger_day_nightly` has no row in `tests/timings.toml`, takes 1800.37 s,
 and prints nothing until it ends.
 
+**A run has a temporary folder of its own.** The runner makes `<temp>/inillucent-tests/run-<pid>`,
+points `TMP`, `TEMP` and `TMPDIR` at it for everything it starts, and removes it when the run ends.
+The next run removes the folder of a run that was killed. A test that writes files makes its folder
+with `inillucent_base::testing::ScratchDir`, which removes it when the guard drops, so a plain
+`cargo test` leaves nothing in the temporary directory either.
+
 **The runner builds the programs once.** It builds `inillucent`, `inillucent-shell` and
 `inillucent-mcp` before any suite starts and sets `INILLUCENT_PROGRAMS_BUILT`. Tests find the
 programs through `cliproc::program`. Under a plain `cargo test`, `cliproc::program` builds them once

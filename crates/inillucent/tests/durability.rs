@@ -40,6 +40,8 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
+
 use inillucent_compat::durable::{
     count, migrate_and_index, the_three_rows, three_rows, values_after_reopen, MIGRATED_ROWS,
 };
@@ -47,18 +49,16 @@ use inillucent_compat::matrix::Arm;
 use inillucent_engine::connect::Database;
 use inillucent_tree::datum::OwnedDatum;
 
-/// Returns a fresh, empty directory for one test's files.
+/// Returns a fresh, empty directory for one test's files, removed when the
+/// returned guard drops.
 ///
 /// @param tag - what to name the directory after
-fn scratch(tag: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+fn scratch(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-durability-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
-    directory
+    ))
 }
 
 /// Counts the rows in `t` through a freshly opened handle, and checks the file.

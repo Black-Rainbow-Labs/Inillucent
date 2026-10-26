@@ -472,8 +472,10 @@ mod tests {
     #[test]
     fn read_and_write_take_a_callers_context_and_round_trip() {
         use anyhow::Context;
-        let dir = std::env::temp_dir().join(format!("inillucent-manifest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-manifest-{}",
+            std::process::id()
+        ));
 
         let missing = ModelManifest::read(&dir.join("absent")).context("opening the embedder");
         let chain = format!("{:#}", missing.unwrap_err());
@@ -487,8 +489,6 @@ mod tests {
         written.write(&dir).context("installing").unwrap();
         let back = ModelManifest::read(&dir).context("opening").unwrap();
         assert_eq!(written, back);
-        std::fs::remove_file(dir.join(ModelManifest::FILE)).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

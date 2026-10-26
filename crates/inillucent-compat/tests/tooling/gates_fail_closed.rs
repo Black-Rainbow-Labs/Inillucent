@@ -64,6 +64,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::workspace_root;
 
 /// The test runner, which a plain `cargo test` does not build.
@@ -90,26 +91,28 @@ fn sqlite_bench_built() -> bool {
         .any(|name| root.join(name).is_file())
 }
 
-/// Returns a private copy of the small fixture.
+/// Returns a private copy of the small fixture, and the guard of the folder it
+/// is in.
 ///
 /// **A copy per run, because a gate leaves an index behind.** The
 /// `schema.index` workload creates `main_label` on the SQLite arm, so a second
 /// run against the same file stops on "index main_label already exists" -
 /// which would be a gate failing for a reason that is not about the engine.
 ///
+/// **The caller binds the guard with a named binding.** The folder is removed
+/// when the guard drops, so a caller that discarded it would lose the copy.
+///
 /// @param tag - what to name the copy after
-fn fixture_copy(tag: &str) -> Option<PathBuf> {
+fn fixture_copy(tag: &str) -> Option<(ScratchDir, PathBuf)> {
     let source = small_fixture()?;
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-gates-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).ok()?;
     let target = directory.join("small.db");
     std::fs::copy(&source, &target).ok()?;
-    Some(target)
+    Some((directory, target))
 }
 
 /// Returns a gate's path, or nothing when this build did not produce it.
@@ -356,7 +359,7 @@ fn readgate_refuses_a_fixture_that_is_not_there() {
 /// a plan of no rows, and a table of no measurements to print a verdict from.
 #[test]
 fn readgate_refuses_a_family_that_selects_no_workload() {
-    let Some(fixture) = fixture_copy("readgate-families") else {
+    let Some((_scratch, fixture)) = fixture_copy("readgate-families") else {
         inillucent_compat::differential::skipping(
             "the small gate fixture is not built; run tools/build-gate-fixtures.sh",
         );
@@ -386,7 +389,7 @@ fn readgate_measures_the_small_fixture() {
         );
         return;
     }
-    let Some(fixture) = fixture_copy("readgate-small") else {
+    let Some((_scratch, fixture)) = fixture_copy("readgate-small") else {
         inillucent_compat::differential::skipping(
             "the small gate fixture is not built; run tools/build-gate-fixtures.sh",
         );
@@ -471,7 +474,7 @@ fn writegate_arms_agree_on_a_round() {
         );
         return;
     }
-    let Some(fixture) = fixture_copy("writegate-agreement") else {
+    let Some((_scratch, fixture)) = fixture_copy("writegate-agreement") else {
         inillucent_compat::differential::skipping(
             "the small gate fixture is not built; run tools/build-gate-fixtures.sh",
         );
@@ -514,7 +517,7 @@ fn writegate_measures_the_small_fixture() {
         );
         return;
     }
-    let Some(fixture) = fixture_copy("writegate-small") else {
+    let Some((_scratch, fixture)) = fixture_copy("writegate-small") else {
         inillucent_compat::differential::skipping(
             "the small gate fixture is not built; run tools/build-gate-fixtures.sh",
         );
@@ -570,7 +573,7 @@ fn fullgate_measures_the_small_fixture() {
         );
         return;
     }
-    let Some(fixture) = fixture_copy("fullgate-small") else {
+    let Some((_scratch, fixture)) = fixture_copy("fullgate-small") else {
         inillucent_compat::differential::skipping(
             "the small gate fixture is not built; run tools/build-gate-fixtures.sh",
         );
@@ -610,7 +613,7 @@ fn fullgate_times_its_arm_in_a_fresh_child_and_writes_the_samples() {
         );
         return;
     }
-    let Some(fixture) = fixture_copy("fullgate-child") else {
+    let Some((_scratch, fixture)) = fixture_copy("fullgate-child") else {
         inillucent_compat::differential::skipping(
             "the small gate fixture is not built; run tools/build-gate-fixtures.sh",
         );
@@ -716,7 +719,7 @@ fn prepareperf_measures_the_small_fixture() {
         );
         return;
     }
-    let Some(fixture) = fixture_copy("prepareperf-small") else {
+    let Some((_scratch, fixture)) = fixture_copy("prepareperf-small") else {
         inillucent_compat::differential::skipping(
             "the small gate fixture is not built; run tools/build-gate-fixtures.sh",
         );
@@ -783,13 +786,11 @@ fn searchgate_measures_a_small_corpus() {
 /// one the gate would happily create.
 #[test]
 fn walperf_refuses_a_scratch_it_cannot_create() {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-gates-walperf-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
     let blocker = directory.join("not-a-directory");
     std::fs::write(&blocker, b"this is a file").expect("the blocking file is written");
     let inside = blocker.join("scratch");
@@ -815,13 +816,11 @@ fn walperf_refuses_a_scratch_it_cannot_create() {
 /// from "measured nothing" is whether a number reached the page.
 #[test]
 fn walperf_measures_the_small_fixture() {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-gates-walperf-measures-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
     let scratch = directory.join("scratch");
     let out = directory.join("out");
     let output = run(
@@ -842,7 +841,6 @@ fn walperf_measures_the_small_fixture() {
     measured("walperf", &output, &|text| {
         a_positive_number_on_a_line_with(&format!("{text}\n{written}"), "commit")
     });
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 // --- scorecard --------------------------------------------------------------
@@ -874,14 +872,12 @@ fn scorecard_refuses_a_lever_it_does_not_know() {
 /// has to say so rather than publish one arm.
 #[test]
 fn scorecard_says_when_it_cannot_measure() {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-gates-scorecard-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
     let blocker = directory.join("not-a-directory");
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
     std::fs::write(&blocker, b"this is a file").expect("the blocking file is written");
     let output = run(
         env!("CARGO_BIN_EXE_inillucent-scorecard"),
@@ -916,12 +912,11 @@ fn scorecard_measures_a_lever_it_knows() {
         );
         return;
     }
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-gates-scorecard-measures-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
     let output = run(
         env!("CARGO_BIN_EXE_inillucent-scorecard"),
         &[
@@ -939,7 +934,6 @@ fn scorecard_measures_a_lever_it_knows() {
     measured("scorecard", &output, &|text| {
         a_positive_number_on_a_line_with(&format!("{text}\n{card}"), "ms")
     });
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 // --- foldgate ---------------------------------------------------------------
@@ -1005,13 +999,11 @@ fn foldgate_measures_a_small_corpus() {
 /// returns `ExitCode::FAILURE` from two places and nothing exercised either.
 #[test]
 fn release_refuses_a_candidate_directory_it_cannot_create() {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-gates-release-refuses-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
     let blocker = directory.join("not-a-directory");
     std::fs::write(&blocker, b"this is a file").expect("the blocking file is written");
     let output = run(
@@ -1019,7 +1011,6 @@ fn release_refuses_a_candidate_directory_it_cannot_create() {
         &["--out", &blocker.join("candidate").to_string_lossy()],
     );
     refused("release", &output, &["cannot create", "cannot"]);
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// The release gate digests the measurement files it was pointed at.
@@ -1031,12 +1022,11 @@ fn release_refuses_a_candidate_directory_it_cannot_create() {
 /// the one `packaging/sign-sums.ps1` shipped in task-1951.
 #[test]
 fn release_measures_the_artifacts_it_was_given() {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-gates-release-measures-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
     let measurements = directory.join("measurements");
     let out = directory.join("candidate");
     std::fs::create_dir_all(&measurements).expect("a measurements directory");
@@ -1063,7 +1053,6 @@ fn release_measures_the_artifacts_it_was_given() {
                 bare.len() == 64 && bare.chars().all(|c| c.is_ascii_hexdigit())
             })
     });
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 // --- testrun ----------------------------------------------------------------
@@ -1378,12 +1367,11 @@ fn testrun_excuses_a_declared_absence_and_nothing_else() {
     let Some(gate) = built(TESTRUN, BUILDS_TESTRUN) else {
         return;
     };
-    let directory = std::env::temp_dir().join(format!(
+    let directory = ScratchDir::new(&format!(
         "inillucent-declared-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::create_dir_all(&directory);
     let both = directory.join("both.toml");
     let one = directory.join("one.toml");
     std::fs::write(&both, "absent = [\"postgres\", \"mysql\"]\n").expect("a scratch file");
@@ -1417,7 +1405,6 @@ fn testrun_excuses_a_declared_absence_and_nothing_else() {
         return;
     };
     let text = said(&partly);
-    let _ = std::fs::remove_dir_all(&directory);
     assert_eq!(
         code(&partly),
         1,

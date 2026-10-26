@@ -1029,8 +1029,10 @@ mod tests {
             skipping("set INILLUCENT_NETWORK_TESTS to run this");
             return;
         }
-        let into = std::env::temp_dir().join("inillucent-http-network");
-        let _ = std::fs::remove_dir_all(&into);
+        let into = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-http-network-{}",
+            std::process::id()
+        ));
 
         // Hugging Face: a small file, redirected to a content network, whose
         // digest this build knows.
@@ -1079,8 +1081,6 @@ mod tests {
         )
         .expect("a small GitHub file fetches");
         assert_eq!(String::from_utf8_lossy(&body).trim(), "1.22.0");
-
-        std::fs::remove_dir_all(&into).expect("the scratch directory is removed");
     }
 
     /// Serves `body` over plain HTTP on a loopback port, to any number of
@@ -1136,7 +1136,10 @@ mod tests {
         }
         let body: &'static [u8] = b"the bytes of a model file";
         let url = serve(body);
-        let into = std::env::temp_dir().join(format!("inillucent-curl-{}", std::process::id()));
+        let into = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-curl-{}",
+            std::process::id()
+        ));
         let destination = into.join("weights.bin");
         let digest = {
             let mut hash = Sha256::new();
@@ -1176,7 +1179,6 @@ mod tests {
             !partial_path(&into.join("missing.bin")).exists(),
             "a failed curl download leaves no partial file, because curl never resumes one"
         );
-        let _ = std::fs::remove_dir_all(&into);
     }
 
     /// A download through the built in client that fails before a byte
@@ -1184,8 +1186,10 @@ mod tests {
     /// arrived keeps them for the next run to resume.
     #[test]
     fn a_failed_download_keeps_only_a_partial_file_it_can_resume() {
-        let into = std::env::temp_dir().join(format!("inillucent-part-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&into);
+        let into = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-part-{}",
+            std::process::id()
+        ));
 
         let empty = into.join("empty.bin");
         let url = serve_short(b"");
@@ -1207,7 +1211,6 @@ mod tests {
             b"the first bytes",
             "the bytes that arrived are kept for a Range request: {failed}"
         );
-        let _ = std::fs::remove_dir_all(&into);
     }
 
     /// Serves a response that announces 1000 bytes, sends `sent` and closes, to

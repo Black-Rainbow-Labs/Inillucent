@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 
 use inillucent_base::ids::PageId;
 use inillucent_base::limits::Limits;
+use inillucent_base::testing::ScratchDir;
 use inillucent_base::PrimaryCode;
 use inillucent_compat::corpus::{self, ScannedRow};
 use inillucent_compat::fixtures::{malformed_fixtures, valid_fixtures};
@@ -698,13 +699,13 @@ fn every_malformed_fixture_is_refused() {
 /// between this test's two hashes of that folder. Nothing this test read had
 /// changed. Only the `.db` files and the manifest are copied, since those are
 /// the corpus; an `.rdb` another suite is writing may be half written.
-fn private_corpus() -> std::path::PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+///
+/// The folder is removed when the returned guard drops.
+fn private_corpus() -> ScratchDir {
+    let directory = ScratchDir::new(&format!(
         "inillucent-storage-readonly-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
     for entry in std::fs::read_dir(corpus::corpus_dir()).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -751,7 +752,6 @@ fn reading_changes_nothing_on_disk() {
             "reading left {name} behind"
         );
     }
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// A full traversal must return every pin it took, and leave the lock where it

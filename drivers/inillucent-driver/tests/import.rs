@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_driver::{Database, Status, Value};
 
 /// Returns the pinned SQLite shell, if this checkout has it.
@@ -32,34 +33,39 @@ fn pinned_shell() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Returns a scratch path nothing else is using.
+/// Returns a scratch directory nothing else is using, removed when the guard
+/// drops.
 ///
-/// @param name - what to call the file
-fn scratch(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "inillucent-driver-import-{name}-{}-{}.db",
+/// The fixture and the database an import builds beside it (`<fixture>.rdb`
+/// and its numbered log segments) both live in this directory, so removing it
+/// removes all of them.
+///
+/// @param name - what to call the directory
+fn scratch(name: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
+        "inillucent-driver-import-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0)
-    ));
-    path
+    ))
 }
 
 /// Builds a SQLite database with the pinned shell.
 ///
 /// Returns `None` when the shell is not in this checkout, which is how these
-/// tests skip rather than fail on a machine that has not fetched it.
+/// tests skip rather than fail on a machine that has not fetched it. Otherwise
+/// returns the directory guard and the fixture's path inside it; the caller
+/// keeps the guard until the test ends.
 ///
-/// @param name - what to call the file
+/// @param name - what to call the directory
 /// @param dot_commands - shell settings to apply before the SQL
 /// @param sql - the statements to run, semicolon-terminated
-fn build_with(name: &str, dot_commands: &[&str], sql: &str) -> Option<PathBuf> {
+fn build_with(name: &str, dot_commands: &[&str], sql: &str) -> Option<(ScratchDir, PathBuf)> {
     let shell = pinned_shell()?;
-    let path = scratch(name);
-    let _ = std::fs::remove_file(&path);
+    let directory = scratch(name);
+    let path = directory.join("fixture.db");
     let mut command = Command::new(shell);
     command.arg(&path);
     for dot_command in dot_commands {
@@ -80,49 +86,15 @@ fn build_with(name: &str, dot_commands: &[&str], sql: &str) -> Option<PathBuf> {
         "{sql}: {said}"
     );
     assert!(path.is_file(), "the shell wrote no file for `{sql}`");
-    Some(path)
+    Some((directory, path))
 }
 
 /// Builds a SQLite database with the pinned shell's own defaults.
 ///
-/// @param name - what to call the file
+/// @param name - what to call the directory
 /// @param sql - the statements to run, semicolon-terminated
-fn build(name: &str, sql: &str) -> Option<PathBuf> {
+fn build(name: &str, sql: &str) -> Option<(ScratchDir, PathBuf)> {
     build_with(name, &[], sql)
-}
-
-/// Removes a fixture and the files an import built beside it.
-///
-/// The imported database is not one file: the engine writes its log as numbered
-/// segments beside it, `<name>-wal.0000000001` and so on, and a version of this
-/// that removed only the database left one segment per run in the temporary
-/// directory for ever. So the segments are removed too, matched by the
-/// database's own file name - which carries this process's id and a nanosecond
-/// stamp, so the prefix cannot name a file some other test made.
-///
-/// @param source - the SQLite file the fixture built
-/// @param imported - the database the import produced, if it produced one
-fn clean_up(source: &Path, imported: Option<&Path>) {
-    let _ = std::fs::remove_file(source);
-    let Some(imported) = imported else {
-        return;
-    };
-    let _ = std::fs::remove_file(imported);
-    let (Some(directory), Some(name)) = (imported.parent(), imported.file_name()) else {
-        return;
-    };
-    let Some(name) = name.to_str() else {
-        return;
-    };
-    let segments = format!("{name}-wal.");
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with(&segments) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
 }
 
 /// The ticket's own reproduction: a table whose columns are named `left` and
@@ -134,7 +106,7 @@ fn clean_up(source: &Path, imported: Option<&Path>) {
 /// image is malformed"` before that was fixed.
 #[test]
 fn a_table_whose_columns_are_named_left_and_right_imports() {
-    let Some(source) = build(
+    let Some((_directory, source)) = build(
         "reserved",
         "CREATE TABLE pairs (left TEXT, right TEXT); \
          INSERT INTO pairs VALUES ('a','b'); \
@@ -146,11 +118,9 @@ fn a_table_whose_columns_are_named_left_and_right_imports() {
     let database = match Database::import_sqlite(&source) {
         Ok(database) => database,
         Err(failure) => {
-            clean_up(&source, None);
             panic!("the import must succeed, and said: {failure}");
         }
     };
-    let imported = database.path().to_path_buf();
     let connection = database.session();
     let rows = connection
         .query("SELECT left, right FROM pairs ORDER BY left", &[], 16)
@@ -170,7 +140,6 @@ fn a_table_whose_columns_are_named_left_and_right_imports() {
     );
     let _ = connection;
     drop(database);
-    clean_up(&source, Some(&imported));
 }
 
 /// The same words in every other name position the pinned release allows one.
@@ -181,7 +150,7 @@ fn a_table_whose_columns_are_named_left_and_right_imports() {
 /// all of them.
 #[test]
 fn the_join_keywords_are_names_in_every_position_sqlite_allows() {
-    let Some(source) = build(
+    let Some((_directory, source)) = build(
         "reserved-positions",
         "CREATE TABLE left (inner TEXT, outer TEXT, cross TEXT, indexed TEXT); \
          INSERT INTO left VALUES ('i','o','c','x'); \
@@ -193,11 +162,9 @@ fn the_join_keywords_are_names_in_every_position_sqlite_allows() {
     let database = match Database::import_sqlite(&source) {
         Ok(database) => database,
         Err(failure) => {
-            clean_up(&source, None);
             panic!("the import must succeed, and said: {failure}");
         }
     };
-    let imported = database.path().to_path_buf();
     let connection = database.session();
     let rows = connection
         .query(
@@ -217,7 +184,6 @@ fn the_join_keywords_are_names_in_every_position_sqlite_allows() {
     );
     let _ = connection;
     drop(database);
-    clean_up(&source, Some(&imported));
 }
 
 /// A join keyword is still a join keyword where SQLite says it is one.
@@ -228,7 +194,7 @@ fn the_join_keywords_are_names_in_every_position_sqlite_allows() {
 /// rather than about the word `left`.
 #[test]
 fn a_left_join_is_still_read_as_a_join() {
-    let Some(source) = build(
+    let Some((_directory, source)) = build(
         "reserved-join",
         "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT); \
          CREATE TABLE u (a INTEGER PRIMARY KEY, c TEXT); \
@@ -238,7 +204,6 @@ fn a_left_join_is_still_read_as_a_join() {
         return;
     };
     let database = Database::import_sqlite(&source).expect("it imports");
-    let imported = database.path().to_path_buf();
     let connection = database.session();
     // An inner join reads as one and answers.
     let rows = connection
@@ -262,7 +227,6 @@ fn a_left_join_is_still_read_as_a_join() {
     }
     let _ = connection;
     drop(database);
-    clean_up(&source, Some(&imported));
 }
 
 /// Schema SQL this engine cannot parse is reported as what it is, not as a
@@ -278,7 +242,7 @@ fn a_schema_statement_that_will_not_parse_is_not_reported_as_a_damaged_file() {
     // `.dbconfig defensive off` is what lets `writable_schema` take; the shell
     // refuses to modify `sqlite_schema` otherwise, and refuses it on *stdout*
     // while still exiting zero.
-    let Some(source) = build_with(
+    let Some((_directory, source)) = build_with(
         "unparseable-schema",
         &[".dbconfig defensive off"],
         "CREATE TABLE good (a); \
@@ -292,7 +256,6 @@ fn a_schema_statement_that_will_not_parse_is_not_reported_as_a_damaged_file() {
     let failure = match Database::import_sqlite(&source) {
         Err(failure) => failure,
         Ok(_) => {
-            clean_up(&source, None);
             panic!("a schema that will not parse must not import");
         }
     };
@@ -307,5 +270,4 @@ fn a_schema_statement_that_will_not_parse_is_not_reported_as_a_damaged_file() {
         !failure.message.contains("disk image is malformed"),
         "{failure:?}"
     );
-    clean_up(&source, None);
 }

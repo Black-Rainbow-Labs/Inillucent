@@ -25,6 +25,7 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::oracle::{Driver, Op, TaggedValue};
 use inillucent_compat::workspace_root;
@@ -46,18 +47,16 @@ fn oracle_path() -> Option<PathBuf> {
 ///
 /// A directory per test rather than a file per test, so two tests running in
 /// parallel never open each other's database - and so the whole of a failed
-/// run's evidence is in one place.
+/// run's evidence is in one place. The directory is removed when the returned
+/// guard drops.
 ///
 /// @param tag - what to name it after
-fn scratch(tag: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+fn scratch(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-writes-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
-    directory
+    ))
 }
 
 /// The schema the write corpus is asked about.
@@ -90,7 +89,7 @@ struct Pair {
     engine: ImportedDatabase,
     oracle: Driver,
     /// Kept so the directory outlives the test.
-    _directory: PathBuf,
+    _directory: ScratchDir,
 }
 
 /// Builds the fixture with the oracle and imports it into the new engine.

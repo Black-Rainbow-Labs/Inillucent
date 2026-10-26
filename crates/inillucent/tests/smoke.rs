@@ -35,11 +35,12 @@
 //! that claims durability **drops the database and opens the path again**, so
 //! what it reads has been through the write-ahead log and recovery.
 
-use std::path::PathBuf;
+use inillucent_base::testing::ScratchDir;
 
 use inillucent::{Database, Rows, Value};
 
-/// Returns a fresh, empty directory for one test's files.
+/// Returns a fresh, empty directory for one test's files, removed when the
+/// returned guard drops.
 ///
 /// A directory per test rather than a file per test: the engine writes a log
 /// beside the database, so a test that removed only the `.rdb` would reopen
@@ -48,15 +49,12 @@ use inillucent::{Database, Rows, Value};
 /// parallel runner makes the normal case rather than the exception.
 ///
 /// @param tag - what to name the directory after
-fn scratch(tag: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+fn scratch(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-smoke-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
-    directory
+    ))
 }
 
 /// Returns the one integer a single-row, single-column answer holds.

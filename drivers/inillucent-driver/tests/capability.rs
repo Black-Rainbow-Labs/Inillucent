@@ -24,28 +24,32 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_driver::capability::{Probe, Support, CAPABILITIES};
 use inillucent_driver::{Database, Status, Value};
 
-/// Returns a scratch database nothing else is using.
+/// Returns a scratch directory guard and the path of a database inside it that
+/// nothing else is using. The directory, with the database's log files, is
+/// removed when the guard drops, so the caller keeps it until the database is
+/// closed.
 ///
-/// One file per probe, because a probe leaves a schema behind and the next
+/// One directory per probe, because a probe leaves a schema behind and the next
 /// probe's `CREATE TABLE` would meet it. A shared file would also make the
 /// order of the table significant, which is exactly the kind of coupling that
 /// makes a failing row hard to read.
 ///
-/// @param name - what to call the file
-fn scratch(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "inillucent-driver-cap-{name}-{}-{:?}.rdb",
+/// @param name - what to call the directory
+fn scratch(name: &str) -> (ScratchDir, PathBuf) {
+    let directory = ScratchDir::new(&format!(
+        "inillucent-driver-cap-{name}-{}-{:?}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0)
     ));
-    path
+    let path = directory.join("probe.rdb");
+    (directory, path)
 }
 
 /// What running one probe produced.
@@ -82,7 +86,7 @@ fn probe(name: &str, setup: &[&str], sql: &str, want_value: bool) -> Outcome {
 /// @param want_value - whether the probe reads a value rather than an outcome
 /// @param register - whether to register the probe function and collation first
 fn probe_with(name: &str, setup: &[&str], sql: &str, want_value: bool, register: bool) -> Outcome {
-    let path = scratch(name);
+    let (_directory, path) = scratch(name);
     let database = Database::open(&path).expect("the scratch database opens");
     let connection = database.session();
     if register {
@@ -100,7 +104,6 @@ fn probe_with(name: &str, setup: &[&str], sql: &str, want_value: bool, register:
                 })
             });
         if let Err(why) = registered {
-            let _ = std::fs::remove_file(&path);
             return Outcome::Refused(format!("{}: {}", why.status.name(), why.message));
         }
     }
@@ -128,7 +131,6 @@ fn probe_with(name: &str, setup: &[&str], sql: &str, want_value: bool, register:
     };
     let _ = connection;
     drop(database);
-    let _ = std::fs::remove_file(&path);
     outcome
 }
 
@@ -141,7 +143,7 @@ fn probe_with(name: &str, setup: &[&str], sql: &str, want_value: bool, register:
 /// @param name - the capability's name, used for the file
 /// @param sql - the query under test
 fn probe_keyed(name: &str, sql: &str) -> Outcome {
-    let path = scratch(name);
+    let (_directory, path) = scratch(name);
     let options = inillucent_driver::OpenOptions {
         key: Some(inillucent_driver::EncryptionKey::raw([0x33; 32])),
         ..inillucent_driver::OpenOptions::default()
@@ -161,7 +163,6 @@ fn probe_keyed(name: &str, sql: &str) -> Outcome {
             outcome
         }
     };
-    let _ = std::fs::remove_file(&path);
     outcome
 }
 
@@ -290,7 +291,7 @@ fn described(outcome: &Outcome) -> String {
 /// here against the real engine rather than against a constructed error.
 #[test]
 fn an_unimplemented_construct_refuses_by_name_and_a_typo_does_not() {
-    let path = scratch("classify");
+    let (_directory, path) = scratch("classify");
     let database = Database::open(&path).expect("opens");
     let connection = database.session();
     connection
@@ -337,7 +338,6 @@ fn an_unimplemented_construct_refuses_by_name_and_a_typo_does_not() {
 
     let _ = connection;
     drop(database);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The number of rows the two-direction check skips is the number AGENTS.md

@@ -13,8 +13,9 @@
 //! case pays for 600,000 rounds of PBKDF2 in a debug build. One case uses a
 //! passphrase with a small iteration count to cover that path.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_engine::connect::Database;
 use inillucent_engine::{EncryptionKey, PrimaryCode};
 use inillucent_tree::datum::OwnedDatum;
@@ -28,17 +29,15 @@ const KEY_B: &str = "x'222222222222222222222222222222222222222222222222222222222
 /// A string every case writes and then looks for on the disk.
 const SECRET: &str = "the vault code is 7461-swordfish";
 
-/// Returns a fresh directory for one case.
+/// Returns a fresh directory for one case, removed when the returned guard
+/// drops.
 ///
 /// @param tag - the case's name
-fn directory(tag: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
+fn directory(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-encryption-{}-{tag}",
         std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("the directory is made");
-    path
+    ))
 }
 
 /// Opens a database with a raw key given in text form.
@@ -181,7 +180,6 @@ fn nothing_reaches_the_disk_in_plaintext() {
         vec![vec![OwnedDatum::Text(b"ok".to_vec())]]
     );
     drop(database);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A wrong key, no key, and a key for a plaintext file are each refused with
@@ -237,7 +235,6 @@ fn a_key_that_does_not_match_the_file_is_refused() {
     drop(database);
     let wrong = EncryptionKey::passphrase_with_iterations("correct horse battery!", 1_000);
     assert!(Database::open_encrypted(&passphrase, wrong).is_err());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `PRAGMA rekey` moves the database to a new key: the old one stops opening
@@ -291,7 +288,6 @@ fn rekey_changes_the_key_and_keeps_the_rows() {
         refused.message()
     );
     drop(plain);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `VACUUM` keeps the database encrypted, and `VACUUM INTO` and a backup
@@ -321,7 +317,6 @@ fn vacuum_and_backup_write_encrypted_files() {
         let copy = open(&dir.join(name), KEY_A);
         assert_eq!(count(&copy).0, 100, "{name}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `PRAGMA <schema>.encryption` answers for the database the qualifier names.
@@ -360,7 +355,6 @@ fn the_encryption_pragma_answers_for_the_database_it_names() {
         "the refusal says why: {refused}"
     );
     drop(database);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `ATTACH ... KEY` opens an encrypted file with its own key, `KEY ''` opens
@@ -425,7 +419,6 @@ fn attach_takes_a_key() {
             "{name} holds the row in plaintext"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `export_to` writes an encrypted copy of a plaintext database and a
@@ -456,7 +449,6 @@ fn export_converts_in_both_directions() {
         Database::open(dir.join("opened.rdb")).expect("the plaintext copy opens without a key");
     assert_eq!(count(&opened), (200, 200, 7));
     drop(opened);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A changed byte in the database file is never read back as a row: the
@@ -494,7 +486,6 @@ fn a_changed_byte_is_reported_as_damage() {
             "every page was changed and the integrity check said ok"
         ),
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `FULL` delete on an encrypted file moves pages through the encrypting
@@ -531,7 +522,6 @@ fn a_full_delete_on_an_encrypted_file_gives_pages_back_and_keeps_every_row() {
     assert_eq!(count(&reopened).0, 200);
     assert_eq!(integer_of(&reopened, "SELECT count(*) FROM junk"), 10);
     drop(reopened);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Returns the one integer a query answers.

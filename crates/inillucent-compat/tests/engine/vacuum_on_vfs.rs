@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_engine::ImportedDatabase;
 use inillucent_exec::physical::Params;
 use inillucent_tree::datum::OwnedDatum;
@@ -222,11 +223,13 @@ fn incremental_vacuum_stays_on_the_file_system_too() {
 /// break without any of the assertions above noticing.
 #[test]
 fn vacuum_on_the_real_file_system_still_works() {
-    let path = std::env::temp_dir().join(format!(
-        "inillucent-vacuum-on-vfs-real-{}.rdb",
+    // The database and its log segments live in a folder that is removed when
+    // the test ends. It is declared first, so the engine closes before it goes.
+    let directory = ScratchDir::new(&format!(
+        "inillucent-vacuum-on-vfs-real-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_file(&path);
+    let path = directory.join("real.rdb");
 
     let mut engine =
         ImportedDatabase::create(path.clone(), PAGE_SIZE, FRAMES).expect("the database is created");
@@ -246,5 +249,4 @@ fn vacuum_on_the_real_file_system_still_works() {
         .expect("the vacuumed database reopens");
     assert_eq!(count(&mut reopened, "SELECT count(*) FROM t"), before);
     drop(reopened);
-    let _ = std::fs::remove_file(&path);
 }

@@ -212,11 +212,14 @@ mod tests {
     use super::*;
     use inillucent_core::model::{Pooling, Prefixes};
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("inillucent-models-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    use inillucent_base::testing::ScratchDir;
+
+    /// Makes an empty folder for one test; the folder is removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole test.
+    ///
+    /// @param name - what to name the folder after
+    fn scratch(name: &str) -> ScratchDir {
+        ScratchDir::new(&format!("inillucent-models-{}-{name}", std::process::id()))
     }
 
     #[test]
@@ -253,7 +256,6 @@ mod tests {
         let resolved = resolve_id(&root, "some-model").unwrap();
         assert_eq!(resolved.manifest, manifest);
         assert!(resolved.manifest_on_disk);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -265,7 +267,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no model.json"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -278,7 +279,6 @@ mod tests {
         assert_eq!(resolved.manifest.dims, 768);
         assert_eq!(resolved.manifest.max_tokens, 1900);
         assert_eq!(resolved.manifest.prefixes.query, "search_query: ");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -297,7 +297,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("whose id is"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -321,7 +320,6 @@ mod tests {
         std::fs::write(dir.join("model.onnx"), b"other weights").unwrap();
         let err = resolved.verify_files().unwrap_err().to_string();
         assert!(err.contains("has been replaced"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -339,7 +337,6 @@ mod tests {
         };
         // No files at all, and no declared digests: nothing to contradict.
         resolved.verify_files().unwrap();
-        std::fs::remove_dir_all(&root).ok();
     }
 }
 

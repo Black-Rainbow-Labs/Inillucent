@@ -35,8 +35,7 @@
 //! sense in which closing them made this file's job harder and the engine's
 //! answers better.
 
-use std::path::PathBuf;
-
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_exec::physical::Params;
 use inillucent_tree::datum::OwnedDatum;
@@ -46,18 +45,16 @@ const PAGE_SIZE: usize = 32_768;
 /// How many frames the pool holds.
 const FRAMES: usize = 4_096;
 
-/// Returns a fresh scratch directory named after the test.
+/// Returns a fresh scratch directory named after the test, removed when the
+/// returned guard drops.
 ///
 /// @param tag - what to name it after
-fn scratch(tag: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+fn scratch(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-pages-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
-    directory
+    ))
 }
 
 /// Returns what `PRAGMA integrity_check` answers, as one string.

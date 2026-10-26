@@ -54,6 +54,7 @@ use std::process::{Command, ExitCode};
 use std::rc::Rc;
 use std::time::Instant;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::perf::{bind_value, eat_borrowed, run_sqlite};
 use inillucent_compat::perf::{plan_for, Bind, Digest, Paired, Sample, Workload};
@@ -399,8 +400,13 @@ fn run(fixture: &Path, settings: &Settings) -> Result<Option<bool>, String> {
         ),
     }
 
-    let plan_path =
-        std::env::temp_dir().join(format!("inillucent-readgate-{}.plan", std::process::id()));
+    // In a folder the guard removes when this function returns; every run used
+    // to leave its plan file in the temporary directory.
+    let plan_folder = ScratchDir::try_at(
+        std::env::temp_dir().join(format!("inillucent-readgate-{}", std::process::id())),
+    )
+    .map_err(|error| format!("could not make a folder for the plan: {error}"))?;
+    let plan_path = plan_folder.join("workloads.plan");
     std::fs::write(&plan_path, plan.render())
         .map_err(|error| format!("could not write the plan: {error}"))?;
 

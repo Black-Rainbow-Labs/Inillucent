@@ -13,6 +13,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_driver::{SharedDatabase, Value};
 
 /// How many worker threads the fan-out test uses.
@@ -21,16 +22,18 @@ const WORKERS: i64 = 8;
 /// How many rows each worker inserts.
 const PER_WORKER: i64 = 1_000;
 
-/// Returns a clean path for one test's database.
+/// Returns a clean directory guard and the path of one test's database inside
+/// it. The directory is removed when the guard drops, so the caller keeps the
+/// guard until the database is closed.
 ///
 /// @param name - the test's name
-fn scratch(name: &str) -> std::path::PathBuf {
-    let directory = std::env::temp_dir()
-        .join("inillucent-driver-threads")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the temporary directory is writable");
-    directory.join("app.rdb")
+fn scratch(name: &str) -> (ScratchDir, std::path::PathBuf) {
+    let directory = ScratchDir::new(&format!(
+        "inillucent-driver-threads-{name}-{}",
+        std::process::id()
+    ));
+    let path = directory.join("app.rdb");
+    (directory, path)
 }
 
 /// Returns the one integer a counting query answered.
@@ -54,7 +57,7 @@ fn count(database: &SharedDatabase, sql: &str) -> i64 {
 /// every run.
 #[test]
 fn eight_threads_inserting_a_thousand_rows_each_land_eight_thousand() {
-    let path = scratch("fan-out");
+    let (_directory, path) = scratch("fan-out");
     let database = SharedDatabase::open(&path).expect("the database opens");
     database
         .execute_batch("CREATE TABLE note (id INTEGER PRIMARY KEY, worker INTEGER, seq INTEGER)")
@@ -93,7 +96,6 @@ fn eight_threads_inserting_a_thousand_rows_each_land_eight_thousand() {
         "no two rows share a key, which is what a rowid handed out under contention has to promise"
     );
     drop(database);
-    let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
 }
 
 /// A reader during a writer's transaction sees the state before it or the state
@@ -108,7 +110,7 @@ fn eight_threads_inserting_a_thousand_rows_each_land_eight_thousand() {
 /// time.
 #[test]
 fn a_reader_sees_the_state_before_a_transaction_or_the_state_after_it() {
-    let path = scratch("transaction");
+    let (_directory, path) = scratch("transaction");
     let database = SharedDatabase::open(&path).expect("the database opens");
     database
         .execute_batch("CREATE TABLE note (id INTEGER PRIMARY KEY, seq INTEGER)")
@@ -157,7 +159,6 @@ fn a_reader_sees_the_state_before_a_transaction_or_the_state_after_it() {
         "the last read is after the commit, so it has to see the whole transaction"
     );
     drop(database);
-    let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
 }
 
 /// A database opened on one thread is used and dropped on another.
@@ -169,7 +170,7 @@ fn a_reader_sees_the_state_before_a_transaction_or_the_state_after_it() {
 /// the owner thread stopped and released its lock.
 #[test]
 fn a_database_is_used_and_dropped_on_another_thread() {
-    let path = scratch("moved");
+    let (_directory, path) = scratch("moved");
     let database = SharedDatabase::open(&path).expect("the database opens");
     database
         .execute_batch("CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT)")
@@ -193,7 +194,6 @@ fn a_database_is_used_and_dropped_on_another_thread() {
     let reopened = SharedDatabase::open(&path).expect("the database reopens");
     assert_eq!(count(&reopened, "SELECT count(*) FROM note"), 1);
     drop(reopened);
-    let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
 }
 
 /// A transaction dropped without being committed leaves nothing behind.
@@ -203,7 +203,7 @@ fn a_database_is_used_and_dropped_on_another_thread() {
 /// transaction open and the next thread's statement inside it.
 #[test]
 fn a_dropped_transaction_rolls_back_and_gives_the_turn_up() {
-    let path = scratch("dropped");
+    let (_directory, path) = scratch("dropped");
     let database = SharedDatabase::open(&path).expect("the database opens");
     database
         .execute_batch("CREATE TABLE note (id INTEGER PRIMARY KEY, seq INTEGER)")
@@ -231,7 +231,6 @@ fn a_dropped_transaction_rolls_back_and_gives_the_turn_up() {
     after.join().expect("the thread finished");
     assert_eq!(count(&database, "SELECT count(*) FROM note"), 1);
     drop(database);
-    let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
 }
 
 /// A shared database is one session, so what a session holds lasts between
@@ -246,7 +245,7 @@ fn a_dropped_transaction_rolls_back_and_gives_the_turn_up() {
 /// into `log`, and `total_changes()` is 2, then 4, then 6.
 #[test]
 fn a_shared_database_keeps_one_session_between_statements() {
-    let path = scratch("one-session");
+    let (_directory, path) = scratch("one-session");
     let database = SharedDatabase::open(&path).expect("the database opens");
     database
         .execute_batch(
@@ -290,7 +289,6 @@ fn a_shared_database_keeps_one_session_between_statements() {
         .expect("the update runs");
     assert_eq!(count(&database, "SELECT total_changes()"), before + 6);
     drop(database);
-    let _ = std::fs::remove_dir_all(path.parent().expect("the scratch directory"));
 }
 
 /// A TEMP table lasts from one statement to the next, and a statement does not
@@ -306,7 +304,7 @@ fn a_shared_database_keeps_one_session_between_statements() {
 /// statement.
 #[test]
 fn a_temp_table_lasts_and_a_statement_opens_no_session() {
-    let path = scratch("temp-table");
+    let (_directory, path) = scratch("temp-table");
     let database = SharedDatabase::open(&path).expect("the database opens");
     // A schema about the size of the coffee shop example's: what a new
     // session costs grows with the schema it loads, and over an empty one it
@@ -345,7 +343,6 @@ fn a_temp_table_lasts_and_a_statement_opens_no_session() {
         .expect("the next statement sees the temporary table");
     assert_eq!(count(&database, "SELECT count(*) FROM scratch"), 1);
     drop(database);
-    let _ = std::fs::remove_dir_all(path.parent().expect("the scratch directory"));
 }
 
 /// A statement is stopped from another thread through a [`CancelHandle`].
@@ -361,7 +358,7 @@ fn a_temp_table_lasts_and_a_statement_opens_no_session() {
 #[test]
 fn a_cancel_handle_stops_a_statement_running_on_another_thread() {
     fn crosses_threads<T: Send + Sync + 'static>(_: &T) {}
-    let path = scratch("cancel-handle");
+    let (_directory, path) = scratch("cancel-handle");
     let database = inillucent_driver::Database::open(&path).expect("the database opens");
     let connection = database.session();
     let handle = database.cancel_handle();

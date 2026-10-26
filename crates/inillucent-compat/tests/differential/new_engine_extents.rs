@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::oracle::{Driver, Op, TaggedValue};
 use inillucent_compat::workspace_root;
@@ -36,18 +37,16 @@ fn oracle_path() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Returns a fresh directory for one test's files.
+/// Returns a fresh directory for one test's files, removed when the returned
+/// guard drops.
 ///
 /// @param tag - what to name it after
-fn scratch(tag: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+fn scratch(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-extents-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
-    directory
+    ))
 }
 
 /// A fixture both engines have opened.
@@ -55,7 +54,7 @@ struct Pair {
     engine: ImportedDatabase,
     oracle: Driver,
     /// Kept so the directory outlives the test.
-    _directory: PathBuf,
+    _directory: ScratchDir,
 }
 
 /// Builds a `wide`-shaped fixture with the oracle and imports it.

@@ -28,6 +28,11 @@ inillucent-exec = { workspace = true }
 inillucent-sqlite-reader = { workspace = true }
 inillucent-search = { workspace = true }
 
+[dev-dependencies]
+# `ScratchDir`, the folder guard every test that makes a folder in the system
+# temporary directory goes through, so a test removes what it made.
+inillucent-base = { workspace = true, features = ["testing"] }
+
 # The workspace's lint table; see the note beside it in the root manifest.
 [lints]
 workspace = true

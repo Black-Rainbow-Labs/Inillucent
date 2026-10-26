@@ -1527,24 +1527,32 @@ mod vacuum_crash {
     const PAGE_SIZE: usize = 4_096;
     const FRAMES: usize = 256;
 
-    /// Returns a path under the system temp directory nothing else is using.
-    ///
-    /// @param tag - which case this path belongs to, for a reader of the temp
-    ///   directory
     /// The operating system's file system, which is what these tests rebuild on.
     fn os_vfs() -> std::sync::Arc<dyn inillucent_vfs::Vfs> {
         std::sync::Arc::new(inillucent_vfs::OsVfs::new())
     }
 
-    fn temp_db_path(tag: &str) -> PathBuf {
+    /// Returns a fresh folder under the system temp directory and the path of a
+    /// database file inside it.
+    ///
+    /// **The folder holds the database, its log segments and the rebuild's
+    /// scratch file with its own segments.** A case that renames the scratch
+    /// file over the database leaves the scratch file's segments behind, so
+    /// removing the folder is what leaves nothing in the temp directory. The
+    /// caller binds the guard with a named binding and keeps it for the whole
+    /// case, declared before the engine opened on the database.
+    ///
+    /// @param tag - which case this path belongs to, for a reader of the temp
+    ///   directory
+    fn temp_db_path(tag: &str) -> (inillucent_base::testing::ScratchDir, PathBuf) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "inillucent-vacuum-crash-{}-{tag}-{unique}.rdb",
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-vacuum-crash-{}-{tag}-{unique}",
             std::process::id()
         ));
-        path
+        let path = directory.join("case.rdb");
+        (directory, path)
     }
 
     /// Builds a real database with something for `VACUUM` to reclaim - the
@@ -1587,7 +1595,7 @@ mod vacuum_crash {
     /// the one this ticket's fix is actually about.
     #[test]
     fn a_crash_before_the_rename_recovers_the_original() {
-        let path = temp_db_path("before-rename");
+        let (_scratch_dir, path) = temp_db_path("before-rename");
         let mut engine = seeded(&path);
         let before = rows(&engine);
 
@@ -1610,10 +1618,6 @@ mod vacuum_crash {
             "a crash before the rename must leave the original database exactly as it was"
         );
         drop(reopened);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&scratch);
-        remove_log_segments(&os_vfs(), &path);
-        remove_log_segments(&os_vfs(), &scratch);
     }
 
     /// A crash between removing the original's log segments and the rename,
@@ -1626,7 +1630,7 @@ mod vacuum_crash {
     /// removed after the rename.
     #[test]
     fn a_crash_after_the_early_segment_removal_recovers_the_original() {
-        let path = temp_db_path("segments-gone");
+        let (_scratch_dir, path) = temp_db_path("segments-gone");
         let mut engine = seeded(&path);
         let before = rows(&engine);
 
@@ -1651,10 +1655,6 @@ mod vacuum_crash {
             "the original holds every row its log did"
         );
         drop(reopened);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&scratch);
-        remove_log_segments(&os_vfs(), &path);
-        remove_log_segments(&os_vfs(), &scratch);
     }
 
     /// A crash after the rename lands, but before `path`'s pre-rebuild log
@@ -1671,7 +1671,7 @@ mod vacuum_crash {
     /// different unsafe order.
     #[test]
     fn a_crash_after_the_rename_recovers_the_rebuilt_file() {
-        let path = temp_db_path("after-rename");
+        let (_scratch_dir, path) = temp_db_path("after-rename");
         let mut engine = seeded(&path);
         let before = rows(&engine);
 
@@ -1704,8 +1704,6 @@ mod vacuum_crash {
              that described the file it replaced"
         );
         drop(reopened);
-        let _ = std::fs::remove_file(&path);
-        remove_log_segments(&os_vfs(), &path);
     }
 
     /// The order `vacuum_in_place` used to run in - the original's log
@@ -1717,7 +1715,7 @@ mod vacuum_crash {
     /// defect even after nothing in the source still runs in that order.
     #[test]
     fn an_early_segment_removal_loses_the_original_to_an_interrupted_copy() {
-        let path = temp_db_path("old-order");
+        let (_scratch_dir, path) = temp_db_path("old-order");
         let mut engine = seeded(&path);
         let before = rows(&engine);
 
@@ -1766,9 +1764,6 @@ mod vacuum_crash {
                 );
             }
         }
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&scratch);
-        remove_log_segments(&os_vfs(), &scratch);
     }
 
     /// `VACUUM` refuses a connection with an imposter table declared.
@@ -1779,7 +1774,7 @@ mod vacuum_crash {
     /// the declaration to still name afterward.
     #[test]
     fn a_declared_imposter_refuses_vacuum() {
-        let path = temp_db_path("imposter-refusal");
+        let (_scratch_dir, path) = temp_db_path("imposter-refusal");
         let mut engine = seeded(&path);
         engine
             .execute_any(
@@ -1797,7 +1792,5 @@ mod vacuum_crash {
             "VACUUM must refuse a connection with an imposter table declared"
         );
         drop(engine);
-        let _ = std::fs::remove_file(&path);
-        remove_log_segments(&os_vfs(), &path);
     }
 }

@@ -561,9 +561,11 @@ mod tests {
     /// `CancelHandle` the handle took at open now, and reads nothing else.
     #[test]
     fn a_cancel_from_another_thread_stops_the_running_statement() {
-        let file =
-            std::env::temp_dir().join(format!("inillucent-capi-cancel-{}.rdb", std::process::id()));
-        let _ = std::fs::remove_file(&file);
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-capi-cancel-{}",
+            std::process::id()
+        ));
+        let file = directory.join("cancel.rdb");
         let path = CString::new(file.display().to_string()).unwrap();
         let mut db: *mut inillucent_db = std::ptr::null_mut();
         let mut conn: *mut inillucent_conn = std::ptr::null_mut();
@@ -600,7 +602,6 @@ mod tests {
         unsafe { inillucent_rows_free(after) };
         unsafe { inillucent_conn_free(conn) };
         assert_eq!(unsafe { inillucent_close(db, none) }, INILLUCENT_OK);
-        let _ = std::fs::remove_file(&file);
     }
 
     /// A result read as JSON and a value bound from JSON are the values the cell accessors
@@ -614,9 +615,11 @@ mod tests {
     /// are refused, and a batch holding a row too long for the statement runs none of its rows.
     #[test]
     fn json_reads_and_binds_the_values_the_accessors_do() {
-        let file =
-            std::env::temp_dir().join(format!("inillucent-capi-json-{}.rdb", std::process::id()));
-        let _ = std::fs::remove_file(&file);
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-capi-json-{}",
+            std::process::id()
+        ));
+        let file = directory.join("json.rdb");
         let path = CString::new(file.display().to_string()).unwrap();
         let mut db: *mut inillucent_db = std::ptr::null_mut();
         let mut conn: *mut inillucent_conn = std::ptr::null_mut();
@@ -753,7 +756,6 @@ mod tests {
         unsafe { inillucent_stmt_free(stmt) };
         unsafe { inillucent_conn_free(conn) };
         assert_eq!(unsafe { inillucent_close(db, none) }, INILLUCENT_OK);
-        let _ = std::fs::remove_file(&file);
     }
 
     /// A statement that fails on its 4th row hands the first 3 over through the error.
@@ -766,11 +768,11 @@ mod tests {
     /// rows were never taken frees them with itself.
     #[test]
     fn a_failed_statement_hands_over_the_rows_before_the_failure() {
-        let file = std::env::temp_dir().join(format!(
-            "inillucent-capi-partial-{}.rdb",
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-capi-partial-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&file);
+        let file = directory.join("partial.rdb");
         let path = CString::new(file.display().to_string()).unwrap();
         let mut db: *mut inillucent_db = std::ptr::null_mut();
         let mut conn: *mut inillucent_conn = std::ptr::null_mut();
@@ -824,6 +826,5 @@ mod tests {
 
         unsafe { inillucent_conn_free(conn) };
         assert_eq!(unsafe { inillucent_close(db, none) }, INILLUCENT_OK);
-        let _ = std::fs::remove_file(&file);
     }
 }

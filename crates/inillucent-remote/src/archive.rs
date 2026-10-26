@@ -600,9 +600,10 @@ mod tests {
     /// An archive holding an escaping member writes nothing.
     #[test]
     fn an_archive_with_an_escaping_member_writes_nothing() {
-        let into = std::env::temp_dir().join("inillucent-archive-escape");
-        let _ = std::fs::remove_dir_all(&into);
-        std::fs::create_dir_all(&into).unwrap();
+        let into = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-archive-escape-{}",
+            std::process::id()
+        ));
         let member = Member {
             name: "../escaped.txt".to_string(),
             bytes: b"should never be written".to_vec(),
@@ -610,7 +611,6 @@ mod tests {
         };
         assert!(write_member(&member, &into, None).is_err());
         assert!(!into.join("../escaped.txt").exists());
-        std::fs::remove_dir_all(&into).unwrap();
     }
 
     /// A compression method this reader does not know is refused by number.

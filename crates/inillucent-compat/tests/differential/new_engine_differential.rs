@@ -36,6 +36,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::oracle::{Driver, Op, TaggedValue};
 use inillucent_compat::workspace_root;
@@ -53,13 +54,16 @@ fn oracle_path() -> Option<PathBuf> {
 }
 
 /// Copies the corpus fixture somewhere both engines can open it.
-fn corpus_copy() -> PathBuf {
+///
+/// Returns the scratch directory guard with the copy's path. The directory is
+/// removed when the guard drops, so the caller binds the guard and keeps it for
+/// as long as either engine has the copy open.
+fn corpus_copy() -> (ScratchDir, PathBuf) {
     let source = workspace_root().join("compat/fixtures/select-corpus.db");
-    let directory = std::env::temp_dir().join(format!("inillucent-newdiff-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
+    let directory = ScratchDir::new(&format!("inillucent-newdiff-{}", std::process::id()));
     let target = directory.join("select-corpus.db");
     std::fs::copy(&source, &target).expect("the corpus fixture copies");
-    target
+    (directory, target)
 }
 
 /// One table's shape, as the generator needs it.
@@ -301,7 +305,7 @@ fn the_generated_corpus_has_no_unexplained_differences() {
         inillucent_compat::differential::skipping("the pinned SQLite oracle is not built");
         return;
     };
-    let fixture = corpus_copy();
+    let (_scratch, fixture) = corpus_copy();
     let database = ImportedDatabase::import(fixture.clone(), 8_192)
         .unwrap_or_else(|error| panic!("the corpus did not import: {:?}", error.detail()));
 

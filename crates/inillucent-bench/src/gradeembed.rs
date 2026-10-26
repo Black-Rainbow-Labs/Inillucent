@@ -2086,13 +2086,17 @@ mod tests {
     use super::card::percentile;
     use inillucent_core::model::{ModelManifest, Pooling, Prefixes};
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+    use inillucent_base::testing::ScratchDir;
+
+    /// Makes an empty folder for one test; the folder is removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole test.
+    ///
+    /// @param name - what to name the folder after
+    fn scratch(name: &str) -> ScratchDir {
+        ScratchDir::new(&format!(
             "inillucent-gradeembed-{}-{name}",
             std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        ))
     }
 
     fn arm_facts_for(id: &str) -> ArmFacts {
@@ -2301,7 +2305,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("two different"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2313,7 +2316,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("chunks and"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2332,7 +2334,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("query seed table"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The case a pairwise check cannot see: every cache agrees with every other
@@ -2346,7 +2347,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("this harness digests to"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2371,7 +2371,6 @@ mod tests {
         // The manifest digest moves with the width, so whichever check fires
         // first, the run refuses and says which model and which field.
         assert!(err.contains("model-b"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2396,7 +2395,6 @@ mod tests {
             err.contains("has changed since these vectors were made"),
             "{err}"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2438,7 +2436,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot say which corpus"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2449,7 +2446,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("at least two caches"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2462,7 +2458,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("appears twice"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2474,7 +2469,6 @@ mod tests {
         assert_eq!(arms.len(), 2);
         assert_eq!(arms[0].header.corpus_sha256, arms[1].header.corpus_sha256);
         assert!(arms.iter().all(|a| a.header.has_provenance()));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2550,8 +2544,7 @@ mod tests {
         card.judgements = judge(&card.lanes, &card.baseline, 20260901);
         let stale = card.judgements.len();
 
-        let dir = std::env::temp_dir().join("inillucent-rejudge-role");
-        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let dir = ScratchDir::new(&format!("inillucent-rejudge-role-{}", std::process::id()));
         let path = dir.join("card.json");
         std::fs::write(
             &path,
@@ -2668,12 +2661,12 @@ mod tests {
     }
 
     /// A scratch directory for the sidecar tests, named by process so two runs cannot
-    /// read each other's files.
-    fn sidecar_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("inillucent-sidecar-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// read each other's files. The folder is removed when the returned guard drops,
+    /// so each test keeps the guard for as long as it reads the files inside.
+    ///
+    /// @param name - what to name the folder after
+    fn sidecar_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(&format!("inillucent-sidecar-{}-{name}", std::process::id()))
     }
 
     /// Write a sidecar pair: the vectors and the JSON that claims what they are.

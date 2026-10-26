@@ -114,6 +114,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::PathBuf;
+
+use inillucent_base::testing::ScratchDir;
 use std::time::{Duration, Instant};
 
 use inillucent_engine::connect::{Connection, Database, Statement};
@@ -348,18 +350,16 @@ fn embedder_is_compiled_in(database: &Database) -> bool {
     connection.prepare("SELECT embed('probe')").is_ok()
 }
 
-/// Returns a fresh, empty directory for one test's files.
+/// Returns a fresh, empty directory for one test's files, removed when the
+/// returned guard drops.
 ///
 /// @param tag - what to name the directory after
-fn scratch(tag: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
+fn scratch(tag: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
         "inillucent-budget-{}-{tag}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
-    directory
+    ))
 }
 
 /// Builds a table of [`ROWS`] rows with an index on one column.

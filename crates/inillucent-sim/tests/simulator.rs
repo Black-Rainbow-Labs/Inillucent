@@ -286,9 +286,10 @@ fn crash_artifacts_are_written_to_disk() {
     drop(file);
     let snapshot = vfs.crash();
 
-    let mut directory = std::env::temp_dir();
-    directory.push(format!("inillucent-sim-artifacts-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-sim-artifacts-{}",
+        std::process::id()
+    ));
     snapshot
         .write_artifacts(&directory)
         .expect("the artifact directory is writable");
@@ -296,7 +297,6 @@ fn crash_artifacts_are_written_to_disk() {
         .expect("the manifest was written");
     assert!(manifest.contains("artifact.db"), "{manifest}");
     assert!(directory.join("file-000.bin").exists());
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// A device that promises whole-sector atomicity must never tear, and one that

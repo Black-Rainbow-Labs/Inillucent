@@ -42,17 +42,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_engine::connect::Database;
 use inillucent_engine::{AuthAction, Authorization, Authorizer};
 
-/// A scratch directory of this test's own.
+/// A scratch directory of this test's own, removed when the returned guard drops.
 ///
 /// @param name - what to call it
-fn scratch(name: &str) -> std::path::PathBuf {
-    let directory = std::env::temp_dir().join("inillucent-reentrant").join(name);
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("the scratch directory is made");
-    directory
+fn scratch(name: &str) -> ScratchDir {
+    ScratchDir::new(&format!(
+        "inillucent-reentrant-{}-{name}",
+        std::process::id()
+    ))
 }
 
 /// An authorizer that runs a query on the connection that is asking it.

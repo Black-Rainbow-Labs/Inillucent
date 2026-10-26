@@ -81,6 +81,7 @@ use std::process::{Command, ExitCode};
 use std::rc::Rc;
 use std::time::Instant;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::affinity::{self, Placement};
 use inillucent_compat::newengine::connect::{
     Connection as ConnectedConnection, Database as ConnectedDatabase,
@@ -905,13 +906,14 @@ fn run(fixture: &Path, settings: &Settings, placement: &Placement) -> Result<Opt
         );
     }
 
-    let plan_path =
-        std::env::temp_dir().join(format!("inillucent-fullgate-{}.plan", std::process::id()));
+    // The guard removes the plan and the copies on every return, early ones too.
+    let scratch = ScratchDir::try_at(
+        std::env::temp_dir().join(format!("inillucent-fullgate-{}", std::process::id())),
+    )
+    .map_err(|error| format!("could not make a scratch directory: {error}"))?;
+    let plan_path = scratch.join("workloads.plan");
     std::fs::write(&plan_path, plan.render())
         .map_err(|error| format!("could not write the plan: {error}"))?;
-    let scratch = std::env::temp_dir().join(format!("inillucent-fullgate-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch)
-        .map_err(|error| format!("could not make a scratch directory: {error}"))?;
 
     let mut measured: Vec<Paired> = plan
         .workloads
@@ -1121,17 +1123,16 @@ fn run(fixture: &Path, settings: &Settings, placement: &Placement) -> Result<Opt
     // measurement itself pays for that: `txn.batched` is 200 commits and 200
     // syncs, and on a temp volume in that state it went from 47 ms to 240 ms on
     // *both* arms - the reference's own number moving with ours is what says it
-    // is the disk rather than the engine.
+    // is the disk rather than the engine. The guard made above removes it when
+    // this function returns.
     //
     // A **disagreement** leaves it, and only that: the two databases are the
     // evidence for a digest that did not match, and nothing else here is worth
     // a hundred megabytes. A missed bar is a number, not a file.
-    if measured.iter().all(|entry| entry.agreed) {
-        let _ = std::fs::remove_dir_all(&scratch);
-        let _ = std::fs::remove_file(&plan_path);
-    } else {
+    if !measured.iter().all(|entry| entry.agreed) {
+        let kept = scratch.keep();
         println!();
-        println!("  a workload disagreed; the two databases are kept in {scratch:?}");
+        println!("  a workload disagreed; the two databases are kept in {kept:?}");
     }
 
     println!();

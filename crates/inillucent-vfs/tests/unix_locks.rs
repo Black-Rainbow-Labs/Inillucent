@@ -36,19 +36,21 @@ use inillucent_vfs::contract::{FileLock, OpenOptions, Vfs, VfsFile};
 use inillucent_vfs::os::OsVfs;
 use inillucent_vfs::path::DbPath;
 
-/// Creates a fresh directory for one test and returns the database path in it.
+/// Creates a fresh directory for one test and returns its guard and the
+/// database path in it.
+///
+/// The directory is removed when the guard drops, so the caller binds the guard
+/// with a named binding and keeps it for the whole test, declared before any
+/// handle opened on the database.
 ///
 /// @param name - the test's name
-fn scratch(name: &str) -> DbPath {
-    let mut root = std::env::temp_dir();
-    root.push(format!(
-        "inillucent-vfs-unix-locks/{name}-{}",
+fn scratch(name: &str) -> (inillucent_base::testing::ScratchDir, DbPath) {
+    let guard = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-vfs-unix-locks-{name}-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("the temporary directory is writable");
-    root.push("db.rdb");
-    DbPath::new(root)
+    let path = DbPath::new(guard.join("db.rdb"));
+    (guard, path)
 }
 
 /// Opens one handle on the database, creating it when it is not there.
@@ -123,7 +125,7 @@ impl Drop for Probe {
 /// asserts for the same case through a different mechanism.
 #[test]
 fn a_second_handle_in_this_process_is_refused_the_read_lock() {
-    let path = scratch("exclusive");
+    let (_scratch, path) = scratch("exclusive");
     let vfs = OsVfs::new();
     let writer = handle(&vfs, &path);
     let reader = handle(&vfs, &path);
@@ -161,7 +163,7 @@ fn a_second_handle_in_this_process_is_refused_the_read_lock() {
 /// the same byte can only be taken exclusively, so the reader retries.
 #[test]
 fn two_readers_in_this_process_share_the_file() {
-    let path = scratch("two-readers");
+    let (_scratch, path) = scratch("two-readers");
     let vfs = OsVfs::new();
     let first = handle(&vfs, &path);
     let second = handle(&vfs, &path);
@@ -188,7 +190,7 @@ fn two_readers_in_this_process_share_the_file() {
 /// probed here would tell every connection that nobody was writing.
 #[test]
 fn a_reserved_lock_is_visible_to_another_handle_here() {
-    let path = scratch("reserved");
+    let (_scratch, path) = scratch("reserved");
     let vfs = OsVfs::new();
     let writer = handle(&vfs, &path);
     let reader = handle(&vfs, &path);
@@ -240,7 +242,7 @@ fn a_reserved_lock_is_visible_to_another_handle_here() {
 /// so the descriptor outlives every handle that shares it.
 #[test]
 fn closing_one_handle_keeps_the_other_s_kernel_lock() {
-    let path = scratch("close");
+    let (_scratch, path) = scratch("close");
     let vfs = OsVfs::new();
     let keeper = handle(&vfs, &path);
     let closing = handle(&vfs, &path);

@@ -8,22 +8,27 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_vfs::conformance;
 use inillucent_vfs::contract::{FileLock, OpenOptions, Vfs};
 use inillucent_vfs::memory::MemoryVfs;
 use inillucent_vfs::os::OsVfs;
 use inillucent_vfs::path::DbPath;
 
-/// Creates a fresh directory for one test and returns its path.
-fn workspace(name: &str) -> DbPath {
-    let mut root = std::env::temp_dir();
-    root.push(format!(
-        "inillucent-vfs-tests/{name}-{}",
+/// Creates a fresh directory for one test and returns its guard and its path.
+///
+/// The directory is removed when the guard drops, so the caller binds the guard
+/// with a named binding and keeps it for the whole test, declared before any
+/// file opened inside the directory.
+///
+/// @param name - what to name the directory after
+fn workspace(name: &str) -> (ScratchDir, DbPath) {
+    let guard = ScratchDir::new(&format!(
+        "inillucent-vfs-tests-{name}-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("the temporary directory is writable");
-    DbPath::new(root)
+    let root = DbPath::new(guard.to_path_buf());
+    (guard, root)
 }
 
 /// Writes a report next to the other evidence artifacts so a run leaves proof.
@@ -52,13 +57,12 @@ fn memory_vfs_passes_the_conformance_suite() {
 /// The real file system must pass every case on this platform.
 #[test]
 fn os_vfs_passes_the_conformance_suite() {
-    let root = workspace("conformance");
+    let (_scratch, root) = workspace("conformance");
     let vfs = OsVfs::new();
     let report = conformance::run(&vfs, &root);
     record(&report, "conformance-os");
     assert!(report.is_clean(), "{}", report.to_text());
     assert!(report.passed() >= 24, "{}", report.to_text());
-    let _ = std::fs::remove_dir_all(root.as_path());
 }
 
 /// A second process holding the probe's locks.
@@ -113,7 +117,7 @@ impl Drop for Probe {
 /// the property no same-process test can demonstrate on POSIX.
 #[test]
 fn locks_conflict_across_processes() {
-    let root = workspace("cross-process");
+    let (_scratch, root) = workspace("cross-process");
     let path = DbPath::new(root.as_path().join("shared.db"));
     let vfs = OsVfs::new();
     let local = vfs
@@ -185,14 +189,13 @@ fn locks_conflict_across_processes() {
 
     drop(probe);
     drop(local);
-    let _ = std::fs::remove_dir_all(root.as_path());
 }
 
 /// A process that dies while holding a lock must not leave the file locked, or
 /// a crashed connection would wedge the database until a reboot.
 #[test]
 fn a_dead_process_releases_its_locks() {
-    let root = workspace("dead-process");
+    let (_scratch, root) = workspace("dead-process");
     let path = DbPath::new(root.as_path().join("orphan.db"));
     let vfs = OsVfs::new();
     let owner = vfs
@@ -223,7 +226,6 @@ fn a_dead_process_releases_its_locks() {
         }
     }
     drop(survivor);
-    let _ = std::fs::remove_dir_all(root.as_path());
 }
 
 /// A wal-index left behind by a process that died must be thrown away, and one
@@ -239,7 +241,7 @@ fn a_dead_process_releases_its_locks() {
 /// exists at all.
 #[test]
 fn an_abandoned_wal_index_is_discarded() {
-    let root = workspace("abandoned-index");
+    let (_scratch, root) = workspace("abandoned-index");
     let path = DbPath::new(root.as_path().join("index.db"));
     let vfs = OsVfs::new();
     let owner = vfs
@@ -305,7 +307,6 @@ fn an_abandoned_wal_index_is_discarded() {
     }
     drop(survivor_shm);
     drop(survivor);
-    let _ = std::fs::remove_dir_all(root.as_path());
 }
 
 /// **Creating a file that survives a restart forces its directory entry.**
@@ -328,7 +329,7 @@ fn an_abandoned_wal_index_is_discarded() {
 fn creating_a_durable_file_forces_its_directory_entry() {
     use inillucent_vfs::contract::FileKind;
 
-    let root = workspace("directory-sync");
+    let (_scratch, root) = workspace("directory-sync");
     let vfs = OsVfs::new();
     let path = DbPath::new(root.as_path().join("made.rdb"));
     assert_eq!(vfs.directory_syncs(), 0, "a fresh VFS has forced nothing");
@@ -378,6 +379,4 @@ fn creating_a_durable_file_forces_its_directory_entry() {
         "a transient file forced a directory entry it has no use for"
     );
     drop(transient);
-
-    let _ = std::fs::remove_dir_all(root.as_path());
 }

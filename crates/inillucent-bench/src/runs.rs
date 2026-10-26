@@ -449,8 +449,10 @@ mod tests {
 
     #[test]
     fn a_run_writes_its_records_and_then_its_manifest() {
-        let root = std::env::temp_dir().join(format!("inillucent-runs-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-runs-{}",
+            std::process::id()
+        ));
         let mut w = RunWriter::create(&root, "test-run").unwrap();
         w.record(&QueryRecord {
             family: "heading",
@@ -522,6 +524,5 @@ mod tests {
         assert!(fs::read_to_string(dir.join("manifest.json"))
             .unwrap()
             .contains("test-run"));
-        fs::remove_dir_all(&root).ok();
     }
 }

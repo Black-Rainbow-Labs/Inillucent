@@ -69,8 +69,11 @@ pub mod procstat;
 pub mod processor_share;
 pub mod quiet;
 pub mod rendering;
+// One temporary folder per test run, removed when the run ends, so the system
+// temporary directory does not fill with what the tests leave behind.
 pub mod report;
 pub mod results;
+pub mod run_temp;
 pub mod selection;
 pub mod slt;
 // Every statement form in every context, on files, against the pinned SQLite

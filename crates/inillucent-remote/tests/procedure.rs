@@ -157,33 +157,25 @@ impl RemoteSource for Stub {
     }
 }
 
-/// Returns a scratch path nothing else is using.
+/// Returns a fresh folder and the path of a database file inside it.
+///
+/// **The folder holds every file a migration writes.** The staging file and the
+/// report sit beside the destination, so removing the folder removes all of
+/// them. The caller binds the guard with a named binding and keeps it for the
+/// whole test, because the folder is removed when the guard drops.
 ///
 /// @param name - what to call it
-fn scratch(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "inillucent-procedure-{name}-{}-{}.rdb",
+fn scratch(name: &str) -> (inillucent_base::testing::ScratchDir, PathBuf) {
+    let directory = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-procedure-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0)
     ));
-    path
-}
-
-/// Removes everything a migration wrote.
-///
-/// @param destination - the published path
-fn clean(destination: &Path) {
-    let name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let _ = std::fs::remove_file(destination);
-    let _ = std::fs::remove_file(staging_path(destination));
-    let _ = std::fs::remove_file(destination.with_file_name(format!("{name}.migration-report.md")));
+    let path = directory.join(format!("{name}.rdb"));
+    (directory, path)
 }
 
 /// Returns a plan against a URL that is never dialled.
@@ -197,7 +189,7 @@ fn plan(destination: &Path) -> Plan {
 /// The happy path: staged, copied, verified, published, and readable.
 #[test]
 fn a_verified_migration_publishes_and_reads_back() {
-    let destination = scratch("happy");
+    let (_scratch, destination) = scratch("happy");
     let mut source = Stub::new(Behaviour::Honest);
     let report = run(&plan(&destination), &mut source).expect("the migration runs");
 
@@ -230,7 +222,6 @@ fn a_verified_migration_publishes_and_reads_back() {
     );
     let _ = connection;
     drop(database);
-    clean(&destination);
 }
 
 /// **A source whose count disagrees with its scan publishes nothing.** This is
@@ -239,7 +230,7 @@ fn a_verified_migration_publishes_and_reads_back() {
 /// other way round, and it still has to fail.
 #[test]
 fn a_disagreeing_count_publishes_nothing_and_keeps_the_evidence() {
-    let destination = scratch("mismatch");
+    let (_scratch, destination) = scratch("mismatch");
     let mut source = Stub::new(Behaviour::CountsOneMore);
     let report = run(&plan(&destination), &mut source).expect("the migration runs to a verdict");
 
@@ -280,14 +271,13 @@ fn a_disagreeing_count_publishes_nothing_and_keeps_the_evidence() {
         "the report carries no password: {text}"
     );
     assert!(text.contains("FAIL source.count.note"), "{text}");
-    clean(&destination);
 }
 
 /// A scan that dies half way is an error naming the table, and it publishes
 /// nothing - the rows that did arrive stay in the staging file.
 #[test]
 fn a_scan_that_dies_publishes_nothing_and_names_the_table() {
-    let destination = scratch("died");
+    let (_scratch, destination) = scratch("died");
     let mut source = Stub::new(Behaviour::DiesMidScan);
     let error = match run(&plan(&destination), &mut source) {
         Ok(report) => panic!("a dead scan should not produce a report: {report:?}"),
@@ -300,14 +290,13 @@ fn a_scan_that_dies_publishes_nothing_and_names_the_table() {
         staging_path(&destination).exists(),
         "the partial staging file is the evidence and is not cleaned up"
     );
-    clean(&destination);
 }
 
 /// A source that holds nothing is a pass with one honest check, not an empty
 /// report that reads as a success by having no failures in it.
 #[test]
 fn an_empty_source_says_so_rather_than_passing_vacuously() {
-    let destination = scratch("empty");
+    let (_scratch, destination) = scratch("empty");
     let mut source = Stub::empty();
     let report = run(&plan(&destination), &mut source).expect("the migration runs");
     assert!(report.passed());
@@ -322,14 +311,13 @@ fn an_empty_source_says_so_rather_than_passing_vacuously() {
             .collect::<Vec<String>>()
     );
     assert!(destination.exists());
-    clean(&destination);
 }
 
 /// A destination that already exists is refused, and the file that was there is
 /// not touched.
 #[test]
 fn an_existing_destination_is_refused_and_left_alone() {
-    let destination = scratch("exists");
+    let (_scratch, destination) = scratch("exists");
     std::fs::write(&destination, b"somebody else's database").expect("writes");
     let mut source = Stub::new(Behaviour::Honest);
     let error = match run(&plan(&destination), &mut source) {
@@ -348,7 +336,6 @@ fn an_existing_destination_is_refused_and_left_alone() {
         std::fs::read(&destination).expect("still there"),
         b"somebody else's database".to_vec()
     );
-    clean(&destination);
 }
 
 /// **A leftover staging file is refused rather than resumed.** A file source
@@ -357,7 +344,7 @@ fn an_existing_destination_is_refused_and_left_alone() {
 /// ever existed.
 #[test]
 fn a_leftover_staging_file_is_refused_rather_than_resumed() {
-    let destination = scratch("leftover");
+    let (_scratch, destination) = scratch("leftover");
     std::fs::write(staging_path(&destination), b"half a migration").expect("writes");
     let mut source = Stub::new(Behaviour::Honest);
     let error = match run(&plan(&destination), &mut source) {
@@ -367,7 +354,6 @@ fn a_leftover_staging_file_is_refused_rather_than_resumed() {
     let said = error.detail().unwrap_or_else(|| error.message());
     assert!(said.contains("one pass"), "{said}");
     assert!(!destination.exists());
-    clean(&destination);
 }
 
 /// The batch size changes how many transactions the copy takes and nothing
@@ -375,13 +361,13 @@ fn a_leftover_staging_file_is_refused_rather_than_resumed() {
 /// the same digest.
 #[test]
 fn the_batch_size_changes_nothing_about_the_result() {
-    let one = scratch("batch-1");
+    let (_scratch_one, one) = scratch("batch-1");
     let mut source = Stub::new(Behaviour::Honest);
     let mut small = plan(&one);
     small.batch = 1;
     let first = run(&small, &mut source).expect("the migration runs");
 
-    let many = scratch("batch-default");
+    let (_scratch_many, many) = scratch("batch-default");
     let mut source = Stub::new(Behaviour::Honest);
     let second = run(&plan(&many), &mut source).expect("the migration runs");
 
@@ -390,15 +376,13 @@ fn the_batch_size_changes_nothing_about_the_result() {
         first.tables.first().map(|table| table.digest.clone()),
         second.tables.first().map(|table| table.digest.clone())
     );
-    clean(&one);
-    clean(&many);
 }
 
 /// What the source holds and does not carry across is reported rather than
 /// quietly missing.
 #[test]
 fn objects_that_are_not_carried_are_named_in_the_report() {
-    let destination = scratch("not-carried");
+    let (_scratch, destination) = scratch("not-carried");
     let mut source = Stub::new(Behaviour::Honest);
     let report = run(&plan(&destination), &mut source).expect("the migration runs");
     assert_eq!(
@@ -414,5 +398,4 @@ fn objects_that_are_not_carried_are_named_in_the_report() {
             .expect("the report reads");
     assert!(text.contains("Not carried"), "{text}");
     assert!(text.contains("public.recent"), "{text}");
-    clean(&destination);
 }

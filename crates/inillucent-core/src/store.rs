@@ -1650,8 +1650,10 @@ mod text_arena_tests {
         let text = "alpha beta gamma delta";
         let resident = TextArena::Resident(text.to_string());
 
-        let directory = std::env::temp_dir().join("inillucent-text-arena");
-        let _ = std::fs::create_dir_all(&directory);
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-text-arena-{}",
+            std::process::id()
+        ));
         let path = directory.join("arena.bin");
         // Written with eleven bytes of padding in front, so an arena that
         // ignored its offset would read the padding and this would fail.
@@ -1684,8 +1686,6 @@ mod text_arena_tests {
             assert_eq!(filed.slice(range.clone()), "");
             assert_eq!(resident.slice(range.clone()), "");
         }
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// **Text added to a filed arena is readable without reading the file back.**
@@ -1696,8 +1696,10 @@ mod text_arena_tests {
     /// heap; the filed text stays where it is.
     #[test]
     fn a_filed_arena_takes_an_append_without_reading_itself_in() {
-        let directory = std::env::temp_dir().join("inillucent-text-arena-append");
-        let _ = std::fs::create_dir_all(&directory);
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-text-arena-append-{}",
+            std::process::id()
+        ));
         let path = directory.join("arena.bin");
         std::fs::write(&path, b"alpha beta").expect("the arena file is written");
         let mut filed = TextArena::Filed {
@@ -1722,8 +1724,6 @@ mod text_arena_tests {
             "the appended half is missing"
         );
         assert_eq!(filed.to_text(), "alpha beta gamma");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// **A store claiming more text than its file holds is refused.**
@@ -1761,8 +1761,10 @@ mod text_arena_tests {
             slot.copy_from_slice(&u64::MAX.to_le_bytes());
         }
 
-        let directory = std::env::temp_dir().join("inillucent-text-arena-short");
-        let _ = std::fs::create_dir_all(&directory);
+        let directory = inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-text-arena-short-{}",
+            std::process::id()
+        ));
         let path = directory.join("store.bin");
         std::fs::write(&path, &bytes).expect("the store file is written");
         let file = std::fs::File::open(&path).expect("the store file opens");
@@ -1776,7 +1778,5 @@ mod text_arena_tests {
             std::io::ErrorKind::UnexpectedEof,
             "the refusal was not about the file running out: {refused}"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 }

@@ -11,24 +11,24 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_pool::{Database, Options};
 use inillucent_vfs::OsVfs;
 use inillucent_vfs::{DbPath, FileLock, OpenOptions, Vfs};
 
-/// Makes a fresh database file in a directory of its own and returns its path.
+/// Makes a fresh database file in a directory of its own and returns the
+/// directory's guard with the file's path. The directory is removed when the
+/// guard drops, so the caller keeps it until the test ends.
 ///
 /// @param name - the test's name, which names the directory
-fn fresh_file(name: &str) -> DbPath {
-    let directory =
-        std::env::temp_dir().join(format!("inillucent-lease-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
+fn fresh_file(name: &str) -> (ScratchDir, DbPath) {
+    let directory = ScratchDir::new(&format!("inillucent-lease-{name}-{}", std::process::id()));
     let path = DbPath::new(directory.join("lease.rdb").to_string_lossy().as_ref());
     let vfs = OsVfs::new();
     let mut created = Database::create(&vfs, &path, Options::default()).expect("a new file");
     created.checkpoint().expect("a checkpoint");
     drop(created);
-    path
+    (directory, path)
 }
 
 /// Opens a second, raw handle on the file, the way another process would hold it.
@@ -60,7 +60,7 @@ fn exclusive_within(raw: &dyn inillucent_vfs::VfsFile, limit: Duration) -> Optio
 /// it go once nothing has used it for `IDLE`.
 #[test]
 fn a_lease_holds_the_file_until_it_is_idle() {
-    let path = fresh_file("idle");
+    let (_directory, path) = fresh_file("idle");
     let vfs = Arc::new(OsVfs::new());
     let mut reader = Database::open(vfs.as_ref(), &path, 64).expect("the reader");
     // Opened before the lease, so the check below comes within the lease's
@@ -96,7 +96,7 @@ fn a_lease_holds_the_file_until_it_is_idle() {
 /// because a refused raise lets the leases of this process go first.
 #[test]
 fn a_writer_in_the_same_process_takes_a_lease_away() {
-    let path = fresh_file("yield");
+    let (_directory, path) = fresh_file("yield");
     let vfs = Arc::new(OsVfs::new());
     let mut reader = Database::open(vfs.as_ref(), &path, 64).expect("the reader");
     let mut writer = Database::open(vfs.as_ref(), &path, 64).expect("the writer");
@@ -118,7 +118,7 @@ fn a_writer_in_the_same_process_takes_a_lease_away() {
 /// is the one the lease kept, and no other handle got in between.
 #[test]
 fn the_next_statement_claims_the_lease() {
-    let path = fresh_file("claim");
+    let (_directory, path) = fresh_file("claim");
     let vfs = Arc::new(OsVfs::new());
     let mut reader = Database::open(vfs.as_ref(), &path, 64).expect("the reader");
     reader.begin_read().expect("a read lock");
@@ -144,7 +144,7 @@ fn the_next_statement_claims_the_lease() {
 /// to end by itself: only a statement claims it.
 #[test]
 fn asking_about_the_lock_does_not_keep_the_lease() {
-    let path = fresh_file("ask");
+    let (_directory, path) = fresh_file("ask");
     let vfs = Arc::new(OsVfs::new());
     let mut reader = Database::open(vfs.as_ref(), &path, 64).expect("the reader");
     reader.begin_read().expect("a read lock");

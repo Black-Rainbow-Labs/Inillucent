@@ -32,6 +32,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_compat::newengine::ImportedDatabase;
 use inillucent_compat::slt::{self, Record, TestFile};
 use inillucent_compat::workspace_root;
@@ -62,15 +63,17 @@ fn test_files() -> Vec<PathBuf> {
 /// the tests in this file run in parallel in one process and two of them
 /// copying onto the same path is a locked file rather than a shared fixture.
 ///
+/// Returns the scratch directory guard with the copy's path. The directory is
+/// removed when the guard drops, so the caller binds the guard and keeps it for
+/// as long as the database imported from the copy is open.
+///
 /// @param tag - the calling test's name
-fn corpus_copy(tag: &str) -> PathBuf {
+fn corpus_copy(tag: &str) -> (ScratchDir, PathBuf) {
     let source = workspace_root().join("compat/fixtures/select-corpus.db");
-    let directory =
-        std::env::temp_dir().join(format!("inillucent-slt-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("a scratch directory");
+    let directory = ScratchDir::new(&format!("inillucent-slt-{}-{tag}", std::process::id()));
     let target = directory.join("select-corpus.db");
     std::fs::copy(&source, &target).expect("the corpus fixture copies");
-    target
+    (directory, target)
 }
 
 /// Renders one row the way the format writes it.
@@ -93,7 +96,7 @@ fn render_row(row: &[OwnedDatum], types: &str) -> Vec<String> {
 fn the_read_only_subset_is_green_on_the_new_engine() {
     let files = test_files();
     assert!(!files.is_empty(), "no conformance files were found");
-    let fixture = corpus_copy("subset");
+    let (_scratch, fixture) = corpus_copy("subset");
     let database = ImportedDatabase::import(fixture.clone(), 8_192)
         .unwrap_or_else(|error| panic!("the corpus did not import: {:?}", error.detail()));
 
@@ -181,7 +184,6 @@ fn the_read_only_subset_is_green_on_the_new_engine() {
         failures.len(),
         failures.join("\n")
     );
-    let _ = std::fs::remove_dir_all(fixture.parent().unwrap_or(&fixture));
 }
 
 /// Collapses a refusal message to the construct it named.
@@ -223,7 +225,7 @@ fn reason_of(detail: &str) -> String {
 /// pool, out of pages it did not keep a handle on.
 #[test]
 fn the_catalog_tree_answers_queries_as_sqlite_schema() {
-    let fixture = corpus_copy("catalog");
+    let (_scratch, fixture) = corpus_copy("catalog");
     let database = ImportedDatabase::import(fixture, 8_192)
         .unwrap_or_else(|error| panic!("the corpus did not import: {:?}", error.detail()));
 

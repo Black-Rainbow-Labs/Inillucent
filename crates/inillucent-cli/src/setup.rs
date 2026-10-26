@@ -1281,16 +1281,15 @@ mod tests {
         manifest: EMBEDDER.manifest,
     };
 
-    /// Returns an empty scratch directory for one case.
+    /// Returns an empty scratch directory for one case, removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole case.
     ///
     /// @param name - the case
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("inillucent-setup-from-{}", std::process::id()))
-            .join(name);
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    fn scratch(name: &str) -> inillucent_base::testing::ScratchDir {
+        inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-setup-from-{}-{name}",
+            std::process::id()
+        ))
     }
 
     /// **`--from` installs a model from a folder, and only when every file is
@@ -1357,7 +1356,7 @@ mod tests {
         assert!(!folder.exists(), "{} was left behind", folder.display());
 
         let missing = scratch("missing-from");
-        let refused = install_model(&root, &UNREACHABLE, false, Some(&missing));
+        let refused = install_model(&root, &UNREACHABLE, false, Some(missing.path()));
         assert!(refused.is_err(), "an empty folder holds none of the files");
         assert!(!folder.exists(), "{} was left behind", folder.display());
     }

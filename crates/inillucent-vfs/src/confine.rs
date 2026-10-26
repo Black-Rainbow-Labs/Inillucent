@@ -394,10 +394,21 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Makes an empty folder for one test; the folder is removed when the
+    /// returned guard drops, so the caller keeps the guard for the whole test.
+    ///
+    /// @param name - what to name the folder after
+    fn scratch(name: &str) -> inillucent_base::testing::ScratchDir {
+        inillucent_base::testing::ScratchDir::new(&format!(
+            "inillucent-confine-{name}-{}",
+            std::process::id()
+        ))
+    }
+
     /// A path whose text climbs out of the root is refused.
     #[test]
     fn a_path_that_climbs_out_is_refused() {
-        let directory = std::env::temp_dir().join("inillucent-confine-climb");
+        let directory = scratch("climb");
         std::fs::create_dir_all(directory.join("inner")).unwrap();
         let root = Root::at(&directory).unwrap();
         assert!(root.admit("inner/app.rdb").is_ok());
@@ -409,7 +420,7 @@ mod tests {
     /// refusal on the text alone would refuse a path that is genuinely inside.
     #[test]
     fn climbing_back_inside_is_admitted() {
-        let directory = std::env::temp_dir().join("inillucent-confine-back");
+        let directory = scratch("back");
         std::fs::create_dir_all(directory.join("inner")).unwrap();
         let root = Root::at(&directory).unwrap();
         assert!(root.admit("inner/../app.rdb").is_ok());
@@ -419,8 +430,7 @@ mod tests {
     /// is about to be created is still checked against where it would land.
     #[test]
     fn a_path_that_does_not_exist_yet_resolves_to_where_it_would_land() {
-        let directory = std::env::temp_dir().join("inillucent-confine-new");
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = scratch("new");
         let root = Root::at(&directory).unwrap();
         let admitted = root.admit("not/there/yet.rdb").unwrap();
         assert!(admitted.ends_with("yet.rdb"));
@@ -455,8 +465,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_windows_device_name_or_stream_is_refused() {
-        let directory = std::env::temp_dir().join("inillucent-confine-devices");
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = scratch("devices");
         let root = Root::at(&directory).unwrap();
         for name in [
             "CON",

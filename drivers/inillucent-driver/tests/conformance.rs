@@ -27,6 +27,7 @@
 
 use std::path::PathBuf;
 
+use inillucent_base::testing::ScratchDir;
 use inillucent_driver::{Database, Rows, Status, Value};
 
 mod json {
@@ -303,20 +304,23 @@ mod json {
 
 use json::Json;
 
-/// Returns a scratch database path nothing else is using.
+/// Returns a scratch directory guard and the path of a database inside it that
+/// nothing else is using. The directory, with the database's log files, is
+/// removed when the guard drops, so the caller keeps it until the database is
+/// closed.
 ///
 /// @param name - the case's name
-fn scratch(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "inillucent-conformance-{name}-{}-{}.rdb",
+fn scratch(name: &str) -> (ScratchDir, PathBuf) {
+    let directory = ScratchDir::new(&format!(
+        "inillucent-conformance-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0)
     ));
-    path
+    let path = directory.join("case.rdb");
+    (directory, path)
 }
 
 /// Reads a value out of the suite's one-key object form.
@@ -527,7 +531,7 @@ fn the_conformance_suite_passes() {
     for case in cases {
         let name = case.get("name").and_then(Json::text).unwrap_or("(unnamed)");
         names.push(name.to_owned());
-        let file = scratch(name);
+        let (_directory, file) = scratch(name);
         let database = Database::open(&file).expect("the scratch database opens");
         // **A case may ask to be run a connection per call**, which is the shape
         // a driver in another language is forced into: `Connection` borrows the
@@ -602,7 +606,6 @@ fn the_conformance_suite_passes() {
 
         let _ = hold;
         drop(database);
-        let _ = std::fs::remove_file(&file);
         for problem in wrong {
             failures.push(format!("{name}: {problem}"));
         }
