@@ -165,3 +165,39 @@ function New-NightlyEvidence {
         failed = if ($Summary) { @($Summary.failed) + @($Summary.undetermined) + @($Summary.hollow | ForEach-Object { $_.target }) } else { @() }
     }
 }
+
+# The files the nightly commits about itself. A commit that changes only these is the nightly's own
+# record of a run, not a code change, so it does not make the next night run again.
+$NightlyRecordPaths = @('tests/timings.toml', 'tests/nightly-history.tsv', 'compat/perf/nightly')
+
+function Test-NightlyCodeUnchanged {
+    <#
+    .SYNOPSIS
+        Whether the code at one commit is the same as at the commit the last nightly ran.
+
+    .DESCRIPTION
+        True when the two commits differ only in $NightlyRecordPaths. Then the night would build and
+        test exactly what the last night built and tested, whatever that night's result was, so the
+        nightly does nothing. A red night is not rerun on the same code by itself; `nightly.ps1 -Force`
+        reruns it.
+
+        False when there is no earlier commit, when the repository does not have it, or when any
+        other file differs.
+
+    .PARAMETER Repository
+        A checkout that holds both commits.
+
+    .PARAMETER Since
+        The commit the last nightly ran, from latest.json.
+
+    .PARAMETER Commit
+        The commit tonight would run.
+    #>
+    param([string] $Repository, [string] $Since, [string] $Commit)
+    if ($Since -notmatch '^[0-9a-f]{40}$') { return $false }
+    & git -C $Repository cat-file -e "$Since^{commit}" 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $excluded = @($NightlyRecordPaths | ForEach-Object { ":(exclude)$_" })
+    & git -C $Repository diff --quiet $Since $Commit -- . @excluded
+    return $LASTEXITCODE -eq 0
+}

@@ -46,7 +46,10 @@
     The branch to test. `main` for the scheduled run; another branch for a deliberate trial.
 
 .PARAMETER Force
-    Run even when latest.json already records this commit as green.
+    Run even when no code changed since the commit latest.json records. Without it, a night whose
+    code is the same as the last night's builds and tests nothing, whether that night was green or
+    red. The nightly's own records (tests/timings.toml, tests/nightly-history.tsv and
+    compat/perf/nightly) do not count as code.
 
 .PARAMETER SkipRelease
     Leave out the release build, and so the gates and the pre release.
@@ -468,7 +471,7 @@ function Save-NightlyRecords {
         The commit tested.
     #>
     param([string] $Commit)
-    $paths = @('tests/timings.toml', 'tests/nightly-history.tsv', 'compat/perf/nightly') |
+    $paths = $NightlyRecordPaths |
         Where-Object { Test-Path -LiteralPath (Join-Path $Worktree $_) }
     & git -C $Worktree add -- @paths
     & git -C $Worktree diff --cached --quiet
@@ -563,7 +566,7 @@ if ($WhatIf) {
     $evidence = Read-NightlyEvidence -Path $evidencePath
     $last = if ($evidence) { "$($evidence.result) at $($evidence.commit) on $($evidence.date)" } else { 'none' }
     Write-Host "   the last night: $last"
-    Write-Host '   would fetch origin, move the worktree to the branch, and exit 0 if that commit is already green'
+    Write-Host '   would fetch origin, move the worktree to the branch, and exit 0 if no code changed since the last night'
     Write-Host '   would run: inillucent-testrun --cadence nightly --strict --record --summary'
     if ($DeadlineHours -gt 0) { Write-Host "   would stop whatever is still running $DeadlineHours hours after it starts, and record the night as red" }
     if (-not $SkipRelease) { Write-Host '   would run: release-all.ps1 -Targets all (five builds in parallel, fat LTO, signed and notarised)' }
@@ -581,8 +584,12 @@ Write-Step 'worktree'
 $commit = Initialize-Worktree
 Write-Host "   $commit"
 $previous = Read-NightlyEvidence -Path $evidencePath
-if (-not $Force -and $previous -and "$($previous.commit)" -eq $commit -and "$($previous.result)" -eq 'green') {
-    Write-Host "   $commit was already green on $($previous.date); nothing to do."
+# The code the last night ran is the code tonight would run: nothing is built or tested again, and
+# latest.json keeps that night's result. The commit itself usually differs, because each night
+# commits its own timings, which Test-NightlyCodeUnchanged leaves out of the comparison.
+if (-not $Force -and $previous -and (Test-NightlyCodeUnchanged -Repository $Worktree -Since "$($previous.commit)" -Commit $commit)) {
+    $since = "$($previous.commit)".Substring(0, 12)
+    Write-Host "   no code changed since $since, which was $($previous.result) on $($previous.date); nothing to do. -Force runs it anyway."
     exit 0
 }
 

@@ -239,7 +239,7 @@ tagged and left half published for four days, with its GitHub release still a dr
 | `pgo/build-windows.ps1` | The Windows build: an instrumented build, a training run of `pgo/train.mjs` and `pgo/train.py` against it, and a build with the counts the training wrote. Needs `node` and `python` on the `PATH` and the `llvm-tools` component, which `rust-toolchain.toml` installs |
 | `nightly.ps1` | The nightly: every tier, the release build, the gates, the rolling `nightly` pre release, the timings committed, `latest.json`, and a ticket when red. `-WhatIf` prints the plan |
 | `register-nightly.ps1` | Registers `nightly.ps1` as the scheduled task `inillucent nightly` at 02:00. `-Unregister` removes it |
-| `nightly-evidence.ps1` | The functions `nightly.ps1` writes `latest.json` with and `ship.ps1` reads it with. `tests/ship-evidence.Tests.ps1` tests them |
+| `nightly-evidence.ps1` | The functions `nightly.ps1` writes `latest.json` with and `ship.ps1` reads it with, and `Test-NightlyCodeUnchanged`, which makes a night whose code is the same as the last night's build nothing. `tests/ship-evidence.Tests.ps1` and `tests/nightly-skip.Tests.ps1` test them |
 | `nightly-gates.ps1` | How `nightly.ps1` grades a gate. A gate that exits 1 is red only when it misses a bar not listed in `compat/perf/known-misses.txt`, or disagrees with SQLite, or puts a family under the floor. `tests/nightly-gates.Tests.ps1` tests it |
 | `github-token.ps1` | `Resolve-GitHubToken`, which gives `gh` the token `git push` already uses. `ship.ps1` and `nightly.ps1` both call it, because `gh` is not logged in on the release machine |
 | `setup-machine.ps1` | The machine settings: `-Linker` for the `rust-lld` linker, `-Sccache`, `-Defender`. `-Remove` undoes the first two |
