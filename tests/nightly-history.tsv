@@ -58,3 +58,11 @@ stamp	commit	machine	target	verdict	seconds	note
 2026-10-25T14:54:06Z	bc5bd43	machine-c9df3d5a	inillucent-compat::nightly::storm_nightly	pass	674.7	-
 2026-10-25T14:54:06Z	bc5bd43	machine-c9df3d5a	inillucent-compat::nightly::story_large_table_nightly	pass	220.2	-
 2026-10-25T14:54:06Z	bc5bd43	machine-c9df3d5a	inillucent::story_ledger_day_nightly	pass	23649.3	-
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent-compat::nightly::free_map_page_at_the_end	pass	19.8	-
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent-compat::nightly::matrix	pass	-	-
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent-compat::nightly::matrix_random	pass	-	seed=20261029 cases=4000
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent-compat::nightly::release_format_history	pass	1134.6	-
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent-compat::nightly::research_corpus	pass	820.9	-
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent-compat::nightly::storm_nightly	fail	-	-
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent-compat::nightly::story_large_table_nightly	pass	191.6	-
+2026-10-29T15:45:19Z	7333d3c	machine-c9df3d5a	inillucent::story_ledger_day_nightly	pass	27101.1	-
