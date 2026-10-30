@@ -725,13 +725,19 @@ impl crate::ImportedDatabase {
     /// text the connection already holds (`paged::misordered_table_rows`).
     /// Until then `sqlite_schema` and a dump show the old text.
     pub(crate) fn refresh_statistics(&mut self) -> DbResult<()> {
-        let misordered = match self.schema.trees.get(&SCHEMA_VIEW_ROOT) {
-            Some(tree) => inillucent_catalog::paged::misordered_table_rows(
-                self.storage.database.pool(),
-                tree,
-            )?,
-            None => Vec::new(),
-        };
+        // **The catalog is attached afresh from the file's meta record.** The
+        // tree this connection holds names the root it had when the schema
+        // was loaded, and `VACUUM` moves it: reading the held tree after a
+        // `VACUUM` read a page that was no longer a leaf, failed the
+        // checkpoint, and the file did not reopen. A failure to read is not a
+        // reason to fail a checkpoint either, since the rewrite only tidies
+        // text the loader already reorders, so it leaves the rows for the next
+        // checkpoint.
+        let pool = self.storage.database.pool();
+        let misordered =
+            inillucent_catalog::paged::attach_catalog(pool, self.storage.database.catalog_root())
+                .and_then(|tree| inillucent_catalog::paged::misordered_table_rows(pool, &tree))
+                .unwrap_or_default();
         let stale: Vec<(i64, SchemaEntry)> = self
             .schema
             .entries
