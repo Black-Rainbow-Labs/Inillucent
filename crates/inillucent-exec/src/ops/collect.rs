@@ -527,7 +527,7 @@ pub fn emit_rows(rows: &[Vec<OwnedDatum>], downstream: &mut dyn Sink) -> DbResul
 /// @param rows - the rest of each emitted row, all of the same width
 /// @param downstream - what to push them into
 pub fn emit_rows_after_prefix(
-    prefix: &[OwnedDatum],
+    prefix: &[Datum<'_>],
     rows: &[Vec<OwnedDatum>],
     downstream: &mut dyn Sink,
 ) -> DbResult<Flow> {
@@ -551,7 +551,7 @@ pub fn emit_rows_after_prefix(
         }
         let mut columns: Vec<Vector<'_>> = prefix
             .iter()
-            .map(|value| Vector::Const(value.borrow()))
+            .map(|value| Vector::Const(*value))
             .collect();
         columns.extend(
             columns_owned

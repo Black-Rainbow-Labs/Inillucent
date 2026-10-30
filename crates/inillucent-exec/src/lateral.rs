@@ -30,11 +30,11 @@ use inillucent_base::{error::misuse, DbResult};
 use inillucent_sql::bind::ColumnUse;
 use inillucent_sql::catalog_view::TableInfo;
 use inillucent_sql::plan::AccessPath;
-use inillucent_tree::datum::OwnedDatum;
+use inillucent_tree::datum::{Datum, OwnedDatum};
 
 use crate::batch::Batch;
 use crate::expr::Eval;
-use crate::ops::{emit_rows, emit_rows_after_prefix, Flow, Sink};
+use crate::ops::{emit_rows_after_prefix, Flow, Sink};
 use crate::physical::{Params, TreeCatalog};
 
 /// What a lateral join evaluates against each outer row.
@@ -147,14 +147,17 @@ impl LateralModule<'_> {
     /// one row first: a joined row copies the outer row, and an outer row holding a large
     /// document would be copied once per row the module answered.
     ///
-    /// @param outer - the outer row
+    /// @param outer - the outer row, borrowed from the batch being joined
     /// @param row - the module's row, padded to the module's width
-    fn on_holds(&self, outer: &[OwnedDatum], row: &[OwnedDatum]) -> DbResult<bool> {
+    fn on_holds(&self, outer: &[Datum<'_>], row: &[OwnedDatum]) -> DbResult<bool> {
         let Some(condition) = &self.on else {
             return Ok(true);
         };
-        let borrowed: Vec<inillucent_tree::datum::Datum<'_>> =
-            outer.iter().chain(row).map(OwnedDatum::borrow).collect();
+        let borrowed: Vec<Datum<'_>> = outer
+            .iter()
+            .copied()
+            .chain(row.iter().map(OwnedDatum::borrow))
+            .collect();
         let columns: Vec<crate::batch::Vector<'_>> = borrowed
             .iter()
             .map(|value| crate::batch::Vector::Const(*value))
@@ -189,11 +192,13 @@ impl Sink for LateralModule<'_> {
             if rows.is_empty() && !self.left {
                 continue;
             }
-            // The outer row is copied once and reused for every row the module
-            // answered, which is where the expansion is paid for.
-            let mut outer = Vec::with_capacity(outer_width);
+            // **The outer row is borrowed from the batch, never copied.** It was copied once
+            // per outer row, and when the outer side is itself a lateral join over a large
+            // document (`FROM s, json_each(s.j) e, json_each(e.value) t`) every outer row held
+            // the whole document, so the copies made the join quadratic in the document's size.
+            let mut outer: Vec<Datum<'_>> = Vec::with_capacity(outer_width);
             for column in 0..outer_width {
-                outer.push(OwnedDatum::from_datum(&batch.value(nth, column)?));
+                outer.push(batch.value(nth, column)?);
             }
             let mut produced: Vec<Vec<OwnedDatum>> = Vec::with_capacity(rows.len());
             for mut row in rows {
@@ -203,9 +208,10 @@ impl Sink for LateralModule<'_> {
                 }
             }
             if produced.is_empty() && self.left {
-                let mut padded = outer;
-                padded.resize(outer_width.saturating_add(self.width), OwnedDatum::Null);
-                if emit_rows(&[padded], self.downstream.as_mut())? == Flow::Stop {
+                let padding = vec![OwnedDatum::Null; self.width];
+                if emit_rows_after_prefix(&outer, &[padding], self.downstream.as_mut())?
+                    == Flow::Stop
+                {
                     return Ok(Flow::Stop);
                 }
                 continue;

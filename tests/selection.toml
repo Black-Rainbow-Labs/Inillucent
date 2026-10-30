@@ -3469,6 +3469,13 @@ kind = "test"
 name = "budget"
 tier = "perf"
 
+# Bytes allocated by the JSON functions and by `json_each` and `json_tree` over large documents.
+[[target]]
+package = "inillucent"
+kind = "test"
+name = "json_budget"
+tier = "perf"
+
 # The processor share every run and release script holds itself to (task-2205).
 # It measures how much processor time a child was given, so it needs the machine
 # otherwise idle, which the exclusive tier gives it. Its uncapped control fails
