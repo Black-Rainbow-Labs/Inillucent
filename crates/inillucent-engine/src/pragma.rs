@@ -174,13 +174,15 @@ impl ImportedDatabase {
                 "schema_version",
                 i64::from(self.file_of(at)?.schema_cookie()),
             )),
-            // **A connection-visible counter, not a file one.** SQLite's
-            // `data_version` changes when *another* connection has committed;
-            // one connection watching its own writes always sees the same
-            // number, and this engine holds the file exclusively, so that
-            // number is 1 and stays 1. It is reported rather than refused
-            // because the answer is correct, not because the subject is absent.
-            b"data_version" => Ok(named_integer("data_version", 1)),
+            // **A connection counter, not a file one.** SQLite's `data_version`
+            // changes when *another* connection has committed, and never for this
+            // connection's own commits. `enter_within` adds one each time it finds
+            // the file moved by someone else, which is the same moment SQLite adds
+            // one. Several commits that happen between two looks count once.
+            b"data_version" => Ok(named_integer(
+                "data_version",
+                i64::try_from(self.pragmas.data_version()).unwrap_or(i64::MAX),
+            )),
             b"max_page_count" => self.pragma_max_page_count(argument, at),
             // **Remembered, and exceeded.** `analysis_limit` caps how many rows
             // `ANALYZE` samples per index; this engine's `ANALYZE` walks the
@@ -283,7 +285,7 @@ impl ImportedDatabase {
     /// binder uses everywhere else a name may carry a schema.
     ///
     /// @param at - the attached database the pragma named
-    fn file_of(&self, at: Option<usize>) -> DbResult<&inillucent_pool::Database> {
+    pub(crate) fn file_of(&self, at: Option<usize>) -> DbResult<&inillucent_pool::Database> {
         self.schema_file(at.unwrap_or(MAIN))
             .ok_or_else(|| refusal("that pragma names a database that is not attached"))
     }

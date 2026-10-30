@@ -875,7 +875,10 @@ impl crate::ImportedDatabase {
                         .unwrap_or(-((bytes / 1024) as i64)),
                 ))
             }
-            b"data_version" => Some(named_integer("data_version", 1)),
+            b"data_version" => Some(named_integer(
+                "data_version",
+                i64::try_from(self.pragmas.data_version()).unwrap_or(i64::MAX),
+            )),
             b"defer_foreign_keys" => flag("defer_foreign_keys", self.pragmas.defer_foreign_keys()),
             b"encoding" => Some(word_row("encoding", "UTF-8")),
             b"foreign_keys" => flag("foreign_keys", self.pragmas.foreign_keys()),

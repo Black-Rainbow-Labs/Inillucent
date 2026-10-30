@@ -270,21 +270,38 @@ impl ImportedDatabase {
             self.writing.undo().borrow_mut().clear();
         }
         if changes_schema {
-            // Inside a transaction the old value is kept, so a ROLLBACK (or a
-            // ROLLBACK TO before this statement) puts it back.
-            if !autocommit {
-                self.writing
-                    .meta_changes()
-                    .borrow_mut()
-                    .push(crate::engine::state::MetaChange {
-                        at: None,
-                        field: crate::engine::state::MetaField::SchemaCookie,
-                        before: self.storage.database.schema_cookie(),
-                    });
-            }
-            self.storage.database.bump_schema_cookie();
+            self.bump_schema_cookie_of(at, autocommit);
         }
         Ok(outcome)
+    }
+
+    /// Moves the schema cookie of the database a schema change was made in.
+    ///
+    /// **Each database has its own cookie**, as in SQLite: a table created in an attached
+    /// database or in `temp` moves that database's `PRAGMA schema_version` and leaves `main`'s
+    /// alone. Inside a transaction the old value is kept, so a `ROLLBACK` (or a `ROLLBACK TO`
+    /// before this statement) puts it back.
+    ///
+    /// @param at - the database the statement changed
+    /// @param autocommit - whether no transaction is open
+    fn bump_schema_cookie_of(&mut self, at: usize, autocommit: bool) {
+        let before = match self.file_of(Some(at)) {
+            Ok(file) => file.schema_cookie(),
+            Err(_) => return,
+        };
+        if !autocommit {
+            self.writing
+                .meta_changes()
+                .borrow_mut()
+                .push(crate::engine::state::MetaChange {
+                    at: (at != super::MAIN).then_some(at),
+                    field: crate::engine::state::MetaField::SchemaCookie,
+                    before,
+                });
+        }
+        if let Ok(file) = self.file_of_mut(Some(at)) {
+            file.bump_schema_cookie();
+        }
     }
 
     /// Runs a `BEGIN`.

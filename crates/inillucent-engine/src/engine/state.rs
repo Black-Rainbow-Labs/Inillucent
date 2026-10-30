@@ -160,6 +160,10 @@ pub(crate) struct Pragmas {
     /// than an engine that refused the pragma outright.
     query_only: std::cell::Cell<bool>,
 
+    /// What `PRAGMA data_version` reports: one more every time this connection
+    /// finds that another connection has committed to the file.
+    data_version: std::cell::Cell<u64>,
+
     /// Whether a trigger's own writes fire triggers, set by
     /// `PRAGMA recursive_triggers`.
     recursive_triggers: std::cell::Cell<bool>,
@@ -374,6 +378,23 @@ impl Pragmas {
         self.query_only.set(value);
     }
 
+    /// Returns what `PRAGMA data_version` reports.
+    pub(crate) fn data_version(&self) -> u64 {
+        self.data_version.get()
+    }
+
+    /// Sets what `PRAGMA data_version` reports.
+    ///
+    /// @param value - the number to report
+    pub(crate) fn set_data_version(&self, value: u64) {
+        self.data_version.set(value);
+    }
+
+    /// Moves `PRAGMA data_version` on by one, because another connection committed.
+    pub(crate) fn note_another_commit(&self) {
+        self.data_version.set(self.data_version.get().saturating_add(1));
+    }
+
     /// Returns recursive triggers.
     pub(crate) fn recursive_triggers(&self) -> bool {
         self.recursive_triggers.get()
@@ -523,6 +544,7 @@ impl Pragmas {
             writable_schema: std::cell::Cell::new(false),
             defensive: std::cell::Cell::new(false),
             query_only: std::cell::Cell::new(false),
+            data_version: std::cell::Cell::new(1),
             recursive_triggers: std::cell::Cell::new(false),
             legacy_alter_table: std::cell::Cell::new(false),
             temp_store: std::cell::Cell::new(0),

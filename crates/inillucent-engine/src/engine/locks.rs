@@ -104,6 +104,9 @@ impl ImportedDatabase {
         // has nothing to re-derive, which is what keeps the check off the path
         // `locking_mode = exclusive` takes (task-1979, section 4.4 item 1).
         let taking = !self.storage.database.trusted();
+        // What this connection's schema cookie was before anything is adopted from the file.
+        // See `keep_the_schema_cookie_moving`.
+        let cookie_before = self.storage.database.schema_cookie();
         // **A write holds RESERVED, so readers in other processes keep reading
         // through it**, for `main` under `locking_mode = normal` with no file
         // attached. See `Database::set_reserved_writes`. A transaction across
@@ -133,10 +136,12 @@ impl ImportedDatabase {
         // nothing, so it has nothing the replaced file could contradict.
         let untouched = inside && held_before == inillucent_vfs::FileLock::None;
         if self.replaced_since_open(taking, writing, held_before) {
+            self.pragmas.note_another_commit();
             return self.reopen_the_replaced_file(writing, inside, untouched);
         }
         let reloaded = self.take_the_lock(writing, may_release)?;
         if self.replaced_since_open(taking, writing, held_before) {
+            self.pragmas.note_another_commit();
             return self.reopen_the_replaced_file(writing, inside, untouched);
         }
         if writing && inside && held_before == inillucent_vfs::FileLock::Shared && reserved {
@@ -187,11 +192,16 @@ impl ImportedDatabase {
         // Asked now that the lock is held: an unchanged token means no other process
         // folded, so the meta record is as last read (task-2226).
         let meta_quiet = self.quiet_since_checked();
-        let moved = reloaded
-            || poisoned
+        // Whether another connection committed, which `PRAGMA data_version` counts. A poisoned
+        // log is rebuilt for this connection's own failure and is not another commit.
+        let committed_elsewhere = reloaded
             || (taking
                 && settles
                 && ((!meta_quiet && self.the_meta_moved()?) || self.the_log_moved()?));
+        let moved = committed_elsewhere || poisoned;
+        if committed_elsewhere && settles {
+            self.pragmas.note_another_commit();
+        }
         if moved && settles {
             self.settle_a_journal_left_by_the_dead(writing)?;
             self.resync_from_file()?;
@@ -220,7 +230,10 @@ impl ImportedDatabase {
         // process just built - which is a lost table rather than a stale read.
         // `reload_catalog` is the same reread `ATTACH` does.
         if (moved && !inside) || (main_moved && settles) {
-            self.reload_after_another_commit()?;
+            let changed = self.reload_after_another_commit()?;
+            if main_moved && settles {
+                self.keep_the_schema_cookie_moving(cookie_before, changed);
+            }
         }
         if !inside {
             self.writing.set_entry_mark(self.statement_entry());
@@ -263,16 +276,47 @@ impl ImportedDatabase {
     /// module's own state is derived from its shadow tables, which are ordinary
     /// trees another connection can have written; this is the one moment the
     /// engine knows that happened.
-    fn reload_after_another_commit(&mut self) -> DbResult<()> {
+    ///
+    /// Returns whether the catalog this found differs from the one this connection held.
+    fn reload_after_another_commit(&mut self) -> DbResult<bool> {
         let before = self.catalog_rows();
         let generation = self.schema_generation();
         self.reload_catalog()?;
         self.reattach_every_tree()?;
-        if self.catalog_rows() == before {
+        let changed = self.catalog_rows() != before;
+        if !changed {
             self.schema.catalog_generation = generation;
         }
         self.committed_elsewhere_modules();
-        Ok(())
+        Ok(changed)
+    }
+
+    /// Makes `PRAGMA schema_version` change when another connection changed the schema, even
+    /// when the cookie it wrote has not reached the file yet.
+    ///
+    /// **The cookie is written to the file by the writer's next fold, which is lazy**, and a
+    /// meta record is not in the log, so a connection that replays another's commit can find
+    /// the new tables and the old cookie. SQLite's cookie moves with the commit. The cookie
+    /// this connection held before it adopted the file's is compared with the one it adopted:
+    /// a higher one is the writer's real value and is kept, and when the catalog changed and
+    /// the cookie did not rise, the cookie moves on by one, which is what the schema changes
+    /// it could not see add up to at least. A cookie the file has not caught up with is never
+    /// taken backwards. The count is exact when the writer's fold arrived before this
+    /// connection looked, and a lower bound when several changes were made unfolded.
+    ///
+    /// @param before - the cookie this connection held before it adopted the file's record
+    /// @param changed - whether the catalog it reloaded differs from the one it held
+    fn keep_the_schema_cookie_moving(&mut self, before: i32, changed: bool) {
+        let adopted = self.storage.database.schema_cookie();
+        let rose = adopted.wrapping_sub(before) > 0;
+        let target = match (changed, rose) {
+            (_, true) => adopted,
+            (true, false) => before.wrapping_add(1),
+            (false, false) => before,
+        };
+        if target != adopted {
+            self.storage.database.set_schema_cookie(target);
+        }
     }
 
     /// Reports whether a statement about to take, or just having taken, the lock finds its file

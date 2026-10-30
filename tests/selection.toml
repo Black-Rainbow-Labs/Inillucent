@@ -1145,6 +1145,14 @@ covers = ["inillucent-engine", "inillucent-pool", "inillucent-wal"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "pragma_versions_across_connections"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-pool", "inillucent-wal"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "hostile"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-ext"]
