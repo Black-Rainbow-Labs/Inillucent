@@ -448,6 +448,24 @@ impl crate::ImportedDatabase {
                 .find(|index| index.folded == wanted)
                 .map(|index| (table, index))
         });
+        // A WITHOUT ROWID table is its own primary key index, which SQLite names after the table,
+        // so `index_info(t)` describes the key of `t`.
+        let found = found.or_else(|| {
+            self.schema
+                .tables
+                .iter()
+                .filter(|table| table.without_rowid && table.folded == wanted)
+                .filter(|table| at.is_none_or(|named| table.database == named))
+                .find_map(|table| {
+                    table
+                        .indexes
+                        .iter()
+                        .find(|index| {
+                            index.origin == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey
+                        })
+                        .map(|index| (table, index))
+                })
+        });
         let Some((table, index)) = found else {
             return Ok(empty);
         };
@@ -478,11 +496,21 @@ impl crate::ImportedDatabase {
                 let Some(column) = table.column(position) else {
                     continue;
                 };
+                // A primary key column appended to an index made by `CREATE INDEX` keeps the
+                // direction the key declared, which SQLite reports in `desc`. An index made by a
+                // `UNIQUE` constraint is built before the key exists and reports 0.
+                let descending = index.origin == inillucent_sql::catalog_view::IndexOrigin::Created
+                    && table
+                    .indexes
+                    .iter()
+                    .filter(|held| held.origin == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey)
+                    .flat_map(|held| held.columns.iter())
+                    .any(|key| key.column == Some(position) && key.declared_descending);
                 rows.push(vec![
                     OwnedDatum::Int(rows.len() as i64),
                     OwnedDatum::Int(i64::from(position)),
                     OwnedDatum::Text(column.name.clone()),
-                    OwnedDatum::Int(0),
+                    OwnedDatum::Int(i64::from(descending)),
                     OwnedDatum::Text(collation_name(&column.collation)),
                     OwnedDatum::Int(0),
                 ]);

@@ -370,3 +370,25 @@ pragma secure_delete=3;
 pragma secure_delete;
 pragma secure_delete=off;
 pragma secure_delete;
+-- case: bug-hunt-11/pragma/D13-without-rowid-desc-and-unique-keys
+create table t(a integer primary key desc,b,c unique) without rowid;
+create index si on t(b);
+create table u(x, y, z, primary key(y desc, x), unique(z)) without rowid;
+select name from sqlite_master where type='index' order by 1;
+pragma index_list(t);
+pragma index_info(sqlite_autoindex_t_1);
+pragma index_info(sqlite_autoindex_t_2);
+pragma index_xinfo(sqlite_autoindex_t_1);
+pragma index_xinfo(sqlite_autoindex_t_2);
+pragma index_xinfo(si);
+pragma index_list(u);
+pragma index_xinfo(sqlite_autoindex_u_2);
+pragma index_xinfo(sqlite_autoindex_u_1);
+-- case: bug-hunt-11/pragma/D13-without-rowid-integer-key-is-numbered-last
+create table t(a integer primary key,b,c unique) without rowid;
+select name from sqlite_master where type='index' order by 1;
+pragma index_list(t);
+pragma index_info(sqlite_autoindex_t_1);
+pragma index_info(sqlite_autoindex_t_2);
+pragma index_xinfo(sqlite_autoindex_t_1);
+pragma index_xinfo(sqlite_autoindex_t_2);

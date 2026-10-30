@@ -1052,11 +1052,15 @@ fn automatic_indexes(
     let mut rowid_key_conflict = None;
     for (position, column) in columns.iter().enumerate() {
         for (_, constraint) in &column.constraints {
+            let mut declared_descending = false;
             let (unique, origin, conflict) = match constraint {
-                ColumnConstraint::PrimaryKey { on_conflict, .. } => {
+                ColumnConstraint::PrimaryKey {
+                    on_conflict, order, ..
+                } => {
                     if info.rowid_alias == Some(position as u16) {
                         continue;
                     }
+                    declared_descending = *order == inillucent_sql::ast::SortOrder::Descending;
                     (true, IndexOrigin::PrimaryKey, *on_conflict)
                 }
                 ColumnConstraint::Unique(action) => (true, IndexOrigin::Unique, *action),
@@ -1076,8 +1080,11 @@ fn automatic_indexes(
                     column: Some(position as u16),
                     expr_sql: virtual_key_sql(info, Some(position as u16)),
                     collation,
-                    descending: false,
-                    declared_descending: false,
+                    // As for a table level key: the tree of a `WITHOUT ROWID` table's own key
+                    // ascends whatever `DESC` says, and `declared_descending` reports it.
+                    descending: declared_descending
+                        && !(info.without_rowid && origin == IndexOrigin::PrimaryKey),
+                    declared_descending,
                 }],
                 partial_sql: None,
                 origin,
@@ -1159,7 +1166,45 @@ fn automatic_indexes(
             metric: None,
         });
     }
+    if info.without_rowid {
+        integer_key_last(info, &mut indexes);
+    }
     (indexes, rowid_key_conflict)
+}
+
+/// Moves the primary key of a `WITHOUT ROWID` table behind its other automatic indexes when it is
+/// one ascending `INTEGER` column.
+///
+/// **SQLite makes that key late.** A single `INTEGER` column that is the primary key and is not
+/// `DESC` is first recorded as the table's rowid alias, and `WITHOUT ROWID` turns it into an index
+/// when the table is finished, after the `UNIQUE` constraints already made theirs. So in
+/// `CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE) WITHOUT ROWID` the `UNIQUE` index is
+/// `sqlite_autoindex_t_1` and the key is `sqlite_autoindex_t_2`. Any other key is made where it is
+/// written.
+///
+/// @param info - the table
+/// @param indexes - the automatic indexes in declaration order
+fn integer_key_last(info: &TableInfo, indexes: &mut Vec<IndexInfo>) {
+    let Some(at) = indexes
+        .iter()
+        .position(|index| index.origin == IndexOrigin::PrimaryKey)
+    else {
+        return;
+    };
+    let single_integer = indexes.get(at).is_some_and(|index| {
+        index.columns.len() == 1
+            && index.columns.first().is_some_and(|key| {
+                !key.declared_descending
+                    && key
+                        .column
+                        .and_then(|position| info.column(position))
+                        .is_some_and(|column| column.declared_type.eq_ignore_ascii_case(b"integer"))
+            })
+    });
+    if single_integer {
+        let key = indexes.remove(at);
+        indexes.push(key);
+    }
 }
 
 /// Folds the automatic indexes of a table that repeat an earlier one's key.
