@@ -898,6 +898,12 @@ impl<'a> Parser<'a> {
         use crate::ast::PragmaValue;
         self.expect_keyword(Keyword::PRAGMA)?;
         let (database, name) = self.parse_qualified_name()?;
+        // `PRAGMA main.;` reads the dot as the start of a qualified name, so the error is at the
+        // token after it, as in SQLite.
+        if database.is_none() && self.at(Punctuator::Dot)? {
+            self.bump()?;
+            self.parse_name()?;
+        }
         let value = if self.eat(Punctuator::Equal)? {
             PragmaValue::Value(self.parse_pragma_value()?)
         } else if self.eat(Punctuator::LeftParen)? {
@@ -927,6 +933,28 @@ impl<'a> Parser<'a> {
     fn parse_pragma_value(&mut self) -> Result<crate::ast::ExprId, ParseError> {
         use crate::ast::{Expr, Literal};
         let token = self.peek()?;
+        // SQLite's value is a signed number, a string or a name: `NULL` is none of them, and a
+        // parenthesis opens no value, so `PRAGMA x = NULL` and `PRAGMA x = (1)` are syntax errors.
+        let is_null = matches!(
+            token.kind,
+            TokenKind::Identifier {
+                keyword: Some(Keyword::NULL),
+                quote: QuoteForm::Bare,
+            }
+        );
+        if is_null || token.is(Punctuator::LeftParen) {
+            return Err(self.unexpected(&[])?);
+        }
+        // A number is kept as the text it was written as, which is what SQLite reads it from:
+        // `1e3` is the integer 1.
+        if token.kind == TokenKind::Float {
+            self.bump()?;
+            let text = token.text(self.source).to_vec();
+            return Ok(self.ast.add_expr(
+                Expr::Literal(Literal::String(text)),
+                token.span,
+            ));
+        }
         if Parser::token_is_word(token) && !self.peek_at(1)?.is(Punctuator::LeftParen) {
             self.bump()?;
             let text = lexer::identifier_text(self.source, token).into_owned();

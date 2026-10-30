@@ -276,6 +276,9 @@ pub(crate) fn wrong_arguments(name: &[u8], span: Span) -> ParseError {
 /// @param most - how many arguments it takes
 /// @param span - where the call is
 pub(crate) fn too_many_arguments(name: &[u8], most: usize, span: Span) -> ParseError {
+    // SQLite points at nothing for this failure.
+    let _ = span;
+    let span = Span::default();
     ParseError::new(
         ParseErrorKind::Refused(format!(
             "too many arguments on {}() - max {most}",

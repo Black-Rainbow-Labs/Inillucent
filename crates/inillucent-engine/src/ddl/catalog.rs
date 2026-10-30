@@ -455,6 +455,9 @@ impl crate::ImportedDatabase {
         if names.is_empty() {
             return None;
         }
+        // `table_list` has a result column named `schema` and no hidden one, so the function
+        // takes one argument, the table, and a second is refused.
+        let schema = schema && pragma != "table_list";
         let mut columns: Vec<inillucent_sql::catalog_view::ColumnInfo> = names
             .iter()
             .map(|held| pragma_column(held.as_bytes(), false))

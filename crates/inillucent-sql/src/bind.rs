@@ -2096,6 +2096,21 @@ impl<'a> Binder<'a> {
             // in the file works - and naming this one is what fails.
             return Err(unconnected_module(&written, span));
         }
+        // **A `pragma_*` function is not innocuous**, so a view or trigger stored in the schema may
+        // not read one while the connection does not trust the schema.
+        if self.call_site == function::CallSite::Schema
+            && !self.trusted_schema
+            && table.kind == TableKind::Virtual
+            && table.folded.starts_with(b"pragma_")
+        {
+            return Err(refused(
+                format!(
+                    "unsafe use of virtual table \"{}\"",
+                    String::from_utf8_lossy(&written)
+                ),
+                span,
+            ));
+        }
         if table.kind == TableKind::View {
             return self.bind_view_term(table, alias, join, span);
         }

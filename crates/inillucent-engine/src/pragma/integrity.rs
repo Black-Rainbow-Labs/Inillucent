@@ -186,7 +186,15 @@ impl crate::ImportedDatabase {
             Some(database) => Some(database).filter(|held| holds(*held)),
             None => self.schema_numbers().into_iter().find(|held| holds(*held)),
         };
-        found.ok_or_else(|| inillucent_base::error::refusal(format!("no such table: {name}")))
+        // A qualified pragma names the database in the message, as `temp.t`.
+        found.ok_or_else(|| {
+            let schema = at.map(|database| self.schema_label(database));
+            let shown = match schema {
+                Some(label) => format!("{}.{name}", String::from_utf8_lossy(&label)),
+                None => name.to_string(),
+            };
+            inillucent_base::error::refusal(format!("no such table: {shown}"))
+        })
     }
 
     /// Returns the rows `PRAGMA foreign_key_check` reports for one table.

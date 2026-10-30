@@ -521,8 +521,11 @@ impl crate::ImportedDatabase {
         argument: Option<&PragmaArgument>,
     ) -> DbResult<Outcome> {
         if let Some(argument) = argument {
-            self.pragmas
-                .set_analysis_limit(argument_integer(argument).max(0));
+            // A negative number is ignored, as it is in SQLite.
+            let asked = argument_integer(argument);
+            if asked >= 0 {
+                self.pragmas.set_analysis_limit(asked);
+            }
         }
         Ok(named_integer(
             "analysis_limit",

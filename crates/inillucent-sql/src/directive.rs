@@ -3072,11 +3072,16 @@ impl<'a> Binder<'a> {
         };
         let folded = self.ast.folded(id);
         self.catalog.database_index(folded).ok_or_else(|| {
+            // The name as it was written, quotes and all, which is how SQLite prints the token.
+            let text = String::from_utf8_lossy(self.ast.text(id)).into_owned();
+            let shown = match self.ast.name(id).map(|name| name.quote) {
+                Some(crate::lexer::QuoteForm::Double) => format!("\"{text}\""),
+                Some(crate::lexer::QuoteForm::Bracket) => format!("[{text}]"),
+                Some(crate::lexer::QuoteForm::Backtick) => format!("`{text}`"),
+                _ => text,
+            };
             refused(
-                format!(
-                    "unknown database {}",
-                    String::from_utf8_lossy(self.ast.text(id))
-                ),
+                format!("unknown database {shown}"),
                 // SQLite points at the schema name.
                 self.ast.name(id).map_or(Span::default(), |name| name.span),
             )
