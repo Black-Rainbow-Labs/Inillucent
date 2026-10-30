@@ -337,6 +337,7 @@ pub(super) fn constant_in_list(
             block,
             ..
         } if block.correlations.is_empty() => (operand, vec![term.clone()]),
+        BoundExpr::Or(..) => return hidden_equalities_as_list(id, table, term),
         _ => return None,
     };
     let constant = |value: &BoundExpr| {
@@ -358,6 +359,63 @@ pub(super) fn constant_in_list(
         }
         _ => None,
     }
+}
+
+/// Reads `arg = 'a' OR arg = 'b'` over one hidden column as the list `('a', 'b')`.
+///
+/// **Only a hidden column, which is an argument of a table valued function.** SQLite runs such a
+/// function once for each arm of the `OR` (its multi index `OR`), so `pragma_table_info WHERE
+/// arg = 't' OR arg = 'x'` answers with the columns of both tables. Left as a residual, the
+/// function ran once with no argument and the `OR` then rejected every row. Every arm must
+/// compare that one column with a value that reads no column, so anything else is left alone.
+///
+/// @param id - the FROM term
+/// @param table - the FROM term's table
+/// @param term - one conjunct of the WHERE clause, an `OR`
+fn hidden_equalities_as_list(
+    id: usize,
+    table: &TableInfo,
+    term: &BoundExpr,
+) -> Option<(i32, Vec<BoundExpr>, bool)> {
+    let mut arms: Vec<&BoundExpr> = Vec::new();
+    let mut pending = vec![term];
+    while let Some(next) = pending.pop() {
+        match next {
+            BoundExpr::Or(left, right) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            other => arms.push(other),
+        }
+    }
+    let mut column: Option<u16> = None;
+    let mut values: Vec<BoundExpr> = Vec::new();
+    for arm in arms {
+        let BoundExpr::Compare {
+            op: BinaryOp::Equal,
+            left,
+            right,
+            ..
+        } = arm
+        else {
+            return None;
+        };
+        let (found, value) = match (left.as_ref(), right.as_ref()) {
+            (BoundExpr::Column { source, column, .. }, other) if *source == id => (*column, other),
+            (other, BoundExpr::Column { source, column, .. }) if *source == id => (*column, other),
+            _ => return None,
+        };
+        let mut used = Vec::new();
+        value.sources_used(&mut used);
+        if !used.is_empty() || column.is_some_and(|held| held != found) {
+            return None;
+        }
+        column = Some(found);
+        values.push(value.clone());
+    }
+    let column = column?;
+    table.column(column).filter(|info| info.hidden)?;
+    Some((i32::from(column), values, true))
 }
 
 /// Reports whether a module column compares a value exactly as it was written.

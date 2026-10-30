@@ -572,14 +572,26 @@ impl ImportedDatabase {
         // **An `IN` list is the statement's own filter to test here**, not an
         // argument: these tables read their argument from an `=` on a hidden
         // column, and an `IN` offered as `=` would be read as its first value.
+        //
+        // **Except a list on a `pragma_*` function's hidden column**, which is the argument
+        // itself: `pragma_table_info WHERE arg IN ('a', 'b')` is two calls of the pragma, and
+        // `pragma_function_rows` makes them. Tested against rows that carry no argument it
+        // matched nothing.
+        let list_is_an_argument = |held: &inillucent_sql::plan::VirtualConstraint| {
+            table.folded.starts_with(b"pragma_")
+                && usize::try_from(held.spec.column)
+                    .ok()
+                    .and_then(|column| table.columns.get(column))
+                    .is_some_and(|column| column.hidden)
+        };
         let lists: Vec<&inillucent_sql::plan::VirtualConstraint> = offer
             .iter()
-            .filter(|held| !held.in_list.is_empty())
+            .filter(|held| !held.in_list.is_empty() && !list_is_an_argument(held))
             .collect();
         let offer: Vec<inillucent_sql::plan::VirtualConstraint> = offer
             .iter()
             .enumerate()
-            .filter(|(_, held)| held.in_list.is_empty())
+            .filter(|(_, held)| held.in_list.is_empty() || list_is_an_argument(held))
             // A constraint the loop order has put out of this term's reach
             // compares one of its columns to a column of a later term. It is
             // the statement's own filter to test, and folding its value here
@@ -1912,6 +1924,16 @@ impl ImportedDatabase {
         Ok(Vec::new())
     }
 
+    /// Answers a scan of a `pragma_<name>` function: the pragma's rows, with its hidden
+    /// columns filled in.
+    ///
+    /// **A list of arguments runs the pragma once for each value.** `WHERE arg IN ('a', 'b')`,
+    /// and the planner's reading of `arg = 'a' OR arg = 'b'` as the same list, ask for the rows of
+    /// each table in turn. This ran the pragma once with the first value and left the others out.
+    ///
+    /// @param table - the function's table
+    /// @param offer - the constraints the planner offered
+    /// @param params - the values bound to `?1`, `?2`, ...
     /// @param downstream - where the batches go
     fn pragma_function_rows(
         &self,
@@ -1935,34 +1957,7 @@ impl ImportedDatabase {
             .filter(|(_, column)| column.hidden)
             .map(|(at, column)| (at, column.folded == b"arg"))
             .collect();
-        let mut argument = OwnedDatum::Null;
-        let mut schema = OwnedDatum::Null;
-        for constraint in offer {
-            if constraint.spec.op != inillucent_sql::vtab::ConstraintOp::Eq {
-                continue;
-            }
-            let Ok(column) = usize::try_from(constraint.spec.column) else {
-                continue;
-            };
-            let Some((_, is_argument)) = hidden.iter().find(|(at, _)| *at == column) else {
-                continue;
-            };
-            let value = inillucent_exec::physical::literal_value(&constraint.value, params)?;
-            if *is_argument {
-                argument = value;
-            } else {
-                schema = value;
-            }
-        }
-        // The pragma reader takes the argument as the parser's own shape, which
-        // is a name or an expression; a value bound at run time is neither, so
-        // it is spelled back as the text the reader reads.
-        let spelled = match &argument {
-            OwnedDatum::Null => None,
-            other => Some(inillucent_sql::directive::PragmaArgument::Name(
-                pragma_argument_text(other),
-            )),
-        };
+        let (arguments, schema) = pragma_values_offered(&hidden, offer, params)?;
         let at = match &schema {
             OwnedDatum::Null => None,
             named => {
@@ -1975,25 +1970,12 @@ impl ImportedDatabase {
                 })?)
             }
         };
-        let Some(answer) = self.pragma_function_answer(pragma, spelled.as_ref(), at)? else {
-            return Ok(false);
-        };
-        let width = answer.names.len();
-        let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(answer.rows.len());
-        for row in answer.rows {
-            let mut held = row;
-            held.truncate(width);
-            while held.len() < width {
-                held.push(OwnedDatum::Null);
+        let mut rows: Vec<Vec<OwnedDatum>> = Vec::new();
+        for argument in &arguments {
+            match self.pragma_rows_with_hidden(pragma, argument, &schema, at, &hidden)? {
+                Some(mut found) => rows.append(&mut found),
+                None => return Ok(false),
             }
-            for (_, is_argument) in &hidden {
-                held.push(if *is_argument {
-                    argument.clone()
-                } else {
-                    schema.clone()
-                });
-            }
-            rows.push(held);
         }
         // The hidden columns *are* the arguments and were applied above;
         // every other offered predicate was taken out of the residual on the
@@ -2004,6 +1986,53 @@ impl ImportedDatabase {
             .collect();
         self.emit_filtered(rows, offer, params, &applied, downstream)?;
         Ok(true)
+    }
+
+    /// Runs one pragma for one argument and returns its rows with the hidden columns appended.
+    ///
+    /// @param pragma - the pragma's folded name
+    /// @param argument - the value of its `arg` column, or NULL when it was given none
+    /// @param schema - the value of its `schema` column, or NULL when it was given none
+    /// @param at - the database `schema` names, when it names one
+    /// @param hidden - the table's hidden columns, each with whether it is `arg`
+    fn pragma_rows_with_hidden(
+        &self,
+        pragma: &[u8],
+        argument: &OwnedDatum,
+        schema: &OwnedDatum,
+        at: Option<usize>,
+        hidden: &[(usize, bool)],
+    ) -> DbResult<Option<Vec<Vec<OwnedDatum>>>> {
+        // The pragma reader takes the argument as the parser's own shape, which
+        // is a name or an expression; a value bound at run time is neither, so
+        // it is spelled back as the text the reader reads.
+        let spelled = match argument {
+            OwnedDatum::Null => None,
+            other => Some(inillucent_sql::directive::PragmaArgument::Name(
+                pragma_argument_text(other),
+            )),
+        };
+        let Some(answer) = self.pragma_function_answer(pragma, spelled.as_ref(), at)? else {
+            return Ok(None);
+        };
+        let width = answer.names.len();
+        let mut rows: Vec<Vec<OwnedDatum>> = Vec::with_capacity(answer.rows.len());
+        for row in answer.rows {
+            let mut held = row;
+            held.truncate(width);
+            while held.len() < width {
+                held.push(OwnedDatum::Null);
+            }
+            for (_, is_argument) in hidden {
+                held.push(if *is_argument {
+                    argument.clone()
+                } else {
+                    schema.clone()
+                });
+            }
+            rows.push(held);
+        }
+        Ok(Some(rows))
     }
 
     /// Emits rows this connection produced itself, testing the predicates the
@@ -2261,6 +2290,59 @@ fn satisfies(
 }
 
 impl ImportedDatabase {}
+
+/// Reads the values a scan of a `pragma_<name>` function was offered for its hidden columns.
+///
+/// The `arg` column answers with every value it was offered: one for `arg = 'a'`, and each member
+/// of a list for `arg IN ('a', 'b')`, NULL members left out because nothing equals NULL. A scan
+/// that was offered no `arg` runs the pragma once with none. A list written as a subquery has no
+/// values to read here and is run with the one the planner showed the module.
+///
+/// @param hidden - the table's hidden columns, each with whether it is `arg`
+/// @param offer - the constraints the planner offered
+/// @param params - the values bound to `?1`, `?2`, ...
+fn pragma_values_offered(
+    hidden: &[(usize, bool)],
+    offer: &[inillucent_sql::plan::VirtualConstraint],
+    params: &inillucent_exec::physical::Params,
+) -> DbResult<(Vec<OwnedDatum>, OwnedDatum)> {
+    let mut arguments = vec![OwnedDatum::Null];
+    let mut schema = OwnedDatum::Null;
+    for constraint in offer {
+        if constraint.spec.op != inillucent_sql::vtab::ConstraintOp::Eq {
+            continue;
+        }
+        let Ok(column) = usize::try_from(constraint.spec.column) else {
+            continue;
+        };
+        let Some((_, is_argument)) = hidden.iter().find(|(at, _)| *at == column) else {
+            continue;
+        };
+        let value = inillucent_exec::physical::literal_value(&constraint.value, params)?;
+        if !*is_argument {
+            schema = value;
+            continue;
+        }
+        let listed = !constraint.in_list.is_empty()
+            && !constraint
+                .in_list
+                .iter()
+                .any(|item| matches!(item, inillucent_sql::bind::BoundExpr::Subquery { .. }));
+        arguments = if listed {
+            let mut values: Vec<OwnedDatum> = Vec::new();
+            for item in &constraint.in_list {
+                let held = inillucent_exec::physical::literal_value(item, params)?;
+                if held != OwnedDatum::Null && !values.contains(&held) {
+                    values.push(held);
+                }
+            }
+            values
+        } else {
+            vec![value]
+        };
+    }
+    Ok((arguments, schema))
+}
 
 /// Renders a bound value as the text a pragma reader reads.
 ///

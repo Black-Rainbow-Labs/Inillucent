@@ -248,3 +248,15 @@ select sql from sqlite_master where name='n3';
 create table w(a any, b int);
 create table n4 as select * from w;
 select sql from sqlite_master where name='n4';
+-- case: bug-hunt-11/pragma/D10-pragma-function-arg-lists-and-or
+create table t(a,b,c);
+select count(*) from pragma_table_info where arg='t';
+select count(*) from pragma_table_info where arg in ('t');
+select count(*) from pragma_table_info where arg in ('t','x');
+select count(*) from pragma_table_info where arg='t' or arg='x';
+select count(*) from pragma_table_info('t');
+select count(*) from pragma_table_info where arg='x' or arg='t';
+select count(*) from pragma_table_info where arg='t' and name='a';
+select name from pragma_table_info where arg in ('t', 'x', 't');
+create table u(p,q);
+select arg, name from pragma_table_info where arg='u' or arg='t' order by arg, name;
