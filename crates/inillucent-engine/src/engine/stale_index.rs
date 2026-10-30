@@ -25,7 +25,7 @@ impl crate::ImportedDatabase {
     /// Finds the automatic indexes an older release wrote with no value for a collated key
     /// column and takes them out of the schema the planner reads.
     ///
-    /// Runs once at the end of an open, after the tables are derived.
+    /// Runs at the end of an open and at the end of an `ATTACH`, after the tables are derived.
     pub(crate) fn withdraw_indexes_written_without_their_collation(&mut self) -> DbResult<()> {
         let mut found: Vec<(usize, Vec<u8>, u32, u32)> = Vec::new();
         for table in &self.schema.tables {
@@ -77,10 +77,12 @@ impl crate::ImportedDatabase {
         self.refresh_catalog();
         self.schema.repairs.reindex_tolerates_duplicates = true;
         let mut outcome = Ok(());
-        for (_, folded) in &withdrawn {
+        for (database, folded) in &withdrawn {
             let name = String::from_utf8_lossy(folded).replace('"', "\"\"");
+            let schema = self.schema_name_of(*database);
+            let schema = String::from_utf8_lossy(&schema).replace('"', "\"\"");
             outcome = self
-                .execute_ddl(&format!("REINDEX \"main\".\"{name}\""))
+                .execute_ddl(&format!("REINDEX \"{schema}\".\"{name}\""))
                 .map(|_| ());
             if outcome.is_err() {
                 break;

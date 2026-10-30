@@ -685,6 +685,58 @@ fn a_read_only_connection_answers_correctly_from_a_2_0_2_collated_constraint() {
     );
 }
 
+/// The same file attached to another database answers correctly and enforces its constraints.
+///
+/// An application that attaches a 2.0.x file to its own database reads and writes it through the
+/// attached schema. The index is withdrawn from that schema's plans when the file is attached, and
+/// the first statement of a connection that may write rebuilds it with `REINDEX old.<index>`.
+#[test]
+fn an_attached_2_0_2_file_with_a_collated_constraint_answers_and_enforces_it() {
+    let area = scratch("collate-autoindex-attached");
+    let old = interop::stage("collate-autoindex", &area);
+    let main = area.join("main.rdb");
+    let arm = default_arm();
+    {
+        let handle = open(&arm, &main);
+        let connection = handle.session();
+        run(
+            &connection,
+            &format!(
+                "ATTACH '{}' AS old",
+                old.display().to_string().replace('\\', "/")
+            ),
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT count(*) FROM old.person WHERE first = 'Ann' AND last = 'Bravo'"
+            ),
+            "1",
+            "a row 2.0.2 wrote is not found in the attached file"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT name FROM old.tag WHERE name = 'alpha' COLLATE NOCASE"
+            ),
+            "alpha"
+        );
+        assert!(
+            connection
+                .execute_batch("INSERT INTO old.tag VALUES ('ALPHA', 'dup')")
+                .is_err(),
+            "PRIMARY KEY (name COLLATE NOCASE) of the attached file does not refuse 'ALPHA'"
+        );
+        assert!(
+            connection
+                .execute_batch("INSERT INTO old.person (first, last) VALUES ('Ann', 'BRAVO')")
+                .is_err(),
+            "UNIQUE (first, last COLLATE NOCASE) of the attached file does not refuse 'BRAVO'"
+        );
+        assert_eq!(ask(&connection, "PRAGMA old.integrity_check"), "ok");
+    }
+}
+
 /// A table that 2.0.2 declared `contentless_delete=1` reads, takes a `VACUUM` and is still
 /// refused a new declaration of the option.
 ///

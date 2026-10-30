@@ -376,7 +376,10 @@ impl ImportedDatabase {
         }
         self.rebuild_tables()?;
         self.refresh_catalog();
-        Ok(())
+        // **An attached file an older release wrote gets the same check as `main`**, so a 2.0.x
+        // file attached to an application's connection answers from its tables and is rebuilt
+        // by the next statement of a connection that may write; see `engine::stale_index`.
+        self.withdraw_indexes_written_without_their_collation()
     }
 
     /// Removes a database this connection attached.
@@ -484,6 +487,17 @@ impl ImportedDatabase {
             held.database.checkpoint()?;
         }
         drop(held);
+        // The indexes withdrawn from the file that went are forgotten, and the later files'
+        // numbers move down with their schemas.
+        self.schema
+            .repairs
+            .unusable_indexes
+            .retain(|(database, _)| *database != at);
+        for (database, _) in &mut self.schema.repairs.unusable_indexes {
+            if *database > at {
+                *database = database.saturating_sub(1);
+            }
+        }
         self.rebuild_tables()?;
         self.refresh_catalog();
         Ok(())
