@@ -215,6 +215,18 @@ fn row_larger_than_a_page() -> inillucent_base::error::DbError {
     )
 }
 
+/// How a leaf split packs its left half.
+///
+/// The two travel together because an append split asks for both: a fuller left half, and the
+/// arriving key the right page starts with when a wide table's right half takes no rows.
+#[derive(Clone, Copy)]
+struct Packing<'a, 'd> {
+    /// How full to pack the left half.
+    fill: f64,
+    /// The key of the row arriving past the leaf, when the split is an append.
+    arriving: Option<&'a [Datum<'d>]>,
+}
+
 /// What a leaf split did, for the record that describes it.
 ///
 /// Gathered in one place because the two record forms need different parts of
@@ -2515,9 +2527,11 @@ impl PagedTree {
                 // on the right is what the rows are actually going to need.
                 let fill = if appending { APPEND_FILL } else { SPLIT_FILL };
                 let toward = if appending { arriving } else { None };
-                self.split_carrying_toward(
-                    database, log, page, path, &borrowed, None, fill, toward,
-                )?;
+                let packing = Packing {
+                    fill,
+                    arriving: toward,
+                };
+                self.split_carrying_toward(database, log, page, path, &borrowed, None, packing)?;
                 Ok(true)
             }
             Fit::Repack(appending) => {
@@ -2765,7 +2779,11 @@ impl PagedTree {
         carried: Option<&[Vec<Option<ExtentRef>>]>,
         fill: f64,
     ) -> DbResult<Vec<ExtentRef>> {
-        self.split_carrying_toward(database, log, page, path, rows, carried, fill, None)
+        let packing = Packing {
+            fill,
+            arriving: None,
+        };
+        self.split_carrying_toward(database, log, page, path, rows, carried, packing)
     }
 
     /// Splits a leaf as [`PagedTree::split_carrying`] does, for an append whose arriving key is
@@ -2777,8 +2795,8 @@ impl PagedTree {
     /// @param path - the interior pages above it, root first
     /// @param rows - its live rows, sorted
     /// @param carried - the reference each already-out-of-line value is in, or `None`
-    /// @param fill - how full to pack the left half
-    /// @param arriving - the key of the row arriving past the leaf, when the split is an append
+    /// @param packing - how full to pack the left half, and the key of the row arriving past the
+    ///   leaf when the split is an append
     fn split_carrying_toward<'d, R: AsRef<[Datum<'d>]>>(
         &mut self,
         database: &mut Database,
@@ -2787,9 +2805,9 @@ impl PagedTree {
         path: &[PageId],
         rows: &[R],
         carried: Option<&[Vec<Option<ExtentRef>>]>,
-        fill: f64,
-        arriving: Option<&[Datum<'_>]>,
+        packing: Packing<'_, '_>,
     ) -> DbResult<Vec<ExtentRef>> {
+        let Packing { fill, arriving } = packing;
         if rows.len() < 2 {
             return Err(row_larger_than_a_page());
         }

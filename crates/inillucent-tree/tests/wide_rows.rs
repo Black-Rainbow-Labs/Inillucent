@@ -118,7 +118,7 @@ fn leaves_of_a_thousand(width: usize, modulus: i64) -> (u64, u64) {
             .expect("the insert");
     }
     for (index, row) in rows.iter().enumerate().step_by(97) {
-        let key = [row[0].clone()];
+        let key = [row[0]];
         let found = appended
             .point(database.pool(), &key)
             .expect("a lookup")

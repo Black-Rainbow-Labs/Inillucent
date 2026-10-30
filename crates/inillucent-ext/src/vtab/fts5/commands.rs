@@ -130,7 +130,7 @@ fn skip_literal(bytes: &[u8], at: usize) -> Option<usize> {
             while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
                 end = end.saturating_add(1);
             }
-            let even = end.saturating_sub(at) % 2 == 0;
+            let even = end.saturating_sub(at).is_multiple_of(2);
             (bytes.get(end) == Some(&b'\'') && even).then_some(end.saturating_add(1))
         }
         b'\'' => {

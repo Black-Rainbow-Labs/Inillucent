@@ -42,9 +42,10 @@ pub const MARGIN: usize = 128 * 1024;
 pub const REFUSAL: &str = "statement nests too deeply for the stack of the calling thread; run it on a thread with a larger stack or flatten the statement";
 
 thread_local! {
-    /// The lowest address of this thread's stack. `0` before the first question, and `1` when the
-    /// operating system would not say, which leaves every question answered with a very large room.
-    static LOW: Cell<usize> = const { Cell::new(0) };
+    /// The lowest and highest addresses of this thread's stack. `(0, 0)` before the first
+    /// question, and `(1, 1)` when the operating system would not say, which leaves every question
+    /// answered with a very large room.
+    static BOUNDS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 /// Returns an address close to the current top of the calling thread's stack.
@@ -59,21 +60,30 @@ fn stack_pointer() -> usize {
 
 /// Returns how many bytes of stack the calling thread has left.
 ///
-/// Answers `usize::MAX` when the operating system does not report the thread's bounds.
+/// Answers `usize::MAX` when the operating system does not report the thread's bounds, and when
+/// the address of a local is not inside them. **An address sanitizer can move a local whose
+/// address is taken to a fake stack on the heap** (`detect_stack_use_after_return`), so under
+/// `-Zsanitizer=address` the marker in [`stack_pointer`] can be anywhere. Subtracting the low
+/// bound from such an address answered no room, and the C library's sanitized conformance program
+/// had its first open refused with `too_big`. A guard that cannot see the stack then limits
+/// nothing, and the sanitized build gets that.
 pub fn room() -> usize {
-    let low = LOW.with(|cell| {
+    let (low, high) = BOUNDS.with(|cell| {
         let known = cell.get();
-        if known != 0 {
+        if known.0 != 0 {
             return known;
         }
-        let asked = low_limit().filter(|address| *address != 0).unwrap_or(1);
+        let asked = stack_bounds()
+            .filter(|(low, high)| *low != 0 && low < high)
+            .unwrap_or((1, 1));
         cell.set(asked);
         asked
     });
-    if low == 1 {
+    let here = stack_pointer();
+    if low == 1 || here < low || here > high {
         return usize::MAX;
     }
-    stack_pointer().saturating_sub(low)
+    here.saturating_sub(low)
 }
 
 /// Builds the error a recursive step returns when [`has_room`] answered false.
@@ -95,10 +105,10 @@ pub fn has_room() -> bool {
     room() > MARGIN
 }
 
-/// Asks the operating system for the lowest address of the calling thread's stack.
+/// Asks the operating system for the lowest and highest addresses of the calling thread's stack.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn low_limit() -> Option<usize> {
+fn stack_bounds() -> Option<(usize, usize)> {
     let mut low: usize = 0;
     let mut high: usize = 0;
     // SAFETY: the call writes the two integers it is handed and keeps no pointer to them; both
@@ -106,13 +116,13 @@ fn low_limit() -> Option<usize> {
     unsafe {
         windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high);
     }
-    Some(low)
+    Some((low, high))
 }
 
-/// Asks the operating system for the lowest address of the calling thread's stack.
+/// Asks the operating system for the lowest and highest addresses of the calling thread's stack.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(unsafe_code)]
-fn low_limit() -> Option<usize> {
+fn stack_bounds() -> Option<(usize, usize)> {
     // SAFETY: an all zero `pthread_attr_t` is the state `pthread_getattr_np` expects to overwrite.
     let mut attributes: libc::pthread_attr_t = unsafe { std::mem::zeroed() };
     // SAFETY: `pthread_self` names the calling thread, which is alive, and `attributes` is a valid
@@ -130,13 +140,14 @@ fn low_limit() -> Option<usize> {
     unsafe {
         libc::pthread_attr_destroy(&mut attributes);
     }
-    answered.then_some(address as usize)
+    let low = address as usize;
+    answered.then(|| (low, low.saturating_add(size)))
 }
 
-/// Asks the operating system for the lowest address of the calling thread's stack.
+/// Asks the operating system for the lowest and highest addresses of the calling thread's stack.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn low_limit() -> Option<usize> {
+fn stack_bounds() -> Option<(usize, usize)> {
     // SAFETY: `pthread_self` names the calling thread, and both calls only read that thread's
     // recorded stack bounds.
     let (high, size) = unsafe {
@@ -146,10 +157,10 @@ fn low_limit() -> Option<usize> {
             libc::pthread_get_stacksize_np(thread),
         )
     };
-    high.checked_sub(size)
+    high.checked_sub(size).map(|low| (low, high))
 }
 
-/// Asks the operating system for the lowest address of the calling thread's stack.
+/// Asks the operating system for the lowest and highest addresses of the calling thread's stack.
 ///
 /// A system this module has no call for answers nothing, which [`room`] reads as no limit.
 #[cfg(not(any(
@@ -158,7 +169,7 @@ fn low_limit() -> Option<usize> {
     target_os = "android",
     target_os = "macos"
 )))]
-fn low_limit() -> Option<usize> {
+fn stack_bounds() -> Option<(usize, usize)> {
     None
 }
 
