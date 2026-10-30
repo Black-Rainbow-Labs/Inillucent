@@ -1009,7 +1009,8 @@ impl<'a> Loading<'a> {
         self.identifiers.push(identifier);
     }
 
-    /// Records an object whose `CREATE` text this engine could not re-read.
+    /// Records an object that has nothing to attach to, such as an index or a
+    /// trigger whose table is in another database.
     ///
     /// @param entry - the catalog row
     fn skip(&mut self, entry: &SchemaEntry) {
@@ -1107,22 +1108,18 @@ impl<'a> Loading<'a> {
                 continue;
             }
             let (local, identifier) = self.register(entry, allocate)?;
-            let mut info = match table_from_create_sql(&entry.sql, self.index, identifier) {
-                Ok(info) => info,
-                Err(_) => {
-                    self.skip(entry);
-                    continue;
-                }
-            };
+            // **A table this engine cannot read stops the open, and says which.**
+            // It used to be skipped: the file opened, `sqlite_schema` listed the
+            // table, and every statement naming it answered `no such table`.
+            // That is how a table that 2.0.2 altered after a table constraint looked
+            // dropped to 2.8.1 while all its rows were still in the file.
+            // SQLite refuses a schema it cannot parse the same way.
+            let mut info = table_from_create_sql(&entry.sql, self.index, identifier)
+                .map_err(|error| unreadable_object("table", entry, error))?;
             info.root = identifier;
             let (columns, key_columns, layout) = if info.without_rowid {
-                match keyed_table_shape(&info) {
-                    Ok((columns, key_columns, layout)) => (columns, key_columns, layout),
-                    Err(_) => {
-                        self.skip(entry);
-                        continue;
-                    }
-                }
+                keyed_table_shape(&info)
+                    .map_err(|error| unreadable_object("table", entry, error))?
             } else {
                 let (columns, layout) = table_shape(&info);
                 (columns, 1, layout)
@@ -1156,7 +1153,7 @@ impl<'a> Loading<'a> {
                 continue;
             };
             let (local, identifier) = self.register(entry, allocate)?;
-            let Some(index) = self.declaration_of(entry, &table_info, identifier) else {
+            let Some(index) = self.declaration_of(entry, &table_info, identifier)? else {
                 self.skip(entry);
                 continue;
             };
@@ -1211,18 +1208,25 @@ impl<'a> Loading<'a> {
         entry: &SchemaEntry,
         table_info: &TableInfo,
         identifier: u32,
-    ) -> Option<IndexInfo> {
+    ) -> DbResult<Option<IndexInfo>> {
         if entry.sql.is_empty() {
             let wanted = entry.name.to_ascii_lowercase();
-            let mut index = table_info
+            let Some(mut index) = table_info
                 .indexes
                 .iter()
                 .find(|index| index.folded == wanted)
-                .cloned()?;
+                .cloned()
+            else {
+                return Ok(None);
+            };
             index.root = identifier;
-            return Some(index);
+            return Ok(Some(index));
         }
-        inillucent_catalog::load::index_from_create_sql(&entry.sql, table_info, identifier).ok()
+        // An index whose text does not parse stops the open, as a table does:
+        // skipping it left a table with no index and a planner that never knew.
+        inillucent_catalog::load::index_from_create_sql(&entry.sql, table_info, identifier)
+            .map(Some)
+            .map_err(|error| unreadable_object("index", entry, error))
     }
 
     /// Records every view the catalog declares.
@@ -1266,13 +1270,16 @@ impl<'a> Loading<'a> {
     /// exactly these two places, and both were empty on this engine.
     ///
     /// @param stored - the catalog rows
-    fn triggers_from(&mut self, stored: &[SchemaEntry]) {
+    fn triggers_from(&mut self, stored: &[SchemaEntry]) -> DbResult<()> {
         for entry in stored {
             if entry.kind != ObjectKind::Trigger {
                 continue;
             }
             let folded = entry.table.to_ascii_lowercase();
-            let held = inillucent_catalog::load::trigger_from_create_sql(&entry.sql).ok();
+            // A trigger whose text does not parse stops the open. Skipped, it
+            // was a trigger that silently stopped firing.
+            let held = inillucent_catalog::load::trigger_from_create_sql(&entry.sql)
+                .map_err(|error| unreadable_object("trigger", entry, error))?;
             match (self.infos.get_mut(&folded), held) {
                 // **A trigger on a view is kept, though no `infos` entry holds
                 // the view.** A view has no tree, so `tables_from` never makes
@@ -1281,7 +1288,7 @@ impl<'a> Loading<'a> {
                 // out of `entries`, so after a close and reopen an `INSTEAD OF`
                 // trigger was gone and a write to the view was refused with
                 // "cannot modify ... because it is a view".
-                (None, Some(_)) if names_a_view(stored, &folded) => {}
+                (None, _) if names_a_view(stored, &folded) => {}
                 (None, _) => {
                     self.skip(entry);
                     continue;
@@ -1289,11 +1296,11 @@ impl<'a> Loading<'a> {
                 // Newest first, which is SQLite's own order: it pushes each
                 // trigger onto the front of the table's list as it reads the
                 // schema, so the most recently created one fires first.
-                (Some((_, info)), Some(trigger)) => info.triggers.insert(0, trigger),
-                (Some(_), None) => self.skip(entry),
+                (Some((_, info)), trigger) => info.triggers.insert(0, trigger),
             }
             self.keep(entry, 0);
         }
+        Ok(())
     }
 
     /// Writes each table's foreign keys as the triggers that enforce them.
@@ -1377,6 +1384,30 @@ impl<'a> Loading<'a> {
     }
 }
 
+/// Names the catalog object whose stored text could not be read, in the error
+/// that stops the open.
+///
+/// The parser's own words and code are kept, so a construct this engine has
+/// not built still arrives as `unsupported`, and the object's name is put in
+/// front: a person with a file that will not open needs to know which object
+/// to look at.
+///
+/// @param kind - what the object is, as `table`
+/// @param entry - its catalog row
+/// @param error - why it could not be read
+fn unreadable_object(
+    kind: &str,
+    entry: &SchemaEntry,
+    error: inillucent_base::DbError,
+) -> inillucent_base::DbError {
+    let said = format!(
+        "cannot read {kind} {} in the schema: {}",
+        String::from_utf8_lossy(&entry.name),
+        error.message()
+    );
+    error.with_message(said.clone()).with_detail(said)
+}
+
 /// Returns whether a catalog row declares a view with the given folded name.
 ///
 /// @param stored - the catalog rows
@@ -1416,7 +1447,7 @@ pub(crate) fn load_schema(
     loading.tables_from(&stored, allocate)?;
     loading.indexes_from(&stored, allocate)?;
     loading.views_from(&stored);
-    loading.triggers_from(&stored);
+    loading.triggers_from(&stored)?;
     loading.foreign_keys_from(name);
     loading.layouts_from(catalog_tree, catalog_handle)
 }

@@ -182,8 +182,24 @@ fn table_objects(shell: &Shell, condition: Option<&str>) -> Vec<(String, String)
         return Vec::new();
     };
     rows.iter()
-        .map(|row| (plain(row.first()), plain(row.get(1))))
+        .map(|row| (plain(row.first()), loadable(plain(row.get(1)))))
         .collect()
+}
+
+/// Returns stored `CREATE TABLE` text in an order the grammar accepts.
+///
+/// Releases before 2.1.0 stored `ALTER TABLE ... ADD COLUMN` with the new column
+/// after any table constraint, which neither SQLite nor this engine parses. The
+/// engine reads that text reordered, and rewrites the row at its next
+/// checkpoint, but until then `sqlite_master` still holds the old text, and a
+/// dump that printed it could not be loaded again.
+///
+/// @param sql - the stored text
+fn loadable(sql: String) -> String {
+    match inillucent_engine::stored_create_table_text(sql.as_bytes()) {
+        Some(fixed) => String::from_utf8_lossy(&fixed).into_owned(),
+        None => sql,
+    }
 }
 
 /// Returns the indexes, triggers and views a dump covers, in creation order.

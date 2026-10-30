@@ -303,6 +303,36 @@ pub fn read_catalog_rows(pool: &Pool, tree: &PagedTree) -> DbResult<Vec<(i64, Sc
     }
 }
 
+/// Returns the rowids of the table rows whose stored text has a column after a
+/// table constraint, which `entry_of` reorders when it reads them.
+///
+/// The rows are read as they are stored, not through `entry_of`, because the
+/// question is what is on disk. A checkpoint rewrites these rows from the
+/// reordered entries a connection holds, so `SELECT sql FROM sqlite_schema` and
+/// a dump of the file give text that SQLite and this engine can load again.
+///
+/// @param pool - the buffer pool the file is open through
+/// @param tree - the catalog tree
+pub fn misordered_table_rows(pool: &Pool, tree: &PagedTree) -> DbResult<Vec<i64>> {
+    let mut rowids = Vec::new();
+    tree.visit_leaves(pool, &mut |leaf: &inillucent_tree::leaf::LeafRef<'_>| {
+        for row in leaf.live()? {
+            let (Some(Datum::Int(rowid)), Ok(kind), Ok(sql)) =
+                (row.first(), text_at(&row, 1), text_at(&row, 5))
+            else {
+                continue;
+            };
+            if ObjectKind::from_text(&kind) == Some(ObjectKind::Table)
+                && crate::load::stored_create_table_text(&sql).is_some()
+            {
+                rowids.push(*rowid);
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(rowids)
+}
+
 /// Returns one catalog row as the values the tree holds.
 ///
 /// @param rowid - the key the row is stored under
@@ -401,12 +431,24 @@ fn entry_of(row: &[Datum<'_>]) -> DbResult<SchemaEntry> {
             ))
         }
     };
+    // A `CREATE TABLE` that a release before 2.1.0 stored with a column after a table
+    // constraint is read in the order the grammar accepts, here where every
+    // reader of the catalog gets it, so the loader, recovery and `ALTER` all
+    // see one text. Before this the loader skipped such a table and every
+    // statement naming it answered `no such table`. The row on disk keeps the
+    // old text until `rewrite_misordered_tables` replaces it at a checkpoint.
+    let mut sql = text_at(row, 5)?;
+    if kind == ObjectKind::Table {
+        if let Some(fixed) = crate::load::stored_create_table_text(&sql) {
+            sql = fixed;
+        }
+    }
     Ok(SchemaEntry {
         kind,
         name: text_at(row, 2)?,
         table: text_at(row, 3)?,
         root,
-        sql: text_at(row, 5)?,
+        sql,
         stats: TreeStats {
             first_leaf: PageId(counter_at(row, 6)? as u64),
             leaf_count: counter_at(row, 7)? as u64,

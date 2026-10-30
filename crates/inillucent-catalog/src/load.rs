@@ -420,10 +420,55 @@ pub fn trigger_from_create_sql(sql: &[u8]) -> DbResult<TriggerInfo> {
 ///
 /// This is public because it is how a test builds a catalog without a file, and
 /// because the DDL path will build a candidate table the same way.
+///
+/// Text that will not parse is read once more with its columns moved in front
+/// of its table constraints (`stored_create_table_text`), and the entry then
+/// keeps the reordered text, so a later `ALTER`, `dump` or `VACUUM` works on
+/// SQL the grammar accepts.
 pub fn table_from_create_sql(sql: &[u8], database: usize, root: u32) -> DbResult<TableInfo> {
     let limits = Limits::default();
-    let parsed = parse_next_statement(sql, 0, &limits)
-        .map_err(|error| unparseable_schema("CREATE TABLE", error))?;
+    match parse_next_statement(sql, 0, &limits) {
+        Ok(parsed) => table_from_parsed_sql(sql, parsed, database, root),
+        Err(error) => match stored_create_table_text(sql) {
+            Some(fixed) => {
+                let parsed = parse_next_statement(&fixed, 0, &limits)
+                    .map_err(|error| unparseable_schema("CREATE TABLE", error))?;
+                table_from_parsed_sql(&fixed, parsed, database, root)
+            }
+            None => Err(unparseable_schema("CREATE TABLE", error)),
+        },
+    }
+}
+
+/// Returns stored `CREATE TABLE` text in the order the grammar accepts, when it
+/// was written with a column after a table constraint and reordering makes it
+/// parse; otherwise `None`.
+///
+/// Releases before 2.1.0 wrote that order for `ALTER TABLE ... ADD COLUMN` on a
+/// table with a table constraint (`crate::alter_text::columns_before_constraints`
+/// says why). Only text that fails to parse as it is gets here, so text that
+/// already parses is never changed.
+///
+/// @param sql - the stored text
+pub fn stored_create_table_text(sql: &[u8]) -> Option<Vec<u8>> {
+    let fixed = crate::alter_text::columns_before_constraints(sql).ok()??;
+    parse_next_statement(&fixed, 0, &Limits::default())
+        .ok()
+        .map(|_| fixed)
+}
+
+/// Builds a table entry from a parsed `CREATE TABLE` or `CREATE VIRTUAL TABLE`.
+///
+/// @param sql - the text that was parsed, which the entry keeps
+/// @param parsed - the parse of `sql`
+/// @param database - the database the table is in
+/// @param root - the table's root page or tree identifier
+fn table_from_parsed_sql(
+    sql: &[u8],
+    parsed: inillucent_sql::parser::ParsedStatement,
+    database: usize,
+    root: u32,
+) -> DbResult<TableInfo> {
     let Statement::CreateTable { name, body, .. } = &parsed.statement else {
         if let Statement::CreateVirtualTable {
             name,

@@ -180,3 +180,29 @@ every release before 2.5.0 refuses it.
 fixture with a local build instead of the downloaded release. Use it to try a change to
 `build.sql`, `build-long-keys.sql` or the script. A fixture that is checked in is always built from
 the published release.
+
+## A column after a table constraint: `alter-after-constraint/`
+
+Releases before 2.1.0 stored `ALTER TABLE ... ADD COLUMN` by putting the new column at the end of
+the stored `CREATE TABLE` text, after any table constraint:
+
+```sql
+CREATE TABLE chunk (id TEXT PRIMARY KEY, ..., UNIQUE (document_id, ordinal), CHECK (ordinal >= 0), embedded_at INTEGER, weight REAL NOT NULL DEFAULT 1.5)
+```
+
+SQLite's grammar allows a column only before the first table constraint, so later releases could
+not parse this text. 2.8.1 left the table out of the schema without a message: the file opened,
+`sqlite_schema` listed the table, and every statement naming it answered `no such table`.
+
+The current build reads such text with the columns moved in front of the table constraints. The
+row on disk is rewritten in that order at the next checkpoint that refreshes the catalog's
+statistics (`PRAGMA wal_checkpoint` is one), and `inillucent dump` prints the reordered text before
+then. A table, index or trigger whose stored text still does not parse now stops the open with the
+object's name and the parser's reason.
+
+`alter-after-constraint/` was written by the 2.0.2 binary from `alter-after-constraint/build.sql`,
+checkpointed, and given one more row that only its log holds. It is not a release folder, so
+`interop::versions()` does not list it.
+`release_format.rs::a_table_that_2_0_2_altered_after_its_table_constraints_reads_and_writes`
+reads it, writes to it, renames a column, checks the stored text after a checkpoint, runs the
+foreign key cascade, and loads a dump of an untouched copy into a fresh database.

@@ -120,6 +120,10 @@ pub(crate) use engine::write::*;
 // `pub` at it after.
 pub use engine::rowshape::{identity_columns, logical_row, source_layout_of, stored_as};
 pub use engine::statements::{Outcome, Statement};
+// The dump prints stored `CREATE TABLE` text through this, so a table that
+// a release before 2.1.0 stored with a column after a table constraint is dumped as
+// SQL that SQLite and this engine both load.
+pub use inillucent_catalog::load::stored_create_table_text;
 mod entries;
 pub(crate) mod import;
 mod index_sort;

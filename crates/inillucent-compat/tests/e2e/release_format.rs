@@ -457,6 +457,113 @@ fn every_release_recorded_the_same_answers() {
     }
 }
 
+/// A table that 2.0.2 altered after its table constraints reads, writes, alters
+/// and dumps under this build.
+///
+/// **Releases before 2.1.0 stored `ADD COLUMN` after the table constraints**
+/// (`CREATE TABLE chunk (..., UNIQUE (document_id, ordinal), CHECK (...),
+/// embedded_at INTEGER, weight ...)`), which the grammar refuses. 2.8.1 skipped
+/// the table when it loaded the schema, so the file opened, `sqlite_schema`
+/// listed `chunk`, and every statement naming it answered `no such table`. A
+/// real application's 606,649 row table looked dropped that way. The fixture in
+/// `tests/interop/alter-after-constraint` was written by the 2.0.2 binary from
+/// its `build.sql`, with one row left only in the log.
+///
+/// Every answer is compared to what 2.0.2 itself gave. After a checkpoint the
+/// stored text is the reordered one, and the dump, which must load again, is
+/// read back through a fresh database.
+#[test]
+fn a_table_that_2_0_2_altered_after_its_table_constraints_reads_and_writes() {
+    let area = scratch("alter-after-constraint");
+    let database = interop::stage("alter-after-constraint", &area);
+    let arm = default_arm();
+    {
+        let handle = open(&arm, &database);
+        let connection = handle.session();
+        assert_eq!(ask(&connection, "PRAGMA integrity_check"), "ok");
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT id, document_id, ordinal, body, coalesce(embedded_at, 0), weight \
+                 FROM chunk ORDER BY id"
+            ),
+            "c1,d1,0,alpha,0,1.5\nc2,d1,1,beta,100,1.5\nc3,d2,0,gamma,0,1.5\n\
+             c4,d2,1,delta,200,2.5\nc5,d1,2,the row that only the log holds,0,3.5",
+            "the rows 2.0.2 wrote, including the one only its log holds, do not come back"
+        );
+        assert_eq!(
+            ask(&connection, "SELECT id FROM chunk WHERE embedded_at = 200"),
+            "c4",
+            "the index 2.0.2 built on the added column does not answer"
+        );
+        run(
+            &connection,
+            "INSERT INTO chunk VALUES ('c6', 'd2', 2, 'written by this build', 300, 4.5)",
+        );
+        let duplicate =
+            connection.execute_batch("INSERT INTO chunk VALUES ('c7', 'd2', 2, 'dup', 0, 0)");
+        assert!(
+            duplicate.is_err(),
+            "the UNIQUE (document_id, ordinal) declared before the added columns is not enforced"
+        );
+        let negative =
+            connection.execute_batch("INSERT INTO chunk VALUES ('c8', 'd2', -1, 'neg', 0, 0)");
+        assert!(negative.is_err(), "the table's CHECK is not enforced");
+        run(&connection, "ALTER TABLE chunk RENAME COLUMN body TO text");
+        run(&connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT sql FROM sqlite_schema WHERE name = 'chunk'"
+            ),
+            "CREATE TABLE chunk (id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES \
+             document(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, text TEXT, embedded_at \
+             INTEGER, weight REAL NOT NULL DEFAULT 1.5, UNIQUE (document_id, ordinal), CHECK \
+             (ordinal >= 0))",
+            "the stored text is not in the order the grammar accepts after a checkpoint"
+        );
+        run(
+            &connection,
+            "PRAGMA foreign_keys = ON; DELETE FROM document WHERE id = 'd2'",
+        );
+        assert_eq!(
+            ask(&connection, "SELECT group_concat(id, ' ') FROM chunk"),
+            "c1 c2 c5",
+            "the foreign key's cascade declared before the added columns did not run"
+        );
+    }
+    let handle = reopen_and_check(&arm, &database);
+    let connection = handle.session();
+    assert_eq!(
+        ask(&connection, "SELECT count(*), sum(weight) FROM chunk"),
+        "3,6.5"
+    );
+    drop(connection);
+    drop(handle);
+
+    // The dump is of a copy nothing has written, so its stored text is still
+    // the one 2.0.2 wrote and the dump has to reorder it itself.
+    let untouched_area = scratch("alter-after-constraint-dump");
+    let untouched = interop::stage("alter-after-constraint", &untouched_area);
+    let dumped = std::process::Command::new(inillucent_compat::cliproc::program("inillucent"))
+        .arg("--db")
+        .arg(&untouched)
+        .arg("dump")
+        .output()
+        .expect("inillucent dump starts");
+    let script = String::from_utf8_lossy(&dumped.stdout).into_owned();
+    assert!(dumped.status.success(), "inillucent dump failed:\n{script}");
+    let copy = untouched_area.join("from-dump.rdb");
+    let loaded = open(&arm, &copy);
+    let loading = loaded.session();
+    run(&loading, &script);
+    assert_eq!(
+        ask(&loading, "SELECT group_concat(id, ' ') FROM chunk"),
+        "c1 c2 c3 c4 c5",
+        "the dump of the altered table does not load into a fresh database"
+    );
+}
+
 /// The release script builds a fixture for the version it is shipping.
 ///
 /// Rule 1.5, and the thing it holds is a claim this file's own documentation

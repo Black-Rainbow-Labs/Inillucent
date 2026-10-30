@@ -163,6 +163,59 @@ pub fn drop_constraint(sql: &[u8], folded: &[u8]) -> DbResult<Dropped> {
     Ok(Dropped::Missing)
 }
 
+/// Returns a stored `CREATE TABLE` text with every column definition moved in
+/// front of the table constraints, or `None` when no column follows one.
+///
+/// **Releases before 2.1.0 wrote this text and the grammar refuses it.** Their
+/// `ALTER TABLE ... ADD COLUMN` put the new column before the closing
+/// parenthesis, after any `UNIQUE (a, o)` the table declared, and SQLite's
+/// grammar allows a column only before the first table constraint. Later
+/// releases parse stored text with that grammar, so the table vanished from the
+/// loaded schema and every statement naming it answered `no such table`. A file
+/// with this text is still a file a user made, so it is read: the elements keep
+/// their own bytes, the separators between them keep their place, and only the
+/// order changes. The columns keep their order among themselves, which is the
+/// order their values are stored in.
+///
+/// @param sql - the stored text
+pub fn columns_before_constraints(sql: &[u8]) -> DbResult<Option<Vec<u8>>> {
+    let text = Text::new(sql)?;
+    let elements = text.elements();
+    let Some(first_constraint) = elements.iter().position(|element| element.table_level) else {
+        return Ok(None);
+    };
+    let late_column = elements
+        .iter()
+        .skip(first_constraint)
+        .any(|element| !element.table_level);
+    let (Some(first), Some(last)) = (elements.first(), elements.last()) else {
+        return Ok(None);
+    };
+    if !late_column {
+        return Ok(None);
+    }
+    let reordered = elements
+        .iter()
+        .filter(|element| !element.table_level)
+        .chain(elements.iter().filter(|element| element.table_level));
+    let mut out = sql
+        .get(..text.start_of(first.first))
+        .unwrap_or_default()
+        .to_vec();
+    for (slot, element) in reordered.enumerate() {
+        out.extend_from_slice(text.element_bytes(element));
+        if let Some(next) = elements.get(slot.saturating_add(1)) {
+            let after = elements.get(slot).map_or(0, |held| text.end_of(held.last));
+            out.extend_from_slice(
+                sql.get(after..text.start_of(next.first))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    out.extend_from_slice(sql.get(text.end_of(last.last)..).unwrap_or_default());
+    Ok(Some(out))
+}
+
 /// Drops the table constraint a `CONSTRAINT name` label names, when one of an
 /// element's labels is that name.
 ///
@@ -280,6 +333,24 @@ impl<'a> Text<'a> {
         at.checked_sub(1)
             .and_then(|previous| self.tokens.get(previous))
             .map_or(0, |token| token.span.end as usize)
+    }
+
+    /// Returns the byte offset where the token at a position ends.
+    ///
+    /// @param at - the position
+    fn end_of(&self, at: usize) -> usize {
+        self.tokens
+            .get(at)
+            .map_or(self.sql.len(), |token| token.span.end as usize)
+    }
+
+    /// Returns the bytes of one element, from its first token to its last.
+    ///
+    /// @param element - the element
+    fn element_bytes(&self, element: &Element) -> &'a [u8] {
+        self.sql
+            .get(self.start_of(element.first)..self.end_of(element.last))
+            .unwrap_or_default()
     }
 
     /// Splits the column list into its comma separated elements.
@@ -659,6 +730,48 @@ pub fn trimmed_span(source: &[u8], span: Span) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text releases before 2.1.0 stored for `ADD COLUMN` on a table with a table
+    /// constraint comes back with the columns first, in their own order, and
+    /// with the separators where they were.
+    #[test]
+    fn a_column_after_a_table_constraint_moves_in_front_of_it() {
+        let sql = b"CREATE TABLE chunk ( id TEXT PRIMARY KEY, n INTEGER, UNIQUE (id, n)\n, a INTEGER, CHECK (n > 0), b)";
+        let out = columns_before_constraints(sql)
+            .expect("it lexes")
+            .expect("it reorders");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "CREATE TABLE chunk ( id TEXT PRIMARY KEY, n INTEGER, a INTEGER\n, b, UNIQUE (id, n), CHECK (n > 0))"
+        );
+        let named = b"CREATE TABLE t (a, CONSTRAINT k UNIQUE (a), b) STRICT";
+        let out = columns_before_constraints(named)
+            .expect("it lexes")
+            .expect("it reorders");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "CREATE TABLE t (a, b, CONSTRAINT k UNIQUE (a)) STRICT"
+        );
+    }
+
+    /// Text in the order the grammar accepts is left alone, including a
+    /// comma inside a constraint's parentheses and a word in a comment.
+    #[test]
+    fn text_in_grammar_order_is_not_reordered() {
+        for sql in [
+            &b"CREATE TABLE t (a, b, UNIQUE (a, b), CHECK (a > b))"[..],
+            b"CREATE TABLE t (a /* , UNIQUE (a), */, b)",
+            b"CREATE TABLE t (a CHECK (a > 0), b UNIQUE)",
+            b"CREATE TABLE t (a, b)",
+        ] {
+            assert_eq!(
+                columns_before_constraints(sql).expect("it lexes"),
+                None,
+                "{}",
+                String::from_utf8_lossy(sql)
+            );
+        }
+    }
 
     /// A `NOT NULL` that ends a column goes in before the comma.
     #[test]

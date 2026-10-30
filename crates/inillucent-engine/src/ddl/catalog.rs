@@ -719,14 +719,26 @@ impl crate::ImportedDatabase {
     /// last one, which is exactly what a reader that has just opened the file
     /// gets - and after recovery replays past that point, the checker is what
     /// notices if they no longer describe the tree.
+    ///
+    /// A row whose stored `CREATE TABLE` has a column after a table constraint,
+    /// which releases before 2.1.0 wrote, is rewritten here too, from the reordered
+    /// text the connection already holds (`paged::misordered_table_rows`).
+    /// Until then `sqlite_schema` and a dump show the old text.
     pub(crate) fn refresh_statistics(&mut self) -> DbResult<()> {
+        let misordered = match self.schema.trees.get(&SCHEMA_VIEW_ROOT) {
+            Some(tree) => inillucent_catalog::paged::misordered_table_rows(
+                self.storage.database.pool(),
+                tree,
+            )?,
+            None => Vec::new(),
+        };
         let stale: Vec<(i64, SchemaEntry)> = self
             .schema
             .entries
             .iter()
             .filter_map(|held| {
                 let stats = self.tree_stats(held.root);
-                if stats == held.entry.stats {
+                if stats == held.entry.stats && !misordered.contains(&held.rowid) {
                     return None;
                 }
                 let mut moved = held.entry.clone();
