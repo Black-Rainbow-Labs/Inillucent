@@ -308,7 +308,9 @@ fn unresolved_column(
         if !wrong_qualifier && (rowid || columns.iter().any(|name| name.as_slice() == folded)) {
             continue;
         }
-        if key_columns.contains(&id) {
+        // Only a double quoted name, which SQLite then reads as a string expression. An unquoted
+        // one is a column that is not there.
+        if quoted && key_columns.contains(&id) {
             return Some(
                 "expressions prohibited in PRIMARY KEY and UNIQUE constraints".to_string(),
             );
