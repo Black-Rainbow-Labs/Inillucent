@@ -36,6 +36,26 @@ fn check_arguments(argument: Option<&PragmaArgument>) -> (usize, Option<Vec<u8>>
     }
 }
 
+/// Builds the query that counts one for a table that has a row and zero for an empty one.
+///
+/// @param database - the connection, which names the schema
+/// @param table - the table
+/// @param at - the database the table is in
+fn row_exists_query(
+    database: &crate::ImportedDatabase,
+    table: &inillucent_sql::catalog_view::TableInfo,
+    at: usize,
+) -> String {
+    let quote = |text: &[u8]| String::from_utf8_lossy(text).replace('"', "\"\"");
+    let schema =
+        inillucent_sql::catalog_view::CatalogView::database_name(&database.schema.catalog, at);
+    format!(
+        "SELECT count(*) FROM (SELECT 1 FROM \"{}\".\"{}\" LIMIT 1)",
+        quote(schema),
+        quote(&table.name)
+    )
+}
+
 /// Builds the query that counts the rows of a table that break one of its `CHECK` constraints.
 ///
 /// @param database - the connection, which names the schema
@@ -326,6 +346,13 @@ impl crate::ImportedDatabase {
             let newest_first: Vec<_> = tables.collect::<Vec<_>>().into_iter().rev().collect();
             for table in newest_first {
                 if only.is_some_and(|name| name != table.folded.as_slice()) {
+                    continue;
+                }
+                // **A table with no rows evaluates no `CHECK`.** SQLite reads each row against the
+                // constraints, so `CHECK(ABS(-9223372036854775808))` on an empty table reports `ok`.
+                // The count query below folds that constant before it looks for a row, and the
+                // overflow it raises would fail the pragma.
+                if self.count_rows(&row_exists_query(self, table, database))? == 0 {
                     continue;
                 }
                 let broken = self.count_rows(&check_violation_query(self, table, database))?;

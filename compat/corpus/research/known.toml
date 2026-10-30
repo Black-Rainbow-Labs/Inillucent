@@ -46,19 +46,9 @@ kind = "deviation"
 reason = "Both engines refuse the statement. SQLite names the unknown collation in the view first; this engine names the view as not writable first."
 
 [[known]]
-case = "research/sqlite-forum/fts5_trigram_option_without_value"
-kind = "defect"
-reason = "The trigram tokenizer is not built, so the statement is refused with exit code 3."
-
-[[known]]
 case = "research/sqlite-forum/fts5_external_content_delete_then_reinsert"
 kind = "deviation"
 reason = "The delete command for rows the index never held: SQLite reports the index as malformed on the next query; this engine removes nothing and answers the query."
-
-[[known]]
-case = "research/sqlite-forum/fts5_match_phrase_near_prefix_bm25"
-kind = "deviation"
-reason = "One bm25 score differs in the seventeenth significant digit, because the per phrase terms are added in a different order."
 
 [[known]]
 case = "research/sqlite-forum/fts5_contentless_delete_rebuild"

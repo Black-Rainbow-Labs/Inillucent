@@ -738,6 +738,15 @@ fn mark_stage_needed(
             _ => return,
         }
     }
+    // **An expression the index computes is read from its entry, so its column is decoded.**
+    // `Space::computed` turns `+c0` into a read of the entry's column. Left out of the mask,
+    // that column came back NULL whenever the statement also read the plain column the index
+    // holds beside it, as `SELECT typeof(+c0) FROM t` does over an index on `(+c0, c0)`.
+    for (_, joined) in &stage.computed {
+        if !mark(joined.saturating_sub(stage.offset)) {
+            return;
+        }
+    }
     // A stage after this one reads this one's row by position: a lookup
     // probes the table with the entry's identity, and a join may compare keys.
     // A single stage is read only through the statement's own expressions.
