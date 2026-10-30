@@ -430,6 +430,7 @@ impl ImportedDatabase {
                 String::from_utf8_lossy(name)
             )));
         };
+        self.pragmas.database_detached(at);
         // **Its handles go with it.** A plan built while it was attached names
         // trees this connection no longer holds; the statement cache is emptied
         // by `refresh_catalog` below, and these maps are emptied here so that a

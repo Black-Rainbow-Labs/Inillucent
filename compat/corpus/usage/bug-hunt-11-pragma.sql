@@ -126,7 +126,6 @@ select count(*) from sqlite_master where name='sqlite_stat1';
 -- case: bug-hunt-11/pragma/D12-temp-and-attached-scoping
 attach ':memory:' as aux;
 pragma aux.cache_size=10;
-pragma cache_size;
 pragma temp.synchronous;
 pragma temp.journal_mode;
 pragma temp.secure_delete;
@@ -304,3 +303,70 @@ pragma query_only=1;
 pragma optimize(3);
 pragma optimize;
 select count(*) from sqlite_master where name='sqlite_stat1';
+-- case: bug-hunt-11/pragma/D2-drop_column_indexed_non_ascii
+create table t (a, "é", y);
+insert into t values (1, 2, 3);
+create index i on t("é");
+alter table t drop column "é";
+select * from t;
+insert into t (a, y) values (5, 6);
+select * from t;
+-- case: bug-hunt-11/pragma/D2-drop_column_check_non_ascii
+create table t (a, "é", y, check ("é" > 0));
+alter table t drop column "é";
+select sql from sqlite_master;
+-- case: bug-hunt-11/pragma/D2-drop_column_unique_non_ascii
+create table t (a, "é", y, unique ("é"));
+alter table t drop column "é";
+select sql from sqlite_master;
+-- case: bug-hunt-11/pragma/D2-drop_column_generated_non_ascii
+create table t (a, "é", g as ("é" + 1));
+alter table t drop column "é";
+select sql from sqlite_master;
+-- case: bug-hunt-11/pragma/D12-cache-size-belongs-to-each-database
+attach ':memory:' as aux;
+pragma aux.cache_size=10;
+pragma aux.cache_size;
+pragma temp.cache_size;
+pragma temp.cache_size=7;
+pragma temp.cache_size;
+pragma main.cache_size=99;
+pragma main.cache_size;
+pragma aux.cache_size;
+pragma temp.cache_size;
+-- case: bug-hunt-11/pragma/D12-synchronous-belongs-to-each-database
+attach ':memory:' as aux;
+pragma synchronous;
+pragma temp.synchronous;
+pragma aux.synchronous;
+pragma temp.synchronous=1;
+pragma temp.synchronous;
+pragma aux.synchronous=0;
+pragma aux.synchronous;
+pragma main.synchronous;
+pragma synchronous=1;
+pragma aux.synchronous;
+pragma main.synchronous;
+-- case: bug-hunt-11/pragma/D12-journal-mode-belongs-to-each-database
+attach 'aux.db' as aux;
+attach ':memory:' as mem;
+pragma temp.journal_mode=wal;
+pragma temp.journal_mode;
+pragma temp.journal_mode=memory;
+pragma temp.journal_mode;
+pragma aux.journal_mode;
+pragma aux.journal_mode=truncate;
+pragma aux.journal_mode;
+pragma main.journal_mode;
+pragma mem.journal_mode;
+pragma mem.journal_mode=delete;
+pragma mem.journal_mode;
+-- case: bug-hunt-11/pragma/D12-secure-delete-numbers-are-booleans
+pragma secure_delete=fast;
+pragma secure_delete;
+pragma secure_delete=2;
+pragma secure_delete;
+pragma secure_delete=3;
+pragma secure_delete;
+pragma secure_delete=off;
+pragma secure_delete;

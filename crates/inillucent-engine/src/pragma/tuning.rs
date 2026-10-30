@@ -618,7 +618,7 @@ impl crate::ImportedDatabase {
         };
         self.pragmas.set_secure_delete(
             match argument_text(argument).trim().to_ascii_lowercase().as_str() {
-                "2" | "fast" => 2,
+                "fast" => 2,
                 _ => u8::from(argument_boolean(argument)),
             },
         );

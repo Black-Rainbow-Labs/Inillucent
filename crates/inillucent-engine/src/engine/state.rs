@@ -183,6 +183,13 @@ pub(crate) struct Pragmas {
     ///
     /// A setting that was never set is absent, and reads its default.
     remembered: std::cell::RefCell<std::collections::BTreeMap<&'static str, i64>>,
+
+    /// What `cache_size`, `synchronous` and `journal_mode` were set to for a database other than
+    /// `main`, by database number and pragma name.
+    ///
+    /// Each database has its own value of these in SQLite, and `main`'s is kept in the fields
+    /// above. A database that was never set reads its default.
+    scoped: std::cell::RefCell<std::collections::BTreeMap<(usize, &'static str), i64>>,
 }
 
 // The accessors, and why the fields below them are private.
@@ -458,6 +465,48 @@ impl Pragmas {
         self.remembered.borrow_mut().insert(name, value);
     }
 
+    /// Returns what a setting was set to for one database other than `main`.
+    ///
+    /// @param database - the database number
+    /// @param name - the pragma's folded name
+    pub(crate) fn scoped(&self, database: usize, name: &'static str) -> Option<i64> {
+        self.scoped.borrow().get(&(database, name)).copied()
+    }
+
+    /// Records what a setting was set to for one database other than `main`.
+    ///
+    /// @param database - the database number
+    /// @param name - the pragma's folded name
+    /// @param value - what it reads from now on
+    pub(crate) fn set_scoped(&self, database: usize, name: &'static str, value: i64) {
+        self.scoped.borrow_mut().insert((database, name), value);
+    }
+
+    /// Forgets the settings of a database that was detached, and renumbers the databases after it.
+    ///
+    /// @param database - the number of the database that went
+    pub(crate) fn database_detached(&self, database: usize) {
+        let mut held = self.scoped.borrow_mut();
+        let moved: std::collections::BTreeMap<(usize, &'static str), i64> = std::mem::take(&mut *held)
+            .into_iter()
+            .filter(|((at, _), _)| *at != database)
+            .map(|((at, name), value)| ((if at > database { at - 1 } else { at }, name), value))
+            .collect();
+        *held = moved;
+    }
+
+    /// Returns the settings kept per database, for a `VACUUM` to carry across.
+    pub(crate) fn scoped_all(&self) -> std::collections::BTreeMap<(usize, &'static str), i64> {
+        self.scoped.borrow().clone()
+    }
+
+    /// Puts back the settings kept per database after a `VACUUM`.
+    ///
+    /// @param held - what `scoped_all` returned
+    pub(crate) fn set_scoped_all(&self, held: std::collections::BTreeMap<(usize, &'static str), i64>) {
+        *self.scoped.borrow_mut() = held;
+    }
+
     /// Returns every remembered setting, for a `VACUUM` to carry across.
     pub(crate) fn remembered_all(&self) -> std::collections::BTreeMap<&'static str, i64> {
         self.remembered.borrow().clone()
@@ -549,6 +598,7 @@ impl Pragmas {
             legacy_alter_table: std::cell::Cell::new(false),
             temp_store: std::cell::Cell::new(0),
             remembered: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            scoped: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
     }
 }

@@ -76,6 +76,7 @@ use super::{ImportedDatabase, Outcome, MAIN};
 mod integrity;
 mod remembered;
 mod schema;
+mod scoped;
 mod tuning;
 mod vacuum;
 pub(crate) use tuning::setting_function_column;
@@ -124,6 +125,9 @@ impl ImportedDatabase {
         // `pragma_optimize` function form stays a reader and answers no rows.
         if name == b"optimize" {
             return self.pragma_optimize(argument, at);
+        }
+        if let Some(outcome) = self.pragma_scoped(name, argument, at)? {
+            return Ok(outcome);
         }
         if let Some(outcome) = self.pragma_rows_of(name, argument, at)? {
             return Ok(outcome);

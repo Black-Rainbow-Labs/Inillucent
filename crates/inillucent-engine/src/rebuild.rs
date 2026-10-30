@@ -779,6 +779,7 @@ pub(crate) struct ConnectionSettings {
     writable_schema: bool,
     query_only: bool,
     data_version: u64,
+    scoped: std::collections::BTreeMap<(usize, &'static str), i64>,
     recursive_triggers: bool,
     legacy_alter_table: bool,
     max_page_count: u64,
@@ -818,6 +819,7 @@ impl ConnectionSettings {
             writable_schema: database.pragmas.writable_schema(),
             query_only: database.pragmas.query_only(),
             data_version: database.pragmas.data_version(),
+            scoped: database.pragmas.scoped_all(),
             recursive_triggers: database.pragmas.recursive_triggers(),
             legacy_alter_table: database.pragmas.legacy_alter_table(),
             max_page_count: database.storage.database.max_page_count(),
@@ -871,6 +873,7 @@ impl ConnectionSettings {
         database.pragmas.set_writable_schema(self.writable_schema);
         database.pragmas.set_query_only(self.query_only);
         database.pragmas.set_data_version(self.data_version);
+        database.pragmas.set_scoped_all(self.scoped);
         database
             .pragmas
             .set_recursive_triggers(self.recursive_triggers);
