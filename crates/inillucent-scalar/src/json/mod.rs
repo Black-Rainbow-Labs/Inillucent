@@ -23,7 +23,7 @@ use inillucent_base::DbResult;
 use inillucent_sql::function::JsonFunc;
 use inillucent_value::{numeric, Value};
 
-pub use node::Node;
+pub use node::{bytes_of_text, raw_len, text_of_bytes, Node};
 
 /// One argument, with the mark that says whether it is already JSON.
 #[derive(Clone, Copy, Debug)]
@@ -138,8 +138,8 @@ pub fn document(argument: &Argument<'_>) -> DbResult<Option<Node>> {
         Value::Blob(blob) => blob_document(blob.raw()).map(Some),
         Value::Text(text) => {
             let bytes = text.utf8_bytes();
-            let source = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
-            parse::parse(source)
+            let source = text_of_bytes(&bytes);
+            parse::parse(&source)
                 .map(|parsed| Some(parsed.node))
                 .map_err(|_| malformed())
         }
@@ -220,16 +220,16 @@ fn stored(argument: &Argument<'_>, raw: bool) -> DbResult<Node> {
         }
         Value::Text(text) => {
             let bytes = text.utf8_bytes();
-            let source = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
+            let source = text_of_bytes(&bytes);
             if argument.json {
-                return parse::parse(source)
+                return parse::parse(&source)
                     .map(|parsed| parsed.node)
                     .map_err(|_| malformed());
             }
             Ok(if raw {
-                Node::text_raw(source)
+                Node::text_raw(&source)
             } else {
-                Node::text_escaped(source)
+                Node::text_escaped(&source)
             })
         }
     }
@@ -240,9 +240,9 @@ fn answer(node: &Node, binary: bool) -> DbResult<Answer> {
     if binary {
         return Ok(Answer::marked(Value::owned_blob(&binary::to_blob(node))?));
     }
-    Ok(Answer::marked(Value::owned_text(
-        render::to_text(node).as_bytes(),
-    )?))
+    Ok(Answer::marked(Value::owned_text(&bytes_of_text(
+        &render::to_text(node),
+    ))?))
 }
 
 /// `json(X)` and `jsonb(X)`.
@@ -281,8 +281,8 @@ fn build_object(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
             return Err(failure("json_object() labels must be TEXT"));
         };
         let bytes = text.utf8_bytes();
-        let name = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
-        members.push((Node::text_escaped(name), stored(value, false)?));
+        let name = text_of_bytes(&bytes);
+        members.push((Node::text_escaped(&name), stored(value, false)?));
     }
     answer(&Node::Object(members), binary)
 }
@@ -349,10 +349,8 @@ fn error_position(arguments: &[Argument<'_>]) -> DbResult<Answer> {
         Value::Null => Ok(Answer::null()),
         Value::Text(text) => {
             let bytes = text.utf8_bytes();
-            let Ok(source) = std::str::from_utf8(&bytes) else {
-                return Ok(Answer::plain(Value::Integer(1)));
-            };
-            Ok(Answer::plain(Value::Integer(text_error_position(source))))
+            let source = text_of_bytes(&bytes);
+            Ok(Answer::plain(Value::Integer(text_error_position(&source))))
         }
         // **A blob that is not valid JSONB is read as text (bug hunt 10).** That
         // is what the document readers do, so the position is where the text
@@ -476,11 +474,11 @@ fn as_sql(node: &Node) -> DbResult<Answer> {
         },
         Node::Float(text) => Answer::plain(Value::Real(parse_real(text))),
         Node::Float5(text) => Answer::plain(Value::Real(parse_real(&render::float5_to_json(text)))),
-        Node::Text(_) | Node::TextJ(_) | Node::Text5(_) | Node::TextRaw(_) => {
-            Answer::plain(Value::owned_text(&render::unescape_bytes(node))?)
-        }
+        Node::Text(_) | Node::TextJ(_) | Node::Text5(_) | Node::TextRaw(_) => Answer::plain(
+            Value::owned_text(&held_bytes_restored(render::unescape_bytes(node)))?,
+        ),
         Node::Array(_) | Node::Object(_) => {
-            Answer::marked(Value::owned_text(render::to_text(node).as_bytes())?)
+            Answer::marked(Value::owned_text(&bytes_of_text(&render::to_text(node)))?)
         }
     })
 }
@@ -567,15 +565,8 @@ fn arrow(arguments: &[Argument<'_>], sql: bool) -> DbResult<Answer> {
         }
         Value::Text(text) => {
             let bytes = text.utf8_bytes();
-            let source = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
-            if source.starts_with('$') {
-                path::parse(source)?
-            } else if source.is_empty() {
-                // An empty right operand is neither a path nor a label.
-                return Err(path::bad_path(source));
-            } else {
-                path::parse(&abbreviated_path(source))?
-            }
+            let source = text_of_bytes(&bytes);
+            arrow_text_steps(&source)?
         }
         // **A real or a blob is read as the text it has, and then as a label**, because SQLite
         // takes the text of the right operand before it asks whether it is an integer. `x -> 1.5`
@@ -598,11 +589,39 @@ fn arrow(arguments: &[Argument<'_>], sql: bool) -> DbResult<Answer> {
             }
         }
     };
-    let Some(found) = path::lookup(&node, &steps)? else {
+    arrow_parsed(&node, &steps, sql)
+}
+
+/// Returns the steps a text right operand of `->` or `->>` stands for.
+///
+/// @param source - the operand: a path beginning with `$`, or a bare label or index
+pub fn arrow_text_steps(source: &str) -> DbResult<Vec<path::Step>> {
+    if source.starts_with('$') {
+        path::parse(source)
+    } else if source.is_empty() {
+        // An empty right operand is neither a path nor a label.
+        Err(path::bad_path(source))
+    } else {
+        path::parse(&abbreviated_path(source))
+    }
+}
+
+/// Answers `->` or `->>` from a document and a path that are already parsed.
+///
+/// @param node - the document, already parsed
+/// @param steps - the path, already parsed
+/// @param sql - true for `->>`, which answers a SQL value, and false for `->`, which answers JSON
+pub fn arrow_parsed(node: &Node, steps: &[path::Step], sql: bool) -> DbResult<Answer> {
+    let Some(found) = path::lookup(node, steps)? else {
         return Ok(Answer::null());
     };
     if sql {
-        return as_sql(found);
+        // **`->>` answers SQL text, so its answer is not JSON (the subtype is dropped).**
+        // `json_array('{"x":[1]}' ->> '$.x')` is `["[1]"]`: the extracted array arrives as a
+        // string. `json_extract` keeps the mark for a container and `->>` does not.
+        let mut plain = as_sql(found)?;
+        plain.json = false;
+        return Ok(plain);
     }
     answer(found, false)
 }
@@ -761,9 +780,10 @@ fn pretty(arguments: &[Argument<'_>]) -> DbResult<Answer> {
         }
         _ => "    ".to_string(),
     };
-    Ok(Answer::marked(Value::owned_text(
-        render::to_pretty(&node, &indent).as_bytes(),
-    )?))
+    // `json_pretty` answers plain text: SQLite does not set the JSON subtype on its result.
+    Ok(Answer::plain(Value::owned_text(&bytes_of_text(
+        &render::to_pretty(&node, &indent),
+    ))?))
 }
 
 /// `json_type(X)` and `json_type(X, P)`.
@@ -811,9 +831,16 @@ fn valid(arguments: &[Argument<'_>]) -> DbResult<Answer> {
         Value::Blob(blob) => valid_blob(blob.raw(), flags),
         Value::Text(text) => valid_text(&text.utf8_bytes(), flags),
         // A number is a document in either dialect.
-        // An infinite real is converted to the text `Inf`, which no dialect
-        // accepts: `json_valid(1e999)` is 0 in SQLite.
-        Value::Real(real) if real.is_infinite() => false,
+        // An infinite real is converted to the text `Inf` or `-Inf`, which only JSON5 accepts:
+        // `json_valid(1e999)` is 0 and `json_valid(1e999, 2)` is 1 in SQLite.
+        Value::Real(real) if real.is_infinite() => valid_text(
+            if *real < 0.0 {
+                &b"-Inf"[..]
+            } else {
+                &b"Inf"[..]
+            },
+            flags,
+        ),
         Value::Integer(_) | Value::Real(_) => flags & 3 != 0,
         Value::Null => false,
     };
@@ -871,10 +898,8 @@ fn leading_integer(bytes: &[u8]) -> i64 {
 /// @param bytes - the text
 /// @param flags - the validity flags, 1 to 15
 fn valid_text(bytes: &[u8], flags: i64) -> bool {
-    let Ok(source) = std::str::from_utf8(bytes) else {
-        return false;
-    };
-    match parse::parse(source) {
+    let source = text_of_bytes(bytes);
+    match parse::parse(&source) {
         Err(_) => false,
         Ok(parsed) if parsed.used_json5 => flags & 2 != 0,
         Ok(_) => flags & 3 != 0,
@@ -886,9 +911,17 @@ fn valid_text(bytes: &[u8], flags: i64) -> bool {
 /// @param bytes - the blob
 /// @param flags - the validity flags, 1 to 15
 fn valid_blob(bytes: &[u8], flags: i64) -> bool {
-    let strict = flags & 8 != 0 && binary::is_valid(bytes);
-    let shallow = flags & 4 != 0 && binary::read_header(bytes, 0).is_ok();
-    strict || shallow || valid_text(bytes, flags)
+    // **A blob that is taken to be JSONB is answered as JSONB and never as text.** Flag 4 asks only
+    // that it be taken to be JSONB, flag 8 that it pass the strict check, and a call with neither
+    // (`json_valid(jsonb('123'))`) answers 0. A blob that is not taken to be JSONB is read as text.
+    if binary::looks_like_jsonb(bytes) {
+        return if flags & 4 != 0 {
+            true
+        } else {
+            flags & 8 != 0 && binary::is_valid(bytes)
+        };
+    }
+    valid_text(bytes, flags)
 }
 
 /// The `value` of a `json_each` or `json_tree` row, with the JSON mark when
@@ -934,7 +967,7 @@ fn quote(arguments: &[Argument<'_>]) -> DbResult<Answer> {
         Value::Blob(blob) => unmarked_blob(blob.raw())?,
         Value::Text(text) => {
             let bytes = text.utf8_bytes();
-            Node::text_escaped(std::str::from_utf8(&bytes).map_err(|_| malformed())?)
+            Node::text_escaped(&text_of_bytes(&bytes))
         }
     };
     answer(&node, false)
@@ -953,6 +986,17 @@ fn unmarked_blob(blob: &[u8]) -> DbResult<Node> {
         return Err(failure("JSON cannot hold BLOB values"));
     }
     binary::from_blob(blob)
+}
+
+/// Turns the bytes of a text a document produced back into the bytes SQLite would write, when the
+/// text holds bytes that were not valid UTF-8.
+///
+/// @param bytes - the UTF-8 bytes of a text taken out of a document
+fn held_bytes_restored(bytes: Vec<u8>) -> Vec<u8> {
+    match std::str::from_utf8(&bytes) {
+        Ok(text) if text.as_bytes().contains(&0xf4) => bytes_of_text(text).into_owned(),
+        _ => bytes,
+    }
 }
 
 /// Folds one value into a `json_group_array` accumulator.
@@ -995,8 +1039,7 @@ pub fn group_object_step(
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
-    let name = String::from_utf8(bytes.get(..end).unwrap_or_default().to_vec())
-        .map_err(|_| malformed())?;
+    let name = text_of_bytes(bytes.get(..end).unwrap_or_default()).into_owned();
     members.push((Node::text_escaped(&name), stored(value, false)?));
     Ok(())
 }

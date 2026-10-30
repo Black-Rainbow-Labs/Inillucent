@@ -116,16 +116,18 @@ impl Module for JsonWalkModule {
 fn declaration() -> Declaration {
     Declaration {
         columns: vec![
+            // **No column has a declared type, as in SQLite.** `pragma_table_info('json_each')`
+            // answers an empty type for each of the ten, so no column has an affinity either.
             DeclaredColumn::visible("key"),
             DeclaredColumn::visible("value"),
-            DeclaredColumn::visible("type").typed("TEXT"),
+            DeclaredColumn::visible("type"),
             DeclaredColumn::visible("atom"),
-            DeclaredColumn::visible("id").typed("INT"),
-            DeclaredColumn::visible("parent").typed("INT"),
-            DeclaredColumn::visible("fullkey").typed("TEXT"),
-            DeclaredColumn::visible("path").typed("TEXT"),
-            DeclaredColumn::hidden("json").typed("JSON"),
-            DeclaredColumn::hidden("root").typed("TEXT"),
+            DeclaredColumn::visible("id"),
+            DeclaredColumn::visible("parent"),
+            DeclaredColumn::visible("fullkey"),
+            DeclaredColumn::visible("path"),
+            DeclaredColumn::hidden("json"),
+            DeclaredColumn::hidden("root"),
         ],
         without_rowid: false,
     }
@@ -169,7 +171,17 @@ impl VirtualTable for JsonWalkTable {
         // The argument order `filter` receives is the order they were claimed
         // in, and the document is always claimed first.
         info.index_number = i32::from(used_json) | (i32::from(used_root) << 1);
-        info.estimated_cost = if used_json { 1.0 } else { 1.0e99 };
+        // **A plan that leaves out an argument it was offered is priced out, as SQLite rejects it.**
+        // `FROM n, json_each('[[1],[2],[3]]', '$[' || n.i || ']')` offers the constant document
+        // as usable and the path, which reads `n`, as not usable on the first question. Answering
+        // that with a low cost made the engine take the plan with no path, which returns the
+        // whole document and then fails the path test, so the join had no rows.
+        let left_out = info.constraints.iter().any(|constraint| {
+            !constraint.usable
+                && constraint.op == super::ConstraintOp::Eq
+                && matches!(constraint.column as usize, JSON | ROOT)
+        });
+        info.estimated_cost = if used_json && !left_out { 1.0 } else { 1.0e99 };
         info.estimated_rows = 25;
         Ok(())
     }
@@ -261,7 +273,7 @@ impl VirtualCursor for JsonWalkCursor {
                 let Some((found, value_at, reported)) = locate(&tree, 0, &steps)? else {
                     return Ok(());
                 };
-                let (key, parent) = root_position(&text, &steps);
+                let (key, parent) = root_position(&tree, &text, reported);
                 (found, value_at, reported, text, key, parent)
             }
         };
@@ -314,8 +326,8 @@ impl VirtualCursor for JsonWalkCursor {
             }
             ID => Value::Integer(row.id),
             PARENT => row.parent.map_or(Value::Null, Value::Integer),
-            FULLKEY => Value::owned_text(row.fullkey.as_bytes())?,
-            PATH => Value::owned_text(row.path.as_bytes())?,
+            FULLKEY => Value::owned_text(&crate::json::bytes_of_text(&row.fullkey))?,
+            PATH => Value::owned_text(&crate::json::bytes_of_text(&row.path))?,
             JSON => self.given_json.clone(),
             ROOT => self.given_root.clone(),
             _ => Value::Null,
@@ -381,8 +393,10 @@ impl JsonWalkCursor {
 
 /// One child of a container, with everything the walk needs about it.
 struct Child<'tree> {
-    /// The label as text, for the path.
+    /// The label as text, for matching a path key and for the `key` column.
     label: Option<String>,
+    /// The label as it is stored, escapes included, which is what `fullkey` and `path` print.
+    stored: Option<&'tree str>,
     /// The index, for the path.
     index: Option<usize>,
     /// The child node.
@@ -400,7 +414,7 @@ impl Child<'_> {
     /// the way and reports none of their keys.
     fn key(&self) -> Option<Value<'static>> {
         match (&self.label, self.index) {
-            (Some(label), _) => Value::owned_text(label.as_bytes()).ok(),
+            (Some(label), _) => Value::owned_text(&crate::json::bytes_of_text(label)).ok(),
             (None, Some(index)) => Some(Value::Integer(index as i64)),
             _ => None,
         }
@@ -408,8 +422,8 @@ impl Child<'_> {
 
     /// Returns the path to this child.
     fn fullkey(&self, prefix: &str) -> String {
-        match (&self.label, self.index) {
-            (Some(label), _) => join_key(prefix, label),
+        match (self.stored, self.index) {
+            (Some(stored), _) => join_key(prefix, stored),
             (None, Some(index)) => format!("{prefix}[{index}]"),
             _ => prefix.to_string(),
         }
@@ -430,6 +444,7 @@ fn children(node: &Node, node_id: i64) -> Vec<Child<'_>> {
             for (index, item) in items.iter().enumerate() {
                 out.push(Child {
                     label: None,
+                    stored: None,
                     index: Some(index),
                     node: item,
                     id: cursor,
@@ -444,6 +459,7 @@ fn children(node: &Node, node_id: i64) -> Vec<Child<'_>> {
                 let value_at = cursor.saturating_add(encoded_length(label));
                 out.push(Child {
                     label: Some(name),
+                    stored: Some(stored_text(label)),
                     index: None,
                     node: value,
                     id: cursor,
@@ -498,10 +514,13 @@ fn locate_from<'tree>(
             .iter()
             .find(|child| child.label.as_deref() == Some(name.as_str())),
         path::Step::Index(index) => members.iter().find(|child| child.index == Some(*index)),
-        path::Step::FromEnd(back) => members
+        // `[#-1]` counts from the end of an array and means nothing against an object, which
+        // has no rows here: its members are not numbered.
+        path::Step::FromEnd(back) if matches!(node, Node::Array(_)) => members
             .len()
             .checked_sub(*back)
             .and_then(|index| members.get(index)),
+        path::Step::FromEnd(_) => None,
         path::Step::Append => None,
         path::Step::Malformed { array_only, text } => {
             return match !array_only || matches!(node, Node::Array(_)) {
@@ -543,7 +562,7 @@ fn payload_length(node: &Node) -> i64 {
         | Node::Text(text)
         | Node::TextJ(text)
         | Node::Text5(text)
-        | Node::TextRaw(text) => i64::try_from(text.len()).unwrap_or(0),
+        | Node::TextRaw(text) => i64::try_from(crate::json::raw_len(text)).unwrap_or(0),
     }
 }
 
@@ -560,46 +579,103 @@ fn text_of(value: &Value<'static>) -> String {
     }
 }
 
-/// Returns the key and the containing path of the element a root path names.
+/// Returns the key and the containing path of the element a root path names, as SQLite reports them.
 ///
-/// `json_tree(x, '$.a')` reports its first row with the key `a` and the path
-/// `$`, because the walk is inside the whole document rather than inside one
-/// that begins at `$.a`. With no root path there is no key and the path is the
-/// root itself.
-fn root_position(text: &str, steps: &[path::Step]) -> (Option<Value<'static>>, String) {
-    let Some(last) = steps.last() else {
+/// **SQLite derives both from the text of the root path, and they are odd.** `json_tree` cuts the
+/// path at the last `.` or `[` whose prefix names an element that begins exactly where the
+/// root element's row begins, which is only a container the root element is the first child of.
+/// For any other root element the path is `$` and the key is the whole of the path after `$.`:
+/// `json_tree('{"a":{"b":1,"c":2}}', '$.a.c')` has the key `a.c` and the path `$`, while
+/// `'$.a.b'` has the key `b` and the path `$.a`. A key written `[#-1]` has no number, and
+/// SQLite reads the text before `]` as an integer, which gives 0. With no root path, or `$`, the key
+/// is NULL and the path is `$`.
+///
+/// @param tree - the whole document
+/// @param text - the root path as it was written
+/// @param reported - the offset the walk reports for the root element
+fn root_position(tree: &Node, text: &str, reported: i64) -> (Option<Value<'static>>, String) {
+    if text.len() < 2 {
         return (None, "$".to_string());
+    }
+    let bytes = text.as_bytes();
+    let mut cut = bytes.len();
+    while cut > 1 {
+        cut -= 1;
+        if !matches!(bytes.get(cut), Some(b'[' | b'.')) {
+            continue;
+        }
+        let Some(Ok(steps)) = text.get(..cut).map(path::parse) else {
+            continue;
+        };
+        if let Ok(Some((found, at, _))) = locate(tree, 0, &steps) {
+            if at.saturating_add(header_length(found)) == reported {
+                break;
+            }
+        }
+    }
+    let rest = text.get(cut..).unwrap_or("");
+    let key = match rest.as_bytes() {
+        [] => None,
+        [b'[', ..] => Some(Value::Integer(leading_integer(rest.get(1..).unwrap_or("")))),
+        [_, b'"', ..] => rest
+            .get(2..rest.len().saturating_sub(1))
+            .and_then(|name| Value::owned_text(name.as_bytes()).ok()),
+        _ => rest
+            .get(1..)
+            .and_then(|name| Value::owned_text(name.as_bytes()).ok()),
     };
-    let key = match last {
-        path::Step::Key(name) => Value::owned_text(name.as_bytes()).ok(),
-        path::Step::Index(index) => Some(Value::Integer(*index as i64)),
-        path::Step::FromEnd(_) | path::Step::Append | path::Step::Malformed { .. } => None,
+    (key, text.get(..cut).unwrap_or("$").to_string())
+}
+
+/// Reads the integer a text starts with, or 0, the way SQLite's `sqlite3Atoi64` leaves it.
+///
+/// @param text - the text after the `[`
+fn leading_integer(text: &str) -> i64 {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
     };
-    // The containing path is the written path with its last step removed, which
-    // is a suffix trim rather than a re-render: the path was written by the
-    // caller and its spelling is what the answer repeats.
-    let cut = match last {
-        path::Step::Key(_) => text.rfind('.'),
-        _ => text.rfind('['),
-    };
-    let parent = match cut {
-        Some(0) | None => "$".to_string(),
-        Some(cut) => text.get(..cut).unwrap_or("$").to_string(),
-    };
-    (key, parent)
+    let end = digits
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(digits.len());
+    let value = digits
+        .get(..end)
+        .and_then(|run| run.parse::<i64>().ok())
+        .unwrap_or(0);
+    if negative {
+        -value
+    } else {
+        value
+    }
+}
+
+/// Returns a label as it is stored: the content of the text node, escapes included.
+///
+/// @param label - an object label, which is always one of the text kinds
+fn stored_text(label: &Node) -> &str {
+    match label {
+        Node::Text(text) | Node::TextJ(text) | Node::Text5(text) | Node::TextRaw(text) => text,
+        _ => "",
+    }
 }
 
 /// Returns the path to a member, quoting the label when it needs quoting.
-fn join_key(prefix: &str, name: &str) -> String {
-    let plain = !name.is_empty()
-        && name
+///
+/// SQLite quotes a label that is empty, does not begin with a letter, or holds anything but
+/// letters and digits, so `user_id` is quoted. The stored text is printed as it is, escapes and
+/// all, so a label written `a\"b` gives `."a\"b"`.
+///
+/// @param prefix - the path to the label's container
+/// @param stored - the label as it is stored
+fn join_key(prefix: &str, stored: &str) -> String {
+    let plain = stored.starts_with(|character: char| character.is_ascii_alphabetic())
+        && stored
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        && !name.starts_with(|character: char| character.is_ascii_digit());
+            .all(|character| character.is_ascii_alphanumeric());
     if plain {
-        format!("{prefix}.{name}")
+        format!("{prefix}.{stored}")
     } else {
-        format!("{prefix}.\"{name}\"")
+        format!("{prefix}.\"{stored}\"")
     }
 }
 

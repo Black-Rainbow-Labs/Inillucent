@@ -97,6 +97,73 @@ impl Node {
     }
 }
 
+/// The code point that stands for the byte 0x00 in text that is not valid UTF-8.
+///
+/// **SQLite copies bytes it cannot read as UTF-8 through a JSON document, and a `String` cannot
+/// hold them.** `json_array(CAST(x'ff' AS TEXT))` answers `["` followed by the byte 0xff and
+/// `"]`. Each such byte is held as one character of the last 128 code points of plane 16 (U+10FF80
+/// to U+10FFFF, private use and two noncharacters) and turned back into the byte where text leaves
+/// the JSON functions. The price is that a real character in that range, which no real text uses,
+/// reads as a byte on its way out.
+const RAW_BYTE_BASE: u32 = 0x10_FF00;
+
+/// Returns the text of a byte string, holding each byte that is not valid UTF-8 as one character.
+///
+/// Valid UTF-8 is returned as it is, borrowed. See [`bytes_of_text`] for the way back.
+///
+/// @param bytes - the bytes of a SQL text value
+pub fn text_of_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    let Err(first) = std::str::from_utf8(bytes) else {
+        // `from_utf8` just succeeded, so the lossy conversion borrows and changes nothing.
+        return String::from_utf8_lossy(bytes);
+    };
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    let mut failure = Some(first);
+    while let Some(error) = failure.take() {
+        let (good, bad) = rest.split_at(error.valid_up_to());
+        out.push_str(&String::from_utf8_lossy(good));
+        let skipped = error.error_len().unwrap_or(bad.len());
+        for byte in bad.iter().take(skipped) {
+            out.push(char::from_u32(RAW_BYTE_BASE + u32::from(*byte)).unwrap_or('\u{fffd}'));
+        }
+        rest = bad.get(skipped..).unwrap_or(&[]);
+        failure = std::str::from_utf8(rest).err();
+    }
+    out.push_str(&String::from_utf8_lossy(rest));
+    std::borrow::Cow::Owned(out)
+}
+
+/// Returns the bytes of a text, turning each held byte back into itself.
+///
+/// @param text - text that may hold bytes put there by [`text_of_bytes`]
+pub fn bytes_of_text(text: &str) -> std::borrow::Cow<'_, [u8]> {
+    // The held bytes begin 0xf4 0x8f in UTF-8, so a text without that byte has none.
+    if !text.as_bytes().contains(&0xf4) {
+        return std::borrow::Cow::Borrowed(text.as_bytes());
+    }
+    let mut out = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        let code = u32::from(character);
+        match code.checked_sub(RAW_BYTE_BASE) {
+            Some(byte) if (0x80..=0xff).contains(&byte) => out.push(byte as u8),
+            _ => out.extend_from_slice(character.encode_utf8(&mut [0u8; 4]).as_bytes()),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Returns how many bytes a text takes once its held bytes are turned back.
+///
+/// @param text - the text
+pub fn raw_len(text: &str) -> usize {
+    if text.as_bytes().contains(&0xf4) {
+        bytes_of_text(text).len()
+    } else {
+        text.len()
+    }
+}
+
 /// Returns whether a character can sit in a JSON string with no escape.
 fn needs_no_escape(character: char) -> bool {
     character != '"' && character != '\\' && character >= ' '

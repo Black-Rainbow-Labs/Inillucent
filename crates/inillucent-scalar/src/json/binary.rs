@@ -56,10 +56,10 @@ pub fn encode(node: &Node, out: &mut Vec<u8>) {
         Node::Int5(text) => payload(TYPE_INT5, text.as_bytes(), out),
         Node::Float(text) => payload(TYPE_FLOAT, text.as_bytes(), out),
         Node::Float5(text) => payload(TYPE_FLOAT5, text.as_bytes(), out),
-        Node::Text(text) => payload(TYPE_TEXT, text.as_bytes(), out),
-        Node::TextJ(text) => payload(TYPE_TEXTJ, text.as_bytes(), out),
-        Node::Text5(text) => payload(TYPE_TEXT5, text.as_bytes(), out),
-        Node::TextRaw(text) => payload(TYPE_TEXTRAW, text.as_bytes(), out),
+        Node::Text(text) => payload(TYPE_TEXT, &super::node::bytes_of_text(text), out),
+        Node::TextJ(text) => payload(TYPE_TEXTJ, &super::node::bytes_of_text(text), out),
+        Node::Text5(text) => payload(TYPE_TEXT5, &super::node::bytes_of_text(text), out),
+        Node::TextRaw(text) => payload(TYPE_TEXTRAW, &super::node::bytes_of_text(text), out),
         Node::Array(items) => {
             let mut body = Vec::new();
             for item in items {
@@ -97,7 +97,10 @@ pub fn encoded_len(node: &Node) -> usize {
         | Node::Text(text)
         | Node::TextJ(text)
         | Node::Text5(text)
-        | Node::TextRaw(text) => header_len(text.len()).saturating_add(text.len()),
+        | Node::TextRaw(text) => {
+            let length = super::node::raw_len(text);
+            header_len(length).saturating_add(length)
+        }
         Node::Array(items) => {
             let body: usize = items.iter().map(encoded_len).sum();
             header_len(body).saturating_add(body)
@@ -272,9 +275,299 @@ pub fn might_be_binary(blob: &[u8]) -> bool {
     !(header.kind <= TYPE_FALSE && header.payload_size > 0)
 }
 
-/// Reports whether a blob is a well-formed JSONB document.
+/// Reports whether a blob is a well-formed JSONB document, by SQLite's strict check.
+///
+/// **This is `jsonbValidityCheck`, and it is stricter than decoding.** A header that spends more
+/// bytes than it needs on the size (`x'c000'` is a `null` with a two byte header), a number with
+/// a character a number cannot hold, text with an unescaped quote and an object with an odd number
+/// of members are all refused. Decoding accepts the first of these.
+///
+/// @param blob - the blob
 pub fn is_valid(blob: &[u8]) -> bool {
-    from_blob(blob).is_ok()
+    let Some((header, payload)) = sized(blob, 0) else {
+        return false;
+    };
+    header.saturating_add(payload) == blob.len() && check(blob, 0, blob.len(), 1)
+}
+
+/// Reports whether a blob given to a JSON function is taken to be JSONB, as SQLite decides it.
+///
+/// This is `jsonArgIsJsonb`. The outer header must be one of the thirteen types, header and
+/// payload must cover the blob exactly, `null`, `true` and `false` must have no payload, and a blob
+/// of seven payload bytes or fewer that starts like JSON text (`{`, `[` or a digit) must also pass
+/// the strict check, because it may be text that was cast to a blob.
+///
+/// @param blob - the blob
+pub fn looks_like_jsonb(blob: &[u8]) -> bool {
+    let Some(first) = blob.first().copied() else {
+        return false;
+    };
+    let kind = first & 0x0f;
+    let Some((header, payload)) = sized(blob, 0) else {
+        return false;
+    };
+    kind <= TYPE_OBJECT
+        && header.saturating_add(payload) == blob.len()
+        && (kind > TYPE_FALSE || payload == 0)
+        && (payload > 7
+            || (first != 0x7b && first != 0x5b && !first.is_ascii_digit())
+            || is_valid(blob))
+}
+
+/// Returns the header size and the payload size of the element at an offset, or nothing when the
+/// header is cut off, an eight byte size is above four bytes, or the payload runs past the blob.
+///
+/// This is `jsonbPayloadSize`.
+///
+/// @param blob - the blob
+/// @param at - where the element begins
+fn sized(blob: &[u8], at: usize) -> Option<(usize, usize)> {
+    let first = *blob.get(at)?;
+    let marker = usize::from(first >> 4);
+    let byte = |offset: usize| {
+        blob.get(at.checked_add(offset)?)
+            .map(|value| usize::from(*value))
+    };
+    let (header, payload) = match marker {
+        0..=11 => (1, marker),
+        12 => (2, byte(1)?),
+        13 => (3, (byte(1)? << 8) + byte(2)?),
+        14 => (
+            5,
+            (byte(1)? << 24) + (byte(2)? << 16) + (byte(3)? << 8) + byte(4)?,
+        ),
+        _ => {
+            if byte(1)? != 0 || byte(2)? != 0 || byte(3)? != 0 || byte(4)? != 0 {
+                return None;
+            }
+            (
+                9,
+                (byte(5)? << 24) + (byte(6)? << 16) + (byte(7)? << 8) + byte(8)?,
+            )
+        }
+    };
+    (at.checked_add(header)?.checked_add(payload)? <= blob.len()).then_some((header, payload))
+}
+
+/// Checks one element and everything inside it, the way `jsonbValidityCheck` does.
+///
+/// @param blob - the blob
+/// @param at - where the element begins
+/// @param end - one past the last byte the element may use
+/// @param depth - how deep the element is nested
+fn check(blob: &[u8], at: usize, end: usize, depth: usize) -> bool {
+    if depth > 1000 {
+        return false;
+    }
+    let Some((header, payload)) = sized(blob, at) else {
+        return false;
+    };
+    if at + header + payload != end {
+        return false;
+    }
+    let kind = blob.get(at).map_or(255, |first| first & 0x0f);
+    let body = blob.get(at + header..end).unwrap_or(&[]);
+    match kind {
+        TYPE_NULL | TYPE_TRUE | TYPE_FALSE => header + payload == 1,
+        TYPE_INT => integer_is_valid(body),
+        TYPE_INT5 => hex_integer_is_valid(body),
+        TYPE_FLOAT | TYPE_FLOAT5 => float_is_valid(body, kind == TYPE_FLOAT),
+        TYPE_TEXT => body.iter().all(|byte| text_byte_is_plain(*byte)),
+        TYPE_TEXTJ | TYPE_TEXT5 => escaped_text_is_valid(body, kind == TYPE_TEXT5),
+        TYPE_TEXTRAW => true,
+        TYPE_ARRAY => children_are_valid(blob, at + header, end, depth, false),
+        TYPE_OBJECT => children_are_valid(blob, at + header, end, depth, true),
+        _ => false,
+    }
+}
+
+/// Checks the elements packed into a container's payload.
+///
+/// @param blob - the blob
+/// @param from - where the first child begins
+/// @param end - where the container ends
+/// @param depth - the container's depth
+/// @param object - whether the container is an object, whose odd children must be text labels
+fn children_are_valid(blob: &[u8], from: usize, end: usize, depth: usize, object: bool) -> bool {
+    let mut cursor = from;
+    let mut count = 0usize;
+    while cursor < end {
+        let Some((header, payload)) = sized(blob, cursor) else {
+            return false;
+        };
+        let next = cursor + header + payload;
+        if next > end {
+            return false;
+        }
+        if object && count % 2 == 0 {
+            let kind = blob.get(cursor).map_or(255, |first| first & 0x0f);
+            if !(TYPE_TEXT..=TYPE_TEXTRAW).contains(&kind) {
+                return false;
+            }
+        }
+        if !check(blob, cursor, next, depth + 1) {
+            return false;
+        }
+        count += 1;
+        cursor = next;
+    }
+    !(object && count % 2 == 1)
+}
+
+/// Reports whether a byte may sit in a JSON string with no escape.
+///
+/// @param byte - the byte
+fn text_byte_is_plain(byte: u8) -> bool {
+    (byte >= 0x20 && byte != b'"' && byte != b'\\') || byte == b'\''
+}
+
+/// Checks the payload of an integer element: an optional minus and digits.
+///
+/// @param body - the payload
+fn integer_is_valid(body: &[u8]) -> bool {
+    let digits = body.strip_prefix(b"-").unwrap_or(body);
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+/// Checks the payload of a JSON5 integer element: an optional minus, `0x` and hex digits.
+///
+/// @param body - the payload
+fn hex_integer_is_valid(body: &[u8]) -> bool {
+    let unsigned = body.strip_prefix(b"-").unwrap_or(body);
+    match unsigned {
+        [b'0', b'x' | b'X', digits @ ..] => {
+            !digits.is_empty() && digits.iter().all(u8::is_ascii_hexdigit)
+        }
+        _ => false,
+    }
+}
+
+/// Checks the payload of a float element.
+///
+/// @param body - the payload
+/// @param strict - true for the RFC-8259 type, which allows no leading or trailing point
+fn float_is_valid(body: &[u8], strict: bool) -> bool {
+    let size = body.len();
+    if size < 2 {
+        return false;
+    }
+    let mut at = 0usize;
+    if body.first() == Some(&b'-') {
+        if size < 3 {
+            return false;
+        }
+        at = 1;
+    }
+    let mut seen = 0u8;
+    if body.get(at) == Some(&b'.') {
+        if strict || !body.get(at + 1).is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+        at += 2;
+        seen = 1;
+    } else if body.get(at) == Some(&b'0') && strict {
+        if at + 3 > size {
+            return false;
+        }
+        if !matches!(body.get(at + 1), Some(b'.' | b'e' | b'E')) {
+            return false;
+        }
+        at += 1;
+    }
+    while at < size {
+        let byte = body.get(at).copied().unwrap_or(0);
+        if byte.is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        if byte == b'.' {
+            if seen > 0 {
+                return false;
+            }
+            if strict && (at + 1 == size || !body.get(at + 1).is_some_and(u8::is_ascii_digit)) {
+                return false;
+            }
+            seen = 1;
+            at += 1;
+            continue;
+        }
+        if byte == b'e' || byte == b'E' {
+            if seen == 2 || at + 1 == size {
+                return false;
+            }
+            if matches!(body.get(at + 1), Some(b'+' | b'-')) {
+                at += 1;
+                if at + 1 == size {
+                    return false;
+                }
+            }
+            seen = 2;
+            at += 1;
+            continue;
+        }
+        return false;
+    }
+    seen != 0
+}
+
+/// Checks the payload of a text element whose escapes are kept.
+///
+/// @param body - the payload
+/// @param json5 - true for the JSON5 type, which also allows control characters and its own escapes
+fn escaped_text_is_valid(body: &[u8], json5: bool) -> bool {
+    let size = body.len();
+    let mut at = 0usize;
+    while at < size {
+        let byte = body.get(at).copied().unwrap_or(0);
+        if !text_byte_is_plain(byte) {
+            if byte == b'"' || byte <= 0x1f {
+                if !json5 {
+                    return false;
+                }
+            } else if byte != b'\\' || at + 1 >= size {
+                return false;
+            } else {
+                let next = body.get(at + 1).copied().unwrap_or(0);
+                if b"\"\\/bfnrt".contains(&next) {
+                    at += 1;
+                } else if next == b'u' {
+                    let hex = body.get(at + 2..at + 6);
+                    if at + 5 >= size
+                        || !hex.is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+                    {
+                        return false;
+                    }
+                    at += 1;
+                } else if !json5 {
+                    return false;
+                } else {
+                    let length = json5_escape_length(body.get(at..).unwrap_or(&[]));
+                    if length == 0 {
+                        return false;
+                    }
+                    at += length - 1;
+                }
+            }
+        }
+        at += 1;
+    }
+    true
+}
+
+/// Returns how many bytes a JSON5 only escape takes, or 0 when it is not one.
+///
+/// @param rest - the text starting at the backslash
+fn json5_escape_length(rest: &[u8]) -> usize {
+    match rest {
+        [b'\\', b'\'' | b'v' | b'\n', ..] => 2,
+        [b'\\', b'0', next, ..] if !next.is_ascii_digit() => 2,
+        [b'\\', b'0'] => 2,
+        [b'\\', b'\r', b'\n', ..] => 3,
+        [b'\\', b'\r', ..] => 2,
+        [b'\\', b'x', a, b, ..] if a.is_ascii_hexdigit() && b.is_ascii_hexdigit() => 4,
+        [b'\\', 0xe2, 0x80, 0xa8 | 0xa9, ..] => 4,
+        _ => 0,
+    }
 }
 
 /// Decodes one element, returning it and the offset past it.
@@ -339,9 +632,9 @@ fn decode(blob: &[u8], at: usize, depth: usize) -> DbResult<(Node, usize)> {
     Ok((node, body_end))
 }
 
-/// Returns a payload as text, refusing bytes that are not UTF-8.
+/// Returns a payload as text, holding any byte that is not UTF-8 as the document tree does.
 fn text(body: &[u8]) -> DbResult<String> {
-    String::from_utf8(body.to_vec()).map_err(|_| malformed())
+    Ok(super::node::text_of_bytes(body).into_owned())
 }
 
 /// Returns the error every malformed document reports.

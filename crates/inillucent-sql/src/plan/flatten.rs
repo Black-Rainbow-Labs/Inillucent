@@ -432,15 +432,13 @@ fn inline(select: &mut BoundSelect, position: usize, in_compound: bool) {
     // so putting `json_object(...)` in place of the column a query read from
     // `(SELECT json_object(...) AS obj FROM foo)` handed `json_group_array(obj)`
     // the mark, and the array held objects where SQLite holds quoted strings.
-    // A unary plus is the identity on the value and is not a JSON call.
+    // `likely(x)` is the identity on the value and is not a JSON call. (A unary plus was used,
+    // until SQLite's own `+json(x)` was found to keep the mark.)
     let replacements: Vec<BoundExpr> = block
         .columns
         .iter()
         .map(|column| match &column.expr {
-            BoundExpr::Json { .. } => BoundExpr::Unary {
-                op: crate::ast::UnaryOp::Identity,
-                operand: Box::new(column.expr.clone()),
-            },
+            BoundExpr::Json { .. } => without_json_mark(column.expr.clone()),
             other => other.clone(),
         })
         .collect();
@@ -630,4 +628,19 @@ fn reads_through_an_automatic_index(select: &BoundSelect, source: &BoundSource) 
         };
         keyed(left, right) || keyed(right, left)
     })
+}
+
+/// Wraps a JSON call so that a JSON call reading it does not see its mark.
+///
+/// **The mark travels by a JSON call being the argument of another**, and SQLite drops it where a
+/// value crosses a derived table. `likely(x)` answers `x` and is none of the calls that hand a
+/// mark on.
+///
+/// @param expr - the JSON call
+pub(super) fn without_json_mark(expr: BoundExpr) -> BoundExpr {
+    BoundExpr::Function {
+        func: crate::function::ScalarFunc::Likelihood,
+        arguments: vec![expr],
+        collation: inillucent_value::Collation::Binary,
+    }
 }

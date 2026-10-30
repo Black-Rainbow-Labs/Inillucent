@@ -147,12 +147,83 @@ fn a_nested_json_each_does_not_copy_the_document_for_every_row() {
         &connection,
         "SELECT count(*) FROM s, json_each(s.j) e, json_each(e.value) t",
     );
-    assert_eq!(rows, 3 * ELEMENTS as i64, "each element is an object of three members");
+    assert_eq!(
+        rows,
+        3 * ELEMENTS as i64,
+        "each element is an object of three members"
+    );
     let allowed = size * 8 + ELEMENTS * BYTES_PER_CALL;
     assert!(
         bytes <= allowed,
         "the nested json_each over a {size} byte document allocated {bytes} bytes; the guard \
          asks for at most {allowed}, which is eight copies of the document and {BYTES_PER_CALL} \
          bytes for each of its {ELEMENTS} elements"
+    );
+}
+
+/// Builds a table of `rows` documents, each about 18 KB: an array of 300 small objects and a
+/// small object of four members.
+///
+/// @param connection - the connection to build the table on
+/// @param rows - how many documents to make
+fn build_documents(connection: &Connection<'_>, rows: u64) {
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, j);\
+             INSERT INTO d SELECT value, json_object('id', value, 'items', \
+             (SELECT json_group_array(json_object('sku', 'S' || x.value, 'qty', x.value)) \
+             FROM generate_series(1, 300) x), \
+             'meta', json_object('a', 1, 'b', 2, 'c', 3, 'd', 4)) FROM generate_series(1, {rows});"
+        ))
+        .expect("the documents are built");
+}
+
+/// Five `->>` calls over one document cost about what one costs, and one costs about what
+/// `json_extract` costs.
+///
+/// **What this is a regression test for.** Every JSON call kept a cache of its own, and `->` and
+/// `->>` kept none, so five calls on the same text parsed it five times and an arrow parsed the
+/// whole document into a tree where `json_extract` built only the part its path reads. 2,000
+/// documents of 18 KB took 861 ms for five `->>` calls, 237 ms for five `json_extract` calls and
+/// 172 ms for one `->>`, against 27 ms for the five in SQLite. The calls of a statement now share
+/// one parse of a document, and the arrows read through the same cache as `json_extract`.
+///
+/// Both guards are ratios of bytes allocated in the same run. Measured with 200 documents, one
+/// `->>` allocated 64,077,168 bytes before the fix, five `->>` 314,300,512 and five `json_extract`
+/// 4,329,172. After it all three allocate 3,292,716, which is the cost of reading the 200 rows.
+#[test]
+fn several_json_calls_over_one_document_parse_it_once() {
+    let directory = scratch("calls");
+    let database = Database::open(&directory.join("j.rdb")).expect("the database opens");
+    let connection = database.session();
+    build_documents(&connection, 200);
+    let one = "SELECT sum(j->>'$.meta.a') FROM d";
+    let five = "SELECT sum(j->>'$.meta.a' + j->>'$.meta.b' + j->>'$.meta.c' + j->>'$.meta.d' + j->>'$.id') FROM d";
+    let extract_five = "SELECT sum(json_extract(j, '$.meta.a') + json_extract(j, '$.meta.b') + \
+                        json_extract(j, '$.meta.c') + json_extract(j, '$.meta.d') + json_extract(j, '$.id')) FROM d";
+    // Each statement runs once first, so none pays for a plan the others already have.
+    for sql in [one, five, extract_five] {
+        counted(&connection, sql);
+    }
+    let (one_sum, one_bytes) = counted(&connection, one);
+    let (five_sum, five_bytes) = counted(&connection, five);
+    let (extract_sum, extract_bytes) = counted(&connection, extract_five);
+    assert_eq!(
+        one_sum, 200,
+        "the one member read is 1 in each of 200 documents"
+    );
+    assert_eq!(
+        five_sum, extract_sum,
+        "the arrows and json_extract read the same members"
+    );
+    assert!(
+        five_bytes <= one_bytes * 2,
+        "five ->> calls allocated {five_bytes} bytes and one allocated {one_bytes}; the guard \
+         asks for at most twice, because the five share one parse of each document"
+    );
+    assert!(
+        five_bytes <= extract_bytes * 2,
+        "five ->> calls allocated {five_bytes} bytes and five json_extract calls allocated \
+         {extract_bytes}; the guard asks for at most twice"
     );
 }

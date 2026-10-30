@@ -1354,8 +1354,39 @@ pub fn every_function() -> Vec<FunctionEntry> {
             flags: BUILTIN_FLAGS,
         });
     }
+    for entry in &mut out {
+        if let Some(flags) = json_function_flags(entry.name) {
+            entry.flags = flags;
+        }
+    }
     out.sort_by(|left, right| left.name.cmp(right.name).then(left.arity.cmp(&right.arity)));
     out
+}
+
+/// Returns the flag word SQLite reports in `function_list` for a JSON function, or nothing for
+/// any other name.
+///
+/// 2099200 is `SQLITE_DETERMINISTIC` with the bit `function_list` shows for a function that is
+/// not marked innocuous. The functions that read the subtype of an argument, or set the subtype of
+/// the answer, carry `SQLITE_SUBTYPE` as well, which makes 3147776.
+///
+/// @param name - the function's name
+fn json_function_flags(name: &str) -> Option<i64> {
+    const PLAIN: i64 = 2_099_200;
+    const SUBTYPE: i64 = 3_147_776;
+    let base = name
+        .strip_prefix("jsonb_")
+        .or_else(|| name.strip_prefix("json_"));
+    match (name, base) {
+        ("->" | "->>" | "json" | "jsonb", _) => Some(PLAIN),
+        (
+            _,
+            Some("array" | "array_insert" | "group_array" | "group_object" | "insert" | "object"),
+        )
+        | (_, Some("quote" | "replace" | "set")) => Some(SUBTYPE),
+        (_, Some(_)) => Some(PLAIN),
+        _ => None,
+    }
 }
 
 /// The deterministic scalars, with one row per overload.

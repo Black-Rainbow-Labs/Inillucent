@@ -454,15 +454,12 @@ fn replace_columns(expr: &mut BoundExpr, id: usize, block: &BoundSelect) -> bool
         if !pushable(&inner.expr, usize::MAX) {
             return false;
         }
-        // A JSON call stands behind a unary plus, so the pushed copy reads the
+        // A JSON call stands behind `likely()`, so the pushed copy reads the
         // column as the plain text the derived table hands out; see `inline`
         // in `flatten.rs`. Pushed bare, `WHERE NOT json_quote(c0)` over
         // `SELECT json(TRUE) AS c0` read the JSON mark and kept no row.
         *expr = match &inner.expr {
-            BoundExpr::Json { .. } => BoundExpr::Unary {
-                op: crate::ast::UnaryOp::Identity,
-                operand: Box::new(inner.expr.clone()),
-            },
+            BoundExpr::Json { .. } => super::flatten::without_json_mark(inner.expr.clone()),
             other => other.clone(),
         };
         *expr = with_derived_collation(std::mem::replace(expr, BoundExpr::Null), outer_collation);

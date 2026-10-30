@@ -549,10 +549,8 @@ pub fn emit_rows_after_prefix(
                     .collect(),
             );
         }
-        let mut columns: Vec<Vector<'_>> = prefix
-            .iter()
-            .map(|value| Vector::Const(*value))
-            .collect();
+        let mut columns: Vec<Vector<'_>> =
+            prefix.iter().map(|value| Vector::Const(*value)).collect();
         columns.extend(
             columns_owned
                 .iter()

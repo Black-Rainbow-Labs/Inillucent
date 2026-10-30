@@ -176,6 +176,16 @@ fn resolve_in_frame(expr: &BoundExpr, frame: Frame<'_>) -> DbResult<Option<Expr>
         }
         if let Some(position) = select.group_by.iter().position(|key| key == expr) {
             if !reads_from_extreme_row(select, expr) {
+                // **A key that is a JSON call keeps its JSON mark.** The key comes back as a
+                // plain column, so `json_array(json_object('k', b))` over `GROUP BY
+                // json_object('k', b)` quoted the object as a string. `json()` of the text the
+                // call produced is that text with the mark on it.
+                if inillucent_sql::bind::always_json(expr) {
+                    return Ok(Some(Expr::Json {
+                        func: inillucent_sql::function::JsonFunc::Json,
+                        arguments: vec![Expr::Column(position)],
+                    }));
+                }
                 return Ok(Some(Expr::Column(position)));
             }
         }

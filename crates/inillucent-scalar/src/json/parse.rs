@@ -58,6 +58,20 @@ pub fn parse(text: &str) -> Result<Parsed, ParseFailure> {
 /// @param text - the document
 /// @param steps - the path that will be looked up in the answer
 pub fn parse_pruned(text: &str, steps: &[Step]) -> Result<Parsed, ParseFailure> {
+    parse_pruned_set(text, &[steps])
+}
+
+/// Parses a whole document but builds only the parts a set of paths read.
+///
+/// **What several `json_extract` calls over one document need.** Each call reads a different
+/// path of the same text, so the document is parsed once for all of them: a member is kept when
+/// any path steps into it, and an element up to the highest index any path wants. The tree
+/// answers each path in the set exactly as [`parse`]'s tree does, and a path that is not in
+/// the set may find nothing there.
+///
+/// @param text - the document
+/// @param paths - the paths that will be looked up in the answer
+pub fn parse_pruned_set(text: &str, paths: &[&[Step]]) -> Result<Parsed, ParseFailure> {
     let mut parser = Parser {
         bytes: text.as_bytes(),
         at: 0,
@@ -72,7 +86,7 @@ pub fn parse_pruned(text: &str, steps: &[Step]) -> Result<Parsed, ParseFailure> 
     if parser.at == parser.bytes.len() {
         return Err(parser.fail_at(0));
     }
-    let node = parser.value_pruned(steps)?;
+    let node = parser.value_pruned(paths)?;
     parser.skip_space();
     // SQLite reads the text as a C string, so a zero byte after a complete value
     // ends the document and whatever follows it is never read (bug hunt 10).
@@ -179,8 +193,20 @@ impl Parser<'_> {
                 Some(b'/') if self.peek_at(1) == Some(b'/') => {
                     self.used_json5 = true;
                     self.at += 2;
-                    while !matches!(self.peek(), None | Some(b'\n')) {
+                    // **A line comment ends at a line feed, a carriage return or U+2028 and
+                    // U+2029**, and the terminator belongs to the comment, as in SQLite.
+                    while let Some(byte) = self.peek() {
+                        let separator = byte == 0xe2
+                            && self.peek_at(1) == Some(0x80)
+                            && matches!(self.peek_at(2), Some(0xa8 | 0xa9));
+                        if separator {
+                            self.at += 3;
+                            break;
+                        }
                         self.at += 1;
+                        if matches!(byte, b'\n' | b'\r') {
+                            break;
+                        }
                     }
                 }
                 Some(b'/') if self.peek_at(1) == Some(b'*') => {
@@ -216,21 +242,25 @@ impl Parser<'_> {
         }
     }
 
-    /// Parses one value, building only what a path will read; see [`parse_pruned`].
+    /// Parses one value, building only what a set of paths will read; see [`parse_pruned_set`].
     ///
-    /// @param steps - the rest of the path, at this value
-    fn value_pruned(&mut self, steps: &[Step]) -> Result<Node, ParseFailure> {
-        match (steps.split_first(), self.peek()) {
-            (None, _) => self.value(),
-            (Some((Step::Key(name), rest)), Some(b'{')) => self.object_pruned(name, rest),
-            (Some((Step::Index(index), rest)), Some(b'[')) => self.array_pruned(*index, rest),
+    /// @param paths - the rest of each path, at this value
+    fn value_pruned(&mut self, paths: &[&[Step]]) -> Result<Node, ParseFailure> {
+        // A path that ends here, or whose next step is not one this prunes by (from the end, the
+        // append position, a malformed step), needs the whole value.
+        let prunable = |path: &&[Step]| matches!(path.first(), Some(Step::Key(_) | Step::Index(_)));
+        if !paths.iter().all(prunable) {
+            return self.value();
+        }
+        match self.peek() {
+            Some(b'{') => self.object_pruned(paths),
+            Some(b'[') => self.array_pruned(paths),
             // A key or an index meeting a value it cannot step into: the
             // lookup answers nothing whatever the value is.
-            (Some((Step::Key(_) | Step::Index(_), _)), _) => {
+            _ => {
                 self.skip_value()?;
                 Ok(Node::Null)
             }
-            _ => self.value(),
         }
     }
 
@@ -243,14 +273,24 @@ impl Parser<'_> {
         read.map(|_| ())
     }
 
-    /// Parses an object, keeping only the first member whose label is `name`.
+    /// Parses an object, keeping only the first member for each key a path steps into.
     ///
-    /// @param name - the key the path steps into
-    /// @param rest - the path after it
-    fn object_pruned(&mut self, name: &str, rest: &[Step]) -> Result<Node, ParseFailure> {
+    /// @param paths - the paths, each starting with a step into this object
+    fn object_pruned(&mut self, paths: &[&[Step]]) -> Result<Node, ParseFailure> {
         if self.depth >= MAX_DEPTH {
             return Err(self.fail());
         }
+        // The keys wanted, each with what follows it in every path that names it.
+        let mut wanted: Vec<(&str, Vec<&[Step]>)> = Vec::new();
+        for path in paths {
+            if let Some((Step::Key(name), rest)) = path.split_first() {
+                match wanted.iter_mut().find(|(held, _)| *held == name.as_str()) {
+                    Some((_, rests)) => rests.push(rest),
+                    None => wanted.push((name.as_str(), vec![rest])),
+                }
+            }
+        }
+        let mut taken = vec![false; wanted.len()];
         self.at += 1;
         self.depth += 1;
         let mut members = Vec::new();
@@ -265,22 +305,20 @@ impl Parser<'_> {
                 break;
             }
             seen = true;
-            let label = match members.is_empty() {
-                true => self.label_if(name)?,
-                false => {
-                    self.skip_label()?;
-                    None
-                }
-            };
+            let label = self.label_if(&wanted, &taken)?;
             self.skip_space();
             if self.peek() != Some(b':') {
-                return Err(self.fail());
+                return Err(self.missing_colon());
             }
             self.at += 1;
             self.skip_space();
             match label {
-                Some(label) => {
-                    let value = self.value_pruned(rest)?;
+                Some((label, which)) => {
+                    if let Some(flag) = taken.get_mut(which) {
+                        *flag = true;
+                    }
+                    let rests = wanted.get(which).map(|(_, rests)| rests.as_slice());
+                    let value = self.value_pruned(rests.unwrap_or(&[]))?;
                     members.push((label, value));
                 }
                 None => self.skip_value()?,
@@ -308,15 +346,25 @@ impl Parser<'_> {
         read.map(|_| ())
     }
 
-    /// Reads one label and returns it when it spells `name`.
+    /// Reads one label and returns it, with which wanted key it spells, when it spells one that
+    /// no earlier member took.
     ///
     /// A label with no escape in it is its own spelling, so it is compared
     /// where it lies, with nothing allocated; only a label holding an escape
     /// is built and unescaped to be compared.
     ///
-    /// @param name - the key the path steps into
-    fn label_if(&mut self, name: &str) -> Result<Option<Node>, ParseFailure> {
+    /// @param wanted - the keys the paths step into, each with the rest of its paths
+    /// @param taken - which of them an earlier member already supplied
+    fn label_if(
+        &mut self,
+        wanted: &[(&str, Vec<&[Step]>)],
+        taken: &[bool],
+    ) -> Result<Option<(Node, usize)>, ParseFailure> {
         let start = self.at;
+        if taken.iter().all(|done| *done) {
+            self.skip_label()?;
+            return Ok(None);
+        }
         let was = self.skipping;
         self.skipping = true;
         let read = self.label();
@@ -327,26 +375,49 @@ impl Parser<'_> {
             true => (start.saturating_add(1), self.at.saturating_sub(1)),
             false => (start, self.at),
         };
+        let candidates = wanted
+            .iter()
+            .enumerate()
+            .filter(|(which, _)| !taken.get(*which).copied().unwrap_or(true));
         if matches!(kind, Node::Text(_)) || !quoted {
-            let spelled = self.bytes.get(from..to) == Some(name.as_bytes());
-            return Ok(spelled.then(|| Node::Text(name.to_string())));
+            for (which, (name, _)) in candidates {
+                if self.bytes.get(from..to) == Some(name.as_bytes()) {
+                    return Ok(Some((Node::Text((*name).to_string()), which)));
+                }
+            }
+            return Ok(None);
         }
         // An escape: read it again, kept, and compare what it denotes.
         let end = self.at;
         self.at = start;
         let label = self.label()?;
         self.at = end;
-        Ok(super::path::label_matches(&label, name).then_some(label))
+        for (which, (name, _)) in candidates {
+            if super::path::label_matches(&label, name) {
+                return Ok(Some((label, which)));
+            }
+        }
+        Ok(None)
     }
 
-    /// Parses an array, keeping the elements up to `wanted`, the earlier ones as `null`.
+    /// Parses an array, keeping the elements up to the highest index a path wants, the
+    /// unwanted ones before it as `null`.
     ///
-    /// @param wanted - the index the path steps into
-    /// @param rest - the path after it
-    fn array_pruned(&mut self, wanted: usize, rest: &[Step]) -> Result<Node, ParseFailure> {
+    /// @param paths - the paths, each starting with a step into this array
+    fn array_pruned(&mut self, paths: &[&[Step]]) -> Result<Node, ParseFailure> {
         if self.depth >= MAX_DEPTH {
             return Err(self.fail());
         }
+        let mut wanted: Vec<(usize, Vec<&[Step]>)> = Vec::new();
+        for path in paths {
+            if let Some((Step::Index(index), rest)) = path.split_first() {
+                match wanted.iter_mut().find(|(held, _)| held == index) {
+                    Some((_, rests)) => rests.push(rest),
+                    None => wanted.push((*index, vec![rest])),
+                }
+            }
+        }
+        let last = wanted.iter().map(|(index, _)| *index).max();
         self.at += 1;
         self.depth += 1;
         let mut items = Vec::new();
@@ -360,13 +431,16 @@ impl Parser<'_> {
                 self.at += 1;
                 break;
             }
-            if count == wanted {
-                let item = self.value_pruned(rest)?;
-                items.push(item);
-            } else {
-                self.skip_value()?;
-                if count < wanted {
-                    items.push(Node::Null);
+            match wanted.iter().find(|(index, _)| *index == count) {
+                Some((_, rests)) => {
+                    let item = self.value_pruned(rests)?;
+                    items.push(item);
+                }
+                None => {
+                    self.skip_value()?;
+                    if last.is_some_and(|last| count < last) {
+                        items.push(Node::Null);
+                    }
                 }
             }
             count = count.saturating_add(1);
@@ -408,6 +482,12 @@ impl Parser<'_> {
             // SQLite compares them without regard to case, so `json('inf')` is
             // `9e999` and `json('nan')` is `null`.
             Some(b'N' | b'n') if self.word_ignoring_case(b"nan") => {
+                self.used_json5 = true;
+                Ok(Node::Null)
+            }
+            Some(b'Q' | b'q' | b'S' | b's')
+                if self.word_ignoring_case(b"qnan") || self.word_ignoring_case(b"snan") =>
+            {
                 self.used_json5 = true;
                 Ok(Node::Null)
             }
@@ -485,7 +565,7 @@ impl Parser<'_> {
             let label = self.label()?;
             self.skip_space();
             if self.peek() != Some(b':') {
-                return Err(self.fail());
+                return Err(self.missing_colon());
             }
             self.at += 1;
             self.skip_space();
@@ -515,18 +595,114 @@ impl Parser<'_> {
                 self.used_json5 = true;
                 self.string(b'\'')
             }
-            Some(byte) if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
-                self.used_json5 = true;
-                let start = self.at;
-                while self.peek().is_some_and(|byte| {
-                    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
-                }) {
-                    self.at += 1;
-                }
-                let name = self.slice(start, self.at)?;
-                Ok(Node::text_escaped(&name))
-            }
+            _ if self.starts_bare_key() => self.bare_key(),
             _ => Err(self.fail()),
+        }
+    }
+
+    /// Reports whether the text at the cursor can be a JSON5 key written without quotes.
+    ///
+    /// **SQLite reads a key as a value first, and only a text value is a key.** `{null:1}`,
+    /// `{true:1}`, `{Infinity:1}` and `{NaN:1}` are refused because the key parses as a
+    /// `null`, boolean or number, and a word that merely begins with one of them (`nullx`) is a
+    /// key. A key may begin with a letter, `$`, `_`, a `\uXXXX` escape or any byte of a multi byte
+    /// character, so `{é:1}` is accepted.
+    fn starts_bare_key(&self) -> bool {
+        let Some(first) = self.peek() else {
+            return false;
+        };
+        let identifier = first.is_ascii_alphabetic()
+            || first == b'_'
+            || first == b'$'
+            || first >= 0x80
+            || self.unicode_escape_at(self.at) > 0;
+        identifier && !self.reads_as_a_value()
+    }
+
+    /// Reports whether the word at the cursor is `true`, `false`, `null` or a spelling of
+    /// infinity or not a number, ending where an identifier would not continue.
+    fn reads_as_a_value(&self) -> bool {
+        let rest = self.bytes.get(self.at..).unwrap_or(&[]);
+        let exact: [&[u8]; 3] = [b"true", b"false", b"null"];
+        let any_case: [&[u8]; 5] = [b"infinity", b"inf", b"nan", b"qnan", b"snan"];
+        let ends = |length: usize| {
+            !rest
+                .get(length)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        };
+        exact
+            .iter()
+            .any(|word| rest.starts_with(word) && ends(word.len()))
+            || any_case.iter().any(|word| {
+                rest.get(..word.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(word))
+                    && ends(word.len())
+            })
+    }
+
+    /// Returns 6 when a `\uXXXX` escape starts at `index`, and 0 otherwise.
+    ///
+    /// @param index - the byte offset to look at
+    fn unicode_escape_at(&self, index: usize) -> usize {
+        let matches = self.bytes.get(index) == Some(&b'\\')
+            && self.bytes.get(index + 1) == Some(&b'u')
+            && (2..6).all(|offset| {
+                self.bytes
+                    .get(index + offset)
+                    .is_some_and(u8::is_ascii_hexdigit)
+            });
+        if matches {
+            6
+        } else {
+            0
+        }
+    }
+
+    /// Parses a key written without quotes, which is JSON5 text.
+    ///
+    /// A `\uXXXX` escape in it makes the label the escaped kind, as SQLite stores it, and the
+    /// escape is kept as it was written. A byte that begins a Unicode space ends the key.
+    fn bare_key(&mut self) -> Result<Node, ParseFailure> {
+        self.used_json5 = true;
+        let start = self.at;
+        let mut escaped = false;
+        loop {
+            let escape = self.unicode_escape_at(self.at);
+            if escape > 0 {
+                escaped = true;
+                self.at += escape;
+                continue;
+            }
+            let continues = self.peek().is_some_and(|byte| {
+                byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
+            });
+            if !continues || (self.at > start && self.unicode_space_len() > 0) {
+                break;
+            }
+            self.at += 1;
+        }
+        let name = self.slice(start, self.at)?;
+        Ok(if escaped {
+            Node::TextJ(name)
+        } else {
+            Node::Text(name)
+        })
+    }
+
+    /// Returns the failure for an object label that no colon follows.
+    ///
+    /// **SQLite tries to read a value where the colon should be**, and when that value is itself
+    /// malformed it reports the position of the malformation, not of the missing colon:
+    /// `{"a"":1}` fails at 9, inside the string that starts at the second quote, while `{"a" 1}`
+    /// fails at 6, where the value begins.
+    fn missing_colon(&mut self) -> ParseFailure {
+        let at = self.at;
+        if matches!(self.peek(), None | Some(b'}' | b']' | b',')) {
+            return self.fail();
+        }
+        match self.value() {
+            Err(inside) => inside,
+            Ok(_) => self.fail_at(at),
         }
     }
 
@@ -600,6 +776,10 @@ impl Parser<'_> {
             if byte == quote {
                 break;
             }
+            // SQLite reads the text as a C string, so a zero byte inside a string is an error.
+            if byte == 0 {
+                return Err(self.fail());
+            }
             if byte == b'"' {
                 // A double quote inside a JSON5 single-quoted string has to be
                 // escaped on the way out, so the content is not plain text.
@@ -626,10 +806,12 @@ impl Parser<'_> {
             match escape {
                 b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.at += 1,
                 b'u' => {
+                    // A bad escape is reported at its letter, not at the digit that was missing.
+                    let letter = self.at;
                     self.at += 1;
                     for _ in 0..4 {
                         if !self.peek().is_some_and(|byte| byte.is_ascii_hexdigit()) {
-                            return Err(self.fail());
+                            return Err(self.fail_at(letter));
                         }
                         self.at += 1;
                     }
@@ -647,10 +829,11 @@ impl Parser<'_> {
                 }
                 b'x' => {
                     needs_json5 = true;
+                    let letter = self.at;
                     self.at += 1;
                     for _ in 0..2 {
                         if !self.peek().is_some_and(|byte| byte.is_ascii_hexdigit()) {
-                            return Err(self.fail());
+                            return Err(self.fail_at(letter));
                         }
                         self.at += 1;
                     }
@@ -674,8 +857,11 @@ impl Parser<'_> {
     fn number(&mut self) -> Result<Node, ParseFailure> {
         let start = self.at;
         let mut json5 = false;
-        if matches!(self.peek(), Some(b'+')) {
-            json5 = true;
+        // **A leading `+` is JSON5 and is not stored.** SQLite writes `+1` as the integer `1`,
+        // so `jsonb('+1')` is the two bytes 1331 and the offsets after it are one byte smaller.
+        let plus = matches!(self.peek(), Some(b'+'));
+        if plus {
+            self.used_json5 = true;
             self.at += 1;
         } else if matches!(self.peek(), Some(b'-')) {
             self.at += 1;
@@ -706,7 +892,7 @@ impl Parser<'_> {
                 return Err(self.fail_at(digits.saturating_sub(1)));
             }
             self.used_json5 = true;
-            return Ok(Node::Int5(self.slice(start, self.at)?));
+            return Ok(Node::Int5(self.slice(start + usize::from(plus), self.at)?));
         }
         let mut is_float = false;
         let integer_digits = self.digits();
@@ -747,7 +933,7 @@ impl Parser<'_> {
                 return Err(self.fail_at(marked));
             }
         }
-        let text = self.slice(start, self.at)?;
+        let text = self.slice(start + usize::from(plus), self.at)?;
         if json5 {
             self.used_json5 = true;
         }

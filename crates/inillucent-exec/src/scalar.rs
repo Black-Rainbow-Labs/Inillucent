@@ -150,8 +150,27 @@ pub struct ScalarCall {
 }
 
 impl Eval for ScalarCall {
+    fn json_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<(Computed<'p>, bool)> {
+        if let Some(answer) = self.lazy_json_value(batch, nth)? {
+            return Ok(answer);
+        }
+        let answer = self.value(batch, nth)?;
+        if !self.hands_on_an_argument() || answer.get().is_null() {
+            return Ok((answer, false));
+        }
+        // `nullif`, `min` and `max` answer one of their arguments, and the answer carries that
+        // argument's mark. The argument is the first one that holds the answer's value.
+        for argument in &self.arguments {
+            let (candidate, marked) = argument.json_value(batch, nth)?;
+            if OwnedDatum::from_datum(&candidate.get()) == OwnedDatum::from_datum(&answer.get()) {
+                return Ok((answer, marked));
+            }
+        }
+        Ok((answer, false))
+    }
+
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
-        if let Some(answer) = self.lazy_value(batch, nth)? {
+        if let Some((answer, _)) = self.lazy_json_value(batch, nth)? {
             return Ok(answer);
         }
         let values = arguments_of(&self.arguments, batch, nth)?;
@@ -356,16 +375,21 @@ impl ScalarCall {
     ///
     /// @param batch - the batch being evaluated
     /// @param nth - the row's position among the live rows
-    fn lazy_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Option<Computed<'p>>> {
+    fn lazy_json_value<'p>(
+        &self,
+        batch: &Batch<'p>,
+        nth: usize,
+    ) -> DbResult<Option<(Computed<'p>, bool)>> {
+        let null = || (Computed::Owned(OwnedDatum::Null), false);
         match self.func {
             ScalarFunc::Coalesce | ScalarFunc::UsingCoalesce | ScalarFunc::IfNull => {
                 for argument in &self.arguments {
-                    let value = argument.value(batch, nth)?;
+                    let (value, marked) = argument.json_value(batch, nth)?;
                     if !value.get().is_null() {
-                        return Ok(Some(value));
+                        return Ok(Some((value, marked)));
                     }
                 }
-                Ok(Some(Computed::Owned(OwnedDatum::Null)))
+                Ok(Some(null()))
             }
             ScalarFunc::Iif => {
                 let mut at = 0usize;
@@ -376,18 +400,29 @@ impl ScalarCall {
                     let verdict = condition.value(batch, nth)?;
                     if crate::expr::truth(&verdict.get()) == Some(true) {
                         return match self.arguments.get(at.saturating_add(1)) {
-                            Some(answer) => answer.value(batch, nth).map(Some),
-                            None => Ok(Some(Computed::Owned(OwnedDatum::Null))),
+                            Some(answer) => answer.json_value(batch, nth).map(Some),
+                            None => Ok(Some(null())),
                         };
                     }
                     at = at.saturating_add(2);
                 }
                 match self.arguments.get(at) {
-                    Some(otherwise) => otherwise.value(batch, nth).map(Some),
-                    None => Ok(Some(Computed::Owned(OwnedDatum::Null))),
+                    Some(otherwise) => otherwise.json_value(batch, nth).map(Some),
+                    None => Ok(Some(null())),
                 }
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Reports whether the function's answer is one of its arguments, unchanged.
+    ///
+    /// `min` and `max` with one argument are the aggregates and answer a value of their own.
+    fn hands_on_an_argument(&self) -> bool {
+        match self.func {
+            ScalarFunc::NullIf => true,
+            ScalarFunc::Min | ScalarFunc::Max => self.arguments.len() > 1,
+            _ => false,
         }
     }
 
@@ -456,6 +491,13 @@ pub struct JsonCall {
     arguments: Vec<JsonOperand>,
     /// The last document seen, and its binary form.
     cached: std::sync::Mutex<Option<(Vec<u8>, Vec<u8>)>>,
+    /// The last document seen that is not in `cached`.
+    ///
+    /// **A document is converted to JSONB the second time it is seen, not the first.** A column of
+    /// different documents never repeats, and converting each one parsed it, encoded it and then
+    /// decoded the blob again inside the function, which made `json_insert(j, '$[#]', 5)` over a
+    /// 588 KB array spend most of its 11 ms on work no call would reuse.
+    pending: std::sync::Mutex<Option<Vec<u8>>>,
     /// The last document and path seen, and what they parsed to.
     ///
     /// **A second cache rather than a bigger one, because it answers a
@@ -511,6 +553,45 @@ struct ExtractCache {
 /// How many misses in a row stop the cache keeping documents.
 const EXTRACT_MISSES_BEFORE_PASSING: u32 = 4;
 
+/// Which of the one document, one path JSON functions a call is, for the cached reading.
+#[derive(Clone, Copy)]
+enum Reading {
+    /// `json_extract` and `jsonb_extract`.
+    Extract {
+        /// True for `jsonb_extract`.
+        binary: bool,
+    },
+    /// `->` and `->>`.
+    Arrow {
+        /// True for `->>`.
+        sql: bool,
+    },
+}
+
+impl Reading {
+    /// Parses the path text this function reads: a path for `json_extract`, and a path, a label or
+    /// an index for the arrows.
+    ///
+    /// @param text - the right operand
+    fn steps_of(self, text: &str) -> DbResult<Vec<json::path::Step>> {
+        match self {
+            Reading::Extract { .. } => json::path::parse(text),
+            Reading::Arrow { .. } => json::arrow_text_steps(text),
+        }
+    }
+
+    /// Answers the call from a document and a path that are already parsed.
+    ///
+    /// @param node - the document
+    /// @param steps - the path
+    fn finish(self, node: &json::Node, steps: &[json::path::Step]) -> DbResult<json::Answer> {
+        match self {
+            Reading::Extract { binary } => json::extract_parsed(node, steps, binary),
+            Reading::Arrow { sql } => json::arrow_parsed(node, steps, sql),
+        }
+    }
+}
+
 /// One argument of a JSON call.
 enum JsonOperand {
     /// Another JSON call, whose answer carries its own subtype.
@@ -529,6 +610,7 @@ impl JsonCall {
             func,
             arguments,
             cached: std::sync::Mutex::new(None),
+            pending: std::sync::Mutex::new(None),
             extract: std::sync::Mutex::new(ExtractCache::default()),
             constant: None,
             literal_steps: None,
@@ -545,14 +627,27 @@ impl JsonCall {
         let Value::Text(text) = first else {
             return None;
         };
-        let source = text.utf8_bytes().into_owned();
+        let source = text.utf8_bytes();
         if let Ok(held) = self.cached.lock() {
             if let Some((seen, blob)) = held.as_ref() {
-                if *seen == source {
+                if seen.as_slice() == &*source {
                     return Value::owned_blob(blob).ok();
                 }
             }
         }
+        // Seen once before: worth converting. Seen for the first time: remembered and left as text.
+        let repeated = self
+            .pending
+            .lock()
+            .ok()
+            .is_some_and(|held| held.as_deref() == Some(&*source));
+        if !repeated {
+            if let Ok(mut held) = self.pending.lock() {
+                *held = Some(source.to_vec());
+            }
+            return None;
+        }
+        let source = source.into_owned();
         let node = json::document(&json::Argument::plain(first)).ok()??;
         let mut blob = Vec::new();
         json::binary::encode(&node, &mut blob);
@@ -584,9 +679,14 @@ impl JsonCall {
     /// @param batch - the batch being evaluated
     /// @param nth - the position among the batch's live rows
     fn extract_cached(&self, batch: &Batch<'_>, nth: usize) -> DbResult<Option<json::Answer>> {
-        let binary = match self.func {
-            JsonFunc::Extract => false,
-            JsonFunc::ExtractB => true,
+        // **`->` and `->>` take the same road as `json_extract`.** They read one document and one
+        // path, and were parsed afresh by every call: five `->>` calls over a document of 18 KB took
+        // 861 ms for 2,000 rows where five `json_extract` calls took 237 ms.
+        let how = match self.func {
+            JsonFunc::Extract => Reading::Extract { binary: false },
+            JsonFunc::ExtractB => Reading::Extract { binary: true },
+            JsonFunc::Arrow => Reading::Arrow { sql: false },
+            JsonFunc::ArrowShift => Reading::Arrow { sql: true },
             _ => return Ok(None),
         };
         let (Some(JsonOperand::Plain(left)), Some(JsonOperand::Plain(right))) =
@@ -625,10 +725,23 @@ impl JsonCall {
                 // **A path that does not parse is reported by the general path, not here.**
                 // SQLite reads the document first, so `json_extract('abc', 'x')` is
                 // `malformed JSON` and only a valid document reports `bad JSON path`.
-                let Ok(steps) = json::path::parse(text) else {
+                let Ok(steps) = how.steps_of(text) else {
                     return Ok(None);
                 };
                 held.steps = Some((path.to_vec(), steps));
+            }
+        }
+        let Some(steps) = self.steps_of(&held) else {
+            return Ok(None);
+        };
+        // **A document read by several calls is parsed once for all of them.** The calls of one
+        // statement that read the same text with different paths share one parse, which keeps
+        // every member any of them names. `None` while only one path is in use.
+        if !blob {
+            if let Some(answer) =
+                crate::json_share::answer_shared(document, steps, |node| how.finish(node, steps))?
+            {
+                return Ok(Some(answer));
             }
         }
         if held.document.as_ref().map(|(seen, _)| seen.as_slice()) == Some(document) {
@@ -640,8 +753,9 @@ impl JsonCall {
         // repeating finds the cache again.
         if held.misses >= EXTRACT_MISSES_BEFORE_PASSING && held.misses % 64 != 0 && !blob {
             // Parsed from the bytes where they lie, answered, and dropped.
+            // Text that is not valid UTF-8 is read by the general path, which holds its bytes.
             let Ok(text) = std::str::from_utf8(document) else {
-                return Err(json::malformed());
+                return Ok(None);
             };
             let Some(steps) = self.steps_of(&held) else {
                 return Ok(None);
@@ -650,7 +764,7 @@ impl JsonCall {
             let node = json::parse::parse_pruned(text, steps)
                 .map_err(|_| json::malformed())?
                 .node;
-            return Ok(Some(json::extract_parsed(&node, steps, binary)?));
+            return Ok(Some(how.finish(&node, steps)?));
         }
         if held.document.as_ref().map(|(seen, _)| seen.as_slice()) != Some(document) {
             let owned = if blob {
@@ -676,7 +790,7 @@ impl JsonCall {
         let (Some((_, node)), Some(steps)) = (held.document.as_ref(), self.steps_of(&held)) else {
             return Ok(None);
         };
-        Ok(Some(json::extract_parsed(node, steps, binary)?))
+        Ok(Some(how.finish(node, steps)?))
     }
 
     /// Returns the path's steps: the literal's, parsed at compile time, or the
@@ -729,9 +843,13 @@ impl JsonCall {
                     values.push(answer.value);
                     marks.push(answer.json);
                 }
+                // **A plain operand may still carry the mark**: `coalesce`, `CASE`, `iif`, `nullif` and
+                // the two argument `min` and `max` hand on one of their arguments, and SQLite keeps
+                // that argument's subtype. Every other expression answers no.
                 JsonOperand::Plain(eval) => {
-                    values.push(Value::from(&eval.value(batch, nth)?.get()).into_owned()?);
-                    marks.push(false);
+                    let (value, marked) = eval.json_value(batch, nth)?;
+                    values.push(Value::from(&value.get()).into_owned()?);
+                    marks.push(marked);
                 }
             }
         }
@@ -838,13 +956,21 @@ pub fn compile_json(
 /// @param func - which JSON function
 /// @param arguments - the call's argument expressions
 fn literal_path(func: JsonFunc, arguments: &[crate::expr::Expr]) -> Option<Vec<json::path::Step>> {
-    if !matches!(func, JsonFunc::Extract | JsonFunc::ExtractB) || arguments.len() != 2 {
+    if !matches!(
+        func,
+        JsonFunc::Extract | JsonFunc::ExtractB | JsonFunc::Arrow | JsonFunc::ArrowShift
+    ) || arguments.len() != 2
+    {
         return None;
     }
     let Some(crate::expr::Expr::Literal(OwnedDatum::Text(path))) = arguments.get(1) else {
         return None;
     };
-    json::path::parse(std::str::from_utf8(path).ok()?).ok()
+    let text = std::str::from_utf8(path).ok()?;
+    match func {
+        JsonFunc::Extract | JsonFunc::ExtractB => json::path::parse(text).ok(),
+        _ => json::arrow_text_steps(text).ok(),
+    }
 }
 
 /// Reports whether every argument of a JSON call is a literal or a JSON call of literals.
@@ -1067,6 +1193,14 @@ pub struct Unary {
 }
 
 impl Eval for Unary {
+    /// Unary plus hands its operand back, so the operand keeps its JSON mark, as in SQLite.
+    fn json_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<(Computed<'p>, bool)> {
+        match self.op {
+            UnaryOp::Identity => self.operand.json_value(batch, nth),
+            _ => Ok((self.value(batch, nth)?, false)),
+        }
+    }
+
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
         let operand = self.operand.value(batch, nth)?;
         let value = Value::from(&operand.get()).into_owned()?;
@@ -1091,6 +1225,24 @@ pub struct Cast {
 }
 
 impl Eval for Cast {
+    /// A cast to text of a value that is already text changes nothing, so it keeps the JSON mark.
+    ///
+    /// SQLite leaves the subtype in place when the cast has no work to do:
+    /// `json_array(CAST(json('[1]') AS TEXT))` is `[[1]]`. A cast to any other type builds a
+    /// new value, which has none.
+    fn json_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<(Computed<'p>, bool)> {
+        let (operand, marked) = self.operand.json_value(batch, nth)?;
+        let keeps =
+            marked && self.affinity == Affinity::Text && matches!(operand.get(), Datum::Text(_));
+        if keeps {
+            return Ok((operand, true));
+        }
+        let value = Value::from(&operand.get()).into_owned()?;
+        let answer = cast::cast_value(value, self.affinity, ENCODING)
+            .map_err(|_| misuse("a cast could not be evaluated"))?;
+        Ok((Computed::Owned(OwnedDatum::from(answer)), false))
+    }
+
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
         let operand = self.operand.value(batch, nth)?;
         let value = Value::from(&operand.get()).into_owned()?;
@@ -1256,6 +1408,11 @@ pub struct Case {
 
 impl Eval for Case {
     fn value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<Computed<'p>> {
+        self.json_value(batch, nth).map(|(answer, _)| answer)
+    }
+
+    /// Answers the chosen arm and the JSON mark that arm carries, which SQLite keeps.
+    fn json_value<'p>(&self, batch: &Batch<'p>, nth: usize) -> DbResult<(Computed<'p>, bool)> {
         let base = match &self.operand {
             Some(operand) => Some(Value::from(&operand.value(batch, nth)?.get()).into_owned()?),
             None => None,
@@ -1286,12 +1443,12 @@ impl Eval for Case {
                 }
             };
             if matched {
-                return then.value(batch, nth);
+                return then.json_value(batch, nth);
             }
         }
         match &self.otherwise {
-            Some(otherwise) => otherwise.value(batch, nth),
-            None => Ok(Computed::Borrowed(Datum::Null)),
+            Some(otherwise) => otherwise.json_value(batch, nth),
+            None => Ok((Computed::Borrowed(Datum::Null), false)),
         }
     }
 }

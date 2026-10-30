@@ -169,7 +169,11 @@ fn read_index(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Opti
         characters.next();
         if characters.peek() == Some(&'-') {
             characters.next();
-            Step::FromEnd(read_number(characters)?)
+            // `[#-0]` is the position `[#]` names, which an edit appends to.
+            match read_number(characters)? {
+                0 => Step::Append,
+                back => Step::FromEnd(back),
+            }
         } else {
             Step::Append
         }
@@ -188,7 +192,9 @@ fn read_number(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Opt
         .and_then(|character| character.to_digit(10))
     {
         characters.next();
-        value = value.checked_mul(10)?.checked_add(digit as usize)?;
+        // A number too large for an index saturates, so the path names an element that is not
+        // there and the lookup answers NULL. SQLite stops adding at 2^32 for the same reason.
+        value = value.saturating_mul(10).saturating_add(digit as usize);
         digits += 1;
     }
     (digits > 0).then_some(value)
@@ -284,21 +290,32 @@ impl Edit {
     }
 }
 
-/// Applies one edit to a document in place.
+/// Applies one edit to a document in place, and says whether the value was written.
 ///
 /// A path that does not apply - `$[0]` into an object, `$.a.b` where `a` is a
 /// number - changes nothing and is not an error, which is what makes
 /// `json_set` safe to run over a column whose rows are not all the same shape.
-pub fn apply(node: &mut Node, steps: &[Step], value: Node, edit: Edit) -> DbResult<()> {
+///
+/// **A container is added only when the whole rest of the path can be built under it.**
+/// `json_set('{}', '$.a.b[1]', 1)` is `{}` in SQLite: `b` would be an array with no element 0, so
+/// nothing is created. The answer `false` is what lets a caller drop the empty container it made
+/// for the walk, where it used to keep `{"a":{}}`.
+///
+/// @param node - the document, edited in place
+/// @param steps - the path
+/// @param value - what to write
+/// @param edit - which of the three operations this is
+pub fn apply(node: &mut Node, steps: &[Step], value: Node, edit: Edit) -> DbResult<bool> {
     let Some((step, rest)) = steps.split_first() else {
         if edit.overwrites() {
             *node = value;
+            return Ok(true);
         }
-        return Ok(());
+        return Ok(false);
     };
     match (step, node) {
         (Step::Malformed { array_only, text }, held) => {
-            reached_malformed::<()>(*array_only, text, held).map(|_| ())
+            reached_malformed::<()>(*array_only, text, held).map(|_| false)
         }
         (Step::Key(name), Node::Object(members)) => {
             if let Some(position) = members
@@ -306,56 +323,66 @@ pub fn apply(node: &mut Node, steps: &[Step], value: Node, edit: Edit) -> DbResu
                 .position(|(label, _)| label_matches(label, name))
             {
                 let Some((_, existing)) = members.get_mut(position) else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 return apply(existing, rest, value, edit);
             }
             if !edit.creates() {
-                return Ok(());
+                return Ok(false);
             }
-            let Some(mut fresh) = seed(rest) else {
-                return Ok(());
+            let Some(fresh) = grow(rest, value)? else {
+                return Ok(false);
             };
-            apply(&mut fresh, rest, value, Edit::Set)?;
             members.push((Node::text_raw(name), fresh));
-            Ok(())
+            Ok(true)
         }
         (Step::Index(index), Node::Array(items)) => {
             if let Some(existing) = items.get_mut(*index) {
                 return apply(existing, rest, value, edit);
             }
             if !edit.creates() || *index != items.len() {
-                return Ok(());
+                return Ok(false);
             }
-            let Some(mut fresh) = seed(rest) else {
-                return Ok(());
+            let Some(fresh) = grow(rest, value)? else {
+                return Ok(false);
             };
-            apply(&mut fresh, rest, value, Edit::Set)?;
             items.push(fresh);
-            Ok(())
+            Ok(true)
         }
         (Step::FromEnd(back), Node::Array(items)) => {
             let Some(index) = items.len().checked_sub(*back) else {
-                return Ok(());
+                return Ok(false);
             };
             let Some(existing) = items.get_mut(index) else {
-                return Ok(());
+                return Ok(false);
             };
             apply(existing, rest, value, edit)
         }
         (Step::Append, Node::Array(items)) => {
             if !edit.creates() {
-                return Ok(());
+                return Ok(false);
             }
-            let Some(mut fresh) = seed(rest) else {
-                return Ok(());
+            let Some(fresh) = grow(rest, value)? else {
+                return Ok(false);
             };
-            apply(&mut fresh, rest, value, Edit::Set)?;
             items.push(fresh);
-            Ok(())
+            Ok(true)
         }
-        _ => Ok(()),
+        _ => Ok(false),
     }
+}
+
+/// Builds the new element for a missing step, with the value written at the end of the path.
+///
+/// `None` when the rest of the path cannot be built, so the caller adds nothing.
+///
+/// @param rest - the steps after the missing one
+/// @param value - what to write
+fn grow(rest: &[Step], value: Node) -> DbResult<Option<Node>> {
+    let Some(mut fresh) = seed(rest) else {
+        return Ok(None);
+    };
+    Ok(apply(&mut fresh, rest, value, Edit::Set)?.then_some(fresh))
 }
 
 /// Inserts a value into an array, shifting whatever follows it along.
@@ -388,6 +415,9 @@ pub fn insert_into_array(
         return Ok(());
     }
     refuse_key_into_object(node, steps, written)?;
+    if create_for_array_insert(node, steps, &value) {
+        return Ok(());
+    }
     let Some(container) = follow(node, init) else {
         return Ok(());
     };
@@ -408,6 +438,85 @@ pub fn insert_into_array(
     }
     items.insert(at, value);
     Ok(())
+}
+
+/// Creates the containers a `json_array_insert` path needs and inserts the value in the new one.
+///
+/// **SQLite builds the missing part of the path, as `json_set` does.** `json_array_insert('{"a":[1]}',
+/// '$.b[0]', 'x')` adds `"b":["x"]` and `json_array_insert('[[1],[2]]', '$[2][0]', 5)` appends
+/// `[5]`. A missing key and the position one past the end of an array are the places a container is
+/// made. Nothing is created when the remaining path cannot be built, which is what leaves no empty
+/// container behind. The final step is not handled here: it names a position in an array that
+/// already exists, and the caller inserts there.
+///
+/// @param node - the document, edited in place
+/// @param steps - the path
+/// @param value - what to insert
+fn create_for_array_insert(node: &mut Node, steps: &[Step], value: &Node) -> bool {
+    let Some((step, rest)) = steps.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    match (step, node) {
+        (Step::Key(name), Node::Object(members)) => {
+            if let Some((_, held)) = members
+                .iter_mut()
+                .find(|(label, _)| label_matches(label, name))
+            {
+                return create_for_array_insert(held, rest, value);
+            }
+            let Some(fresh) = build_for_array_insert(rest, value) else {
+                return false;
+            };
+            members.push((Node::text_raw(name), fresh));
+            true
+        }
+        (Step::Index(_) | Step::FromEnd(_) | Step::Append, Node::Array(items)) => {
+            let at = match step {
+                Step::Index(index) => Some(*index),
+                Step::FromEnd(back) => items.len().checked_sub(*back),
+                _ => Some(items.len()),
+            };
+            match at {
+                Some(at) if at < items.len() => items
+                    .get_mut(at)
+                    .is_some_and(|held| create_for_array_insert(held, rest, value)),
+                Some(at) if at == items.len() => {
+                    let Some(fresh) = build_for_array_insert(rest, value) else {
+                        return false;
+                    };
+                    items.push(fresh);
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Builds the new containers for the rest of a `json_array_insert` path, with the value inside.
+///
+/// A new array can only take position 0 or the append position, so `$.b[1]` into a document with
+/// no `b` builds nothing. The last step is the position the value takes.
+///
+/// @param rest - the steps still to build
+/// @param value - what to insert
+fn build_for_array_insert(rest: &[Step], value: &Node) -> Option<Node> {
+    let (step, after) = rest.split_first()?;
+    match step {
+        Step::Index(0) | Step::Append if after.is_empty() => Some(Node::Array(vec![value.clone()])),
+        Step::Index(0) | Step::Append => {
+            Some(Node::Array(vec![build_for_array_insert(after, value)?]))
+        }
+        Step::Key(name) if !after.is_empty() => Some(Node::Object(vec![(
+            Node::text_raw(name),
+            build_for_array_insert(after, value)?,
+        )])),
+        _ => None,
+    }
 }
 
 /// Refuses `json_array_insert` when the path walks an object to a key that is not an array.
@@ -433,6 +542,9 @@ fn refuse_key_into_object(node: &Node, steps: &[Step], written: &str) -> DbResul
                     .map(|(_, held)| held);
                 match found {
                     Some(held) if at.saturating_add(1) < steps.len() => held,
+                    // A missing key whose path ends in an index is created by the caller: SQLite
+                    // refuses only when the text after the key does not end in `]`.
+                    None if !matches!(steps.last(), Some(Step::Key(_))) => return Ok(()),
                     _ => {
                         return Err(inillucent_base::error::misuse(format!(
                             "not an array element: '{written}'"

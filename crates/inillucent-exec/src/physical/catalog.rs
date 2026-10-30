@@ -410,6 +410,24 @@ impl TreeCatalog for WithQueue<'_> {
             .virtual_cursor(table, path, params, needed, downstream)
     }
 
+    /// Forwards the per outer row arguments of a table valued function.
+    ///
+    /// **Without this the default answered, and the default drops `supplied`.** A recursive step
+    /// `FROM t, json_each(t.d)` reads its module through this catalog, and the default
+    /// `virtual_rows_supplied` calls `virtual_rows`, which evaluates the argument `t.d` with no
+    /// outer row and failed with `the tree read for FROM term 1 does not carry column 0`.
+    fn virtual_rows_supplied(
+        &self,
+        table: &TableInfo,
+        path: &AccessPath,
+        params: &Params,
+        needed: &inillucent_sql::bind::ColumnUse,
+        supplied: &[OwnedDatum],
+    ) -> DbResult<Option<Vec<Vec<OwnedDatum>>>> {
+        self.inner
+            .virtual_rows_supplied(table, path, params, needed, supplied)
+    }
+
     fn user_scalar(&self, name: &[u8], argc: usize) -> Option<crate::expr::ScalarBody> {
         self.inner.user_scalar(name, argc)
     }

@@ -387,8 +387,13 @@ impl Parser<'_> {
                 }
             }
             if list.len() as i64 > self.limits.get(Limit::FunctionArg) {
+                // SQLite words it with the function's name: `too many arguments on function
+                // json_array`.
                 return Err(ParseError::new(
-                    ParseErrorKind::LimitExceeded("too many function arguments"),
+                    ParseErrorKind::Refused(format!(
+                        "too many arguments on function {}",
+                        String::from_utf8_lossy(self.ast.text(name))
+                    )),
                     start,
                 ));
             }

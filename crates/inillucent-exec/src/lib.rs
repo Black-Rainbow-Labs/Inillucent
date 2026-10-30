@@ -54,6 +54,7 @@ pub mod gather;
 pub mod insert_plan;
 pub mod inset;
 pub mod join;
+pub(crate) mod json_share;
 pub mod lateral;
 pub mod ops;
 pub mod packed;
