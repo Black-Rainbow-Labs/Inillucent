@@ -376,9 +376,6 @@ impl ImportedDatabase {
         }
         self.rebuild_tables()?;
         self.refresh_catalog();
-        // **An attached file an older release wrote gets the same check as `main`**, so a 2.0.x
-        // file attached to an application's connection answers from its tables and is rebuilt
-        // by the next statement of a connection that may write; see `engine::stale_index`.
         self.withdraw_indexes_written_without_their_collation()
     }
 

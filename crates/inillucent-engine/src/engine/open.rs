@@ -828,7 +828,6 @@ impl crate::ImportedDatabase {
             opened.rebuild_tables()?;
             opened.refresh_catalog();
         }
-        opened.withdraw_indexes_written_without_their_collation()?;
         opened.finish_the_open(read_only)?;
         Ok(opened)
     }
@@ -841,6 +840,7 @@ impl crate::ImportedDatabase {
     ///
     /// @param read_only - whether this connection may write the file
     fn finish_the_open(&mut self, read_only: bool) -> DbResult<()> {
+        self.withdraw_indexes_written_without_their_collation()?;
         if !read_only
             && header_accounts_for_every_object(&self.schema.entries, &self.storage.database)
             && self.storage.database.has_an_unclaimed_tail()?

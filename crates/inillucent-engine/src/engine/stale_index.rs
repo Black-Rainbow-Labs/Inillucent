@@ -25,7 +25,9 @@ impl crate::ImportedDatabase {
     /// Finds the automatic indexes an older release wrote with no value for a collated key
     /// column and takes them out of the schema the planner reads.
     ///
-    /// Runs at the end of an open and at the end of an `ATTACH`, after the tables are derived.
+    /// Runs at the end of an open and at the end of an `ATTACH`, after the tables are derived. An
+    /// attached 2.0.x file therefore answers from its tables, and the next statement of a
+    /// connection that may write rebuilds its index.
     pub(crate) fn withdraw_indexes_written_without_their_collation(&mut self) -> DbResult<()> {
         let mut found: Vec<(usize, Vec<u8>, u32, u32)> = Vec::new();
         for table in &self.schema.tables {
