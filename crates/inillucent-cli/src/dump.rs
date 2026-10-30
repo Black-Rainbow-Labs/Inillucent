@@ -196,7 +196,7 @@ fn table_objects(shell: &Shell, condition: Option<&str>) -> Vec<(String, String)
 ///
 /// @param sql - the stored text
 fn loadable(sql: String) -> String {
-    match inillucent_engine::stored_create_table_text(sql.as_bytes()) {
+    match inillucent_driver::stored_create_table_text(sql.as_bytes()) {
         Some(fixed) => String::from_utf8_lossy(&fixed).into_owned(),
         None => sql,
     }

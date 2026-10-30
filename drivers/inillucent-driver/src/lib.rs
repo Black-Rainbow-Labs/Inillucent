@@ -159,6 +159,13 @@ pub use inillucent_engine::connect::leading_trivia;
 /// asks `sqlite3_keyword_check`.
 pub use inillucent_engine::keyword_lookup;
 
+/// Returns stored `CREATE TABLE` text with its columns in front of its table
+/// constraints, when a release before 2.1.0 wrote it the other way round.
+///
+/// The shell's dump prints stored text through this, so the dump of such a
+/// file loads again, and asks the driver rather than the engine for it.
+pub use inillucent_engine::stored_create_table_text;
+
 /// The run-time limits `sqlite3_limit` reads and writes.
 ///
 /// Re-exported for the same reason [`StatementLimits`] is: a caller naming one

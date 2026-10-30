@@ -2539,11 +2539,18 @@ impl<'a> Binder<'a> {
         table: ast::NameId,
     ) -> Result<(usize, Vec<u8>, crate::catalog_view::TableInfo), ParseError> {
         let table_folded = self.ast.folded(table).to_vec();
+        // **An unqualified index goes into `main`, or into `temp` when the
+        // table found is a temporary one** - SQLite's `sqlite3CreateIndex`
+        // rule. It used to go into whichever database the table was found in,
+        // so `CREATE INDEX ix ON t` with `t` only in an attached file built the
+        // index there, where SQLite answers `no such table: main.t`.
         let index = match database {
             Some(_) => self.resolve_database(database)?,
             None => match self.catalog.find_table(None, &table_folded) {
-                Some(found) => found.database,
-                None => return Err(self.index_without_table(0, &table_folded, table)),
+                Some(found) if self.catalog.database_name(found.database) == b"temp" => {
+                    found.database
+                }
+                _ => 0,
             },
         };
         let database_name = self.catalog.database_name(index).to_vec();

@@ -23,6 +23,28 @@ use super::*;
 use crate::*;
 
 impl crate::ImportedDatabase {
+    /// Returns the table an index statement names, from the database the
+    /// index goes into.
+    ///
+    /// **Only that database.** `schema.tables` holds every attached
+    /// database's tables, and the first one of that name used to win:
+    /// `CREATE INDEX b.ix ON items` built `ix` over `main.items` or
+    /// `a.items` and stored it in `b`, so a query on `b.items` read another
+    /// table's rows through it and a `UNIQUE` index enforced nothing. SQLite
+    /// resolves the table in the index's own database.
+    ///
+    /// @param table - the table's name as the statement wrote it
+    fn table_in_ddl_schema(&self, table: &[u8]) -> DbResult<TableInfo> {
+        let folded = table.to_ascii_lowercase();
+        let at = self.schema.ddl_schema;
+        self.schema
+            .tables
+            .iter()
+            .find(|held| held.folded == folded && held.database == at)
+            .cloned()
+            .ok_or_else(|| refusal(format!("no such table: {}", String::from_utf8_lossy(table))))
+    }
+
     /// Creates an index, fills it from the table, and records it.
     ///
     /// The fill is a bottom-up bulk build rather than a per-key insert: the
@@ -62,19 +84,7 @@ impl crate::ImportedDatabase {
             "CREATE INDEX"
         };
         let sql = canonical_index_sql(keywords, source, name_offset, source.len() as u32);
-        let folded = table.to_ascii_lowercase();
-        let position = self
-            .schema
-            .tables
-            .iter()
-            .position(|held| held.folded == folded)
-            .ok_or_else(|| refusal(format!("no such table: {}", String::from_utf8_lossy(table))))?;
-        let owner = self
-            .schema
-            .tables
-            .get(position)
-            .cloned()
-            .ok_or_else(|| refusal("the table that was just found is gone"))?;
+        let owner = self.table_in_ddl_schema(table)?;
         let root = self.allocate_root()?;
         let index = index_from_create_sql(&sql, &owner, root)?;
         let (columns, layout) = index_shape(&owner, &index, root);
@@ -209,7 +219,6 @@ impl crate::ImportedDatabase {
                 .push(root);
             self.sort_covering(owner.root);
         }
-        let _ = position;
         let _ = index;
         self.rebuild_tables()?;
         self.refresh_catalog();
