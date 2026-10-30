@@ -106,6 +106,7 @@ case = "bug-hunt-11/appsengine/distinct-order-by-indexed-column-not-selected"
 kind = "deviation"
 reason = "SELECT DISTINCT x ... ORDER BY y with y not selected keeps the first row of each group in scan order, so the row that stands for a group depends on the plan. SQLite reads a non covering index on y backwards, and reads the table by rowid backwards for ORDER BY id DESC, name. inillucent does the second only when the ORDER BY is the rowid alone, and never walks a non covering index for an ORDER BY, so with an index on y the groups come out in a different order"
 
+[[known]]
 case = "bug-hunt-11/files/D12-table-xinfo-of-a-broken-view"
 kind = "deviation"
 reason = "Error label only. PRAGMA table_xinfo of a view over a dropped table fails with the same message in both, no such table: main.t. The pinned sqlite3 fails while it prepares the PRAGMA and the shell prints Parse error, and this engine fails when the PRAGMA runs and the shell prints Error. The table valued form, pragma_table_xinfo, matches"
