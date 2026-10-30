@@ -89,11 +89,14 @@
 // Every item is re-exported, so nothing outside this directory changed.
 use self::index::*;
 use self::query::*;
+mod constraints;
 mod fold;
 mod fts3_snippet;
+mod grammar;
 mod index;
 mod merge;
 mod query;
+mod run;
 mod segment;
 mod snippet;
 
@@ -105,6 +108,7 @@ pub mod bm25;
 mod doclist;
 pub mod expr;
 mod layout;
+pub mod matcher;
 pub mod options;
 pub mod tokenize;
 pub mod vocab;
@@ -394,6 +398,8 @@ const PLAN_ROWID: i32 = 1;
 const PLAN_MATCH: i32 = 2;
 /// The plan bit that says the rows come back ranked.
 const PLAN_RANKED: i32 = 4;
+/// The plan bit that says the ranked rows come worst first, for `ORDER BY rank DESC`.
+const PLAN_DESCENDING: i32 = 16;
 /// The plan bit that says a `rank MATCH '...'` constraint came after the match.
 ///
 /// The second argument of the plan is then the rank function for this query,
@@ -641,15 +647,21 @@ impl VirtualTable for Fts5Table {
             // slot, which is why the dialect has to be checked and not just
             // the column number.
             let docid = self.dialect == Dialect::Three && constraint.column == self.rank_column();
-            if !matches
-                && constraint.op == ConstraintOp::Eq
-                && (constraint.column == ROWID_COLUMN || docid)
-            {
+            let rowid_equality =
+                constraint.op == ConstraintOp::Eq && (constraint.column == ROWID_COLUMN || docid);
+            if !matches && rowid_equality {
                 query.use_constraint(index, true);
                 query.index_number = PLAN_ROWID;
                 query.estimated_cost = 1.0;
                 query.estimated_rows = 1;
                 return Ok(());
+            }
+            // **A rowid beside a match limits the match to that row**, and is compared as a
+            // number, so `rowid = '5'` and `rowid = 5.0` find row 5 here as they do in SQLite.
+            // The role is `=`, and `run` reads it.
+            if matches && rowid_equality && !roles.iter().any(|role| role == "=") {
+                query.use_constraint(index, true);
+                roles.push("=".to_string());
             }
         }
         // **`rank MATCH 'bm25(10.0, 1.0)'` chooses the rank function for this
@@ -667,7 +679,7 @@ impl VirtualTable for Fts5Table {
                 .enumerate()
                 .filter(|(_, constraint)| {
                     constraint.usable
-                        && constraint.op == ConstraintOp::Match
+                        && matches!(constraint.op, ConstraintOp::Match | ConstraintOp::Eq)
                         && constraint.column == self.rank_column()
                 })
                 .map(|(index, _)| index)
@@ -687,10 +699,12 @@ impl VirtualTable for Fts5Table {
                 if query.order_by.len() == 1
                     && self.dialect == Dialect::Five
                     && order.column == self.rank_column()
-                    && !order.descending
                 {
                     query.ordered = true;
                     plan |= PLAN_RANKED;
+                    if order.descending {
+                        plan |= PLAN_DESCENDING;
+                    }
                 }
             }
         }
@@ -710,7 +724,8 @@ impl VirtualTable for Fts5Table {
             contentless: self.contentless,
             offsets: content_offsets(self.external.as_deref(), &self.options.columns, None),
             external: self.external.clone(),
-            matched: Vec::new(),
+            evaluated: matcher::Evaluated::default(),
+            stats: bm25::Statistics::default(),
             phrases: Vec::new(),
             query: None,
             hits_built: false,
@@ -730,13 +745,19 @@ impl VirtualTable for Fts5Table {
                 .collect(),
             match_column: self.match_column(),
             rank_column: self.rank_column(),
+            unindexed: self
+                .options
+                .columns
+                .iter()
+                .map(|column| column.unindexed)
+                .collect(),
             rank_weights: Vec::new(),
-            rank_setting: None,
+            rank_function: None,
+            special: None,
             tokenizer: self.tokenizer.clone(),
             shadows: self.shadows.clone(),
             rows: Vec::new(),
             at: 0,
-            pattern: Vec::new(),
         }))
     }
 
@@ -1042,7 +1063,7 @@ thread_local! {
 /// @param hits - where the phrase matched, per row
 /// @param rowid - the row being reported on
 /// @param column - which column
-fn phrase_counts(hits: &expr::Hits, rowid: i64, column: usize) -> (i64, i64, i64) {
+fn phrase_counts(hits: &matcher::Hits, rowid: i64, column: usize) -> (i64, i64, i64) {
     let mut here = 0i64;
     let mut every = 0i64;
     let mut rows = 0i64;
@@ -1068,11 +1089,7 @@ fn phrase_counts(hits: &expr::Hits, rowid: i64, column: usize) -> (i64, i64, i64
 ///
 /// @param value - the argument, when there is one
 fn text_argument(value: Option<&Value<'static>>) -> Vec<u8> {
-    match value {
-        Some(Value::Text(text)) => text.utf8_bytes().into_owned(),
-        Some(Value::Blob(blob)) => blob.raw().to_vec(),
-        _ => Vec::new(),
-    }
+    value.and_then(text_of).unwrap_or_default()
 }
 
 /// Reports whether a token is one the query asked for.

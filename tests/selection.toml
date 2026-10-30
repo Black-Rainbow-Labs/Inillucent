@@ -1940,6 +1940,14 @@ covers = ["inillucent-ext", "inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "fts5_query_cost"
+tier = "engine"
+covers = ["inillucent-ext", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "fts5_segments"
 tier = "engine"
 covers = ["inillucent-ext", "inillucent-engine"]

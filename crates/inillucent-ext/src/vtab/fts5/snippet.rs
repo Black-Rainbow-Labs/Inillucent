@@ -78,6 +78,39 @@ pub(super) fn instances_in(phrases: &[Phrase], spans: &[Span], column: usize) ->
     found
 }
 
+/// Returns the occurrences of the query's phrases in one column, from the positions the index holds.
+///
+/// **This is how SQLite finds them**: the instances `highlight` and `snippet` mark are the
+/// positions of the phrases that count in the row, which `matcher` works out, so a phrase in a
+/// branch that did not match the row and a position outside the window of a `NEAR` are not
+/// marked. Sorted by first token and then by phrase.
+///
+/// @param phrases - the phrases of the query
+/// @param live - the positions each phrase counts at in the row
+/// @param column - which column to report
+pub(super) fn instances_from_positions(
+    phrases: &[Phrase],
+    live: &[Vec<i64>],
+    column: usize,
+) -> Vec<Instance> {
+    let mut found = Vec::new();
+    for (index, positions) in live.iter().enumerate() {
+        let tokens = phrases.get(index).map_or(1, |phrase| phrase.terms.len());
+        for position in positions {
+            if usize::try_from(position >> 32).ok() != Some(column) {
+                continue;
+            }
+            found.push(Instance {
+                phrase: index,
+                first: usize::try_from(position & 0x7fff_ffff).unwrap_or(0),
+                tokens,
+            });
+        }
+    }
+    found.sort_by_key(|instance| (instance.first, instance.phrase));
+    found
+}
+
 /// The most combinations of occurrences a `NEAR` group is checked against.
 ///
 /// A group over more than this keeps every occurrence, which marks too much and

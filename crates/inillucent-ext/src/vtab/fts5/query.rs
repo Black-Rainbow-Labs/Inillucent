@@ -14,6 +14,7 @@ use crate::shadow::ShadowTables;
 use super::expr::Phrase;
 use super::expr::Query;
 use super::index::*;
+use super::matcher::{self, Evaluated, Position};
 use super::tokenize::Tokenizer;
 use super::*;
 
@@ -21,7 +22,7 @@ use super::*;
 #[derive(Clone, Debug)]
 pub(crate) struct MatchedRow {
     /// Which row.
-    rowid: i64,
+    pub(super) rowid: i64,
     /// The score `rank` reports, which is negative so that smaller is better.
     ///
     /// `None` until something asks for it. Scoring one row costs a read of its
@@ -29,7 +30,7 @@ pub(crate) struct MatchedRow {
     /// never looks at the answer - which is most of them, and `count(*)` in
     /// particular. The one query that needs every score up front is the ranked
     /// one, where the score *is* the sort key.
-    score: Option<f64>,
+    pub(super) score: Option<f64>,
 }
 /// A cursor over the rows one query matched.
 pub(crate) struct Fts5Cursor {
@@ -59,22 +60,27 @@ pub(crate) struct Fts5Cursor {
     pub(crate) names: Vec<Vec<u8>>,
     pub(crate) match_column: i32,
     pub(crate) rank_column: i32,
+    /// Which columns were declared UNINDEXED.
+    pub(crate) unindexed: Vec<bool>,
     /// The column weights `rank` scores with, from the `rank` setting; see
     /// `bm25::configured_weights`.
     pub(crate) rank_weights: Vec<f64>,
     /// The rank function a `rank MATCH '...'` constraint gave this query, such
     /// as `bm25(10.0, 1.0)`, which replaces the `rank` setting for it.
-    pub(crate) rank_setting: Option<String>,
+    pub(crate) rank_function: Option<bm25::RankFunction>,
+    /// What a `MATCH '*id'` query answers, when that is what the query was.
+    pub(crate) special: Option<i64>,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) shadows: ShadowTables,
     pub(crate) rows: Vec<MatchedRow>,
     pub(crate) at: usize,
-    /// The query the rows came from, for the auxiliary functions.
-    pub(crate) pattern: Vec<u8>,
-    /// What each phrase matched, kept so `bm25(t, w1, w2)` can score the row
-    /// again with the weights that call asked for. `rank` is the same score
-    /// with every weight one, so the two cannot disagree.
-    pub(crate) matched: Vec<expr::Hits>,
+    /// The rows the query matched and what each phrase matched, kept so
+    /// `bm25(t, w1, w2)` can score a row with the weights that call asked for.
+    /// `rank` is the same score with every weight one, so the two cannot
+    /// disagree.
+    pub(crate) evaluated: Evaluated,
+    /// The numbers the query's score is relative to, worked out once.
+    pub(crate) stats: bm25::Statistics,
     /// The phrases, in the order `matched` holds them.
     pub(crate) phrases: Vec<Phrase>,
     /// The collection totals the score is relative to.
@@ -130,7 +136,7 @@ fn weight_of(argument: &Value<'static>) -> f64 {
 /// number is 0. Words such as `inf` and `nan` are not numbers here.
 ///
 /// @param text - the text to read
-fn leading_number(text: &str) -> f64 {
+pub(super) fn leading_number(text: &str) -> f64 {
     let trimmed = text.trim_start();
     let allowed = |character: char| matches!(character, '0'..='9' | '.' | '+' | '-' | 'e' | 'E');
     let candidate_end = trimmed
@@ -150,6 +156,51 @@ fn leading_number(text: &str) -> f64 {
     0.0
 }
 
+/// Reads an argument as an integer the way `sqlite3_value_int64` does.
+///
+/// A real is cut to its whole part and text is read up to its first character that is not a digit,
+/// so `'2'` and `2.9` are both 2, `'abc'` and NULL are 0, and nothing is refused.
+///
+/// @param argument - one argument of the call, when it was given
+fn int_argument(argument: Option<&Value<'static>>) -> i64 {
+    match argument {
+        Some(Value::Integer(number)) => *number,
+        Some(Value::Real(number)) => *number as i64,
+        Some(Value::Text(text)) => leading_integer(&text.utf8_bytes()),
+        Some(Value::Blob(blob)) => leading_integer(blob.raw()),
+        _ => 0,
+    }
+}
+
+/// Reads the whole number a piece of text starts with, as `sqlite3Atoi64` does.
+///
+/// @param bytes - the text
+fn leading_integer(bytes: &[u8]) -> i64 {
+    let mut at = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    let negative = bytes.get(at) == Some(&b'-');
+    if matches!(bytes.get(at), Some(b'-' | b'+')) {
+        at += 1;
+    }
+    let mut value = 0i64;
+    for byte in bytes
+        .iter()
+        .skip(at)
+        .take_while(|byte| byte.is_ascii_digit())
+    {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'));
+    }
+    if negative {
+        -value
+    } else {
+        value
+    }
+}
+
 impl Fts5Cursor {
     /// Returns the column weights `rank` scores this query with.
     ///
@@ -157,21 +208,44 @@ impl Fts5Cursor {
     /// table's `rank` setting, which is what SQLite does for that query.
     ///
     /// @param context - the running statement
-    fn load_rank_weights(&self, context: &mut Context<'_>) -> DbResult<Vec<f64>> {
-        match &self.rank_setting {
-            Some(setting) => Ok(bm25::weights_from_setting(setting, self.columns)),
+    pub(super) fn load_rank_weights(&self, context: &mut Context<'_>) -> DbResult<Vec<f64>> {
+        match &self.rank_function {
+            Some(function) => Ok(function.column_weights(self.columns)),
             None => bm25::configured_weights(context, &self.shadows, self.columns),
         }
     }
 
-    /// Returns where the query's phrases occur in one column's tokens.
+    /// Returns where each phrase counts in the row the cursor is on.
     ///
-    /// The occurrences of a `NEAR` group count only where the group matches,
-    /// which is how SQLite reports them to `highlight` and `snippet`.
+    /// A phrase counts only where its node is part of the row's match, and a `NEAR`
+    /// only where its window is, which is how SQLite reports them to `bm25`,
+    /// `highlight` and `snippet`. See [`matcher::Evaluated::live_positions`].
+    fn live_positions(&self) -> Vec<Vec<Position>> {
+        let (Some(row), Some(query)) = (self.rows.get(self.at), self.query.as_ref()) else {
+            return Vec::new();
+        };
+        self.evaluated.live_positions(&query.root, row.rowid)
+    }
+
+    /// Returns where the query's phrases occur in one column of the current row.
     ///
+    /// FTS5 reads them from the positions the index holds for the row, as SQLite
+    /// does, so a phrase in a branch that did not match the row, or outside the
+    /// window of a `NEAR`, is not reported. FTS3 and FTS4 find them in the
+    /// column's tokens.
+    ///
+    /// @param live - where each phrase counts in the row
     /// @param spans - the column's tokens with their byte ranges
     /// @param column - which column the tokens are from
-    fn instances_of(&self, spans: &[snippet::Span], column: usize) -> Vec<snippet::Instance> {
+    fn instances_of(
+        &self,
+        live: &[Vec<Position>],
+        spans: &[snippet::Span],
+        column: usize,
+    ) -> Vec<snippet::Instance> {
+        if self.dialect == Dialect::Five {
+            return snippet::instances_from_positions(&self.phrases, live, column);
+        }
         let found = snippet::instances_in(&self.phrases, spans, column);
         let groups = self
             .query
@@ -198,9 +272,9 @@ impl Fts5Cursor {
         let Some(query) = self.query.clone() else {
             return Ok(());
         };
-        let (_, hits) =
-            expr::evaluate(&query, context, &self.shadows, &self.pending, self.columns)?;
-        self.matched = hits;
+        self.evaluated =
+            matcher::evaluate(&query, context, &self.shadows, &self.pending, self.columns)?;
+        self.stats = bm25::statistics(&self.evaluated.hits, &self.totals);
         Ok(())
     }
 }
@@ -228,7 +302,7 @@ impl Fts5Cursor {
         context: &mut Context<'_>,
         arguments: &[Value<'static>],
     ) -> DbResult<Value<'static>> {
-        let requested = arguments.first().and_then(Value::as_integer).unwrap_or(0);
+        let requested = int_argument(arguments.first());
         let open = text_argument(arguments.get(1));
         let close = text_argument(arguments.get(2));
         let column = match usize::try_from(requested) {
@@ -238,8 +312,10 @@ impl Fts5Cursor {
         let Some(text) = self.column_text(context, column)? else {
             return Ok(Value::Null);
         };
+        self.ensure_hits(context)?;
+        let live = self.live_positions();
         let spans = self.tokenizer.spans(&text);
-        let instances = self.instances_of(&spans, column);
+        let instances = self.instances_of(&live, &spans, column);
         let ranges = snippet::coalesced(&instances);
         let out = snippet::highlight_text(&text, &spans, &ranges, (&open, &close));
         Ok(Value::owned_text(&out).unwrap_or(Value::Null))
@@ -262,27 +338,28 @@ impl Fts5Cursor {
         context: &mut Context<'_>,
         arguments: &[Value<'static>],
     ) -> DbResult<Value<'static>> {
-        let requested = arguments.first().and_then(Value::as_integer).unwrap_or(0);
+        let requested = int_argument(arguments.first());
         let open = text_argument(arguments.get(1));
         let close = text_argument(arguments.get(2));
         let ellipsis = text_argument(arguments.get(3));
-        let wanted = arguments
-            .get(4)
-            .and_then(Value::as_integer)
-            .unwrap_or(15)
-            .clamp(0, 64);
-        let best = self.best_snippet_window(context, requested, wanted)?;
+        let wanted = int_argument(arguments.get(4)).clamp(0, 64);
+        self.ensure_hits(context)?;
+        let live = self.live_positions();
+        let best = self.best_snippet_window(context, &live, requested, wanted)?;
         let Some(text) = self.column_text(context, best.column)? else {
             return Ok(Value::Null);
         };
         let spans = self.tokenizer.spans(&text);
         // `nColSize` is what the best window was found in, and the column's own
         // token count when no window scored.
+        // An UNINDEXED column has no size in `%_docsize`, which SQLite reads as no tokens, so the
+        // whole text is shown.
         let tokens = match best.size {
+            _ if self.unindexed.get(best.column) == Some(&true) => 0,
             0 => spans.len() as i64,
             size => size,
         };
-        let instances = self.instances_of(&spans, best.column);
+        let instances = self.instances_of(&live, &spans, best.column);
         let ranges = snippet::coalesced(&instances);
         let words = (open.as_slice(), close.as_slice(), ellipsis.as_slice());
         let out =
@@ -320,7 +397,9 @@ impl Fts5Cursor {
         }
         let tokens = tokens.clamp(-64, 64);
         let texts = self.column_sources(context)?;
-        let columns = self.column_hits(&texts, named);
+        self.ensure_hits(context)?;
+        let live = self.live_positions();
+        let columns = self.column_hits(&live, &texts, named);
         let (fragments, size) = fts3_snippet::choose_fragments(&columns, tokens);
         let marks = fts3_snippet::Marks {
             open: &open,
@@ -366,10 +445,12 @@ impl Fts5Cursor {
 
     /// Finds the phrase occurrences of the columns a snippet considers.
     ///
+    /// @param live - where each phrase counts in the row
     /// @param texts - each column's text and tokens
     /// @param named - the column argument, negative for every column
     fn column_hits(
         &self,
+        live: &[Vec<Position>],
         texts: &[Option<(Vec<u8>, Vec<snippet::Span>)>],
         named: i64,
     ) -> Vec<fts3_snippet::ColumnHits> {
@@ -382,7 +463,7 @@ impl Fts5Cursor {
                 .get(column)
                 .and_then(Option::as_ref)
                 .map(|(_, spans)| spans.as_slice());
-            let found = self.instances_of(spans.unwrap_or_default(), column);
+            let found = self.instances_of(live, spans.unwrap_or_default(), column);
             columns.push(fts3_snippet::ColumnHits {
                 column,
                 hits: fts3_snippet::hits_of(&found, self.phrases.len()),
@@ -394,11 +475,13 @@ impl Fts5Cursor {
     /// Returns the column and the first token of the window `snippet` shows.
     ///
     /// @param context - the statement's context
+    /// @param live - where each phrase counts in the row
     /// @param requested - the column argument, negative for every column
     /// @param wanted - how many tokens the snippet shows
     fn best_snippet_window(
         &mut self,
         context: &mut Context<'_>,
+        live: &[Vec<Position>],
         requested: i64,
         wanted: i64,
     ) -> DbResult<snippet::Best> {
@@ -419,7 +502,7 @@ impl Fts5Cursor {
                 continue;
             };
             let spans = self.tokenizer.spans(&text);
-            let instances = self.instances_of(&spans, column);
+            let instances = self.instances_of(live, &spans, column);
             let sentences = snippet::sentence_starts(&text, &spans);
             let windows = snippet::ColumnWindows {
                 column,
@@ -471,13 +554,13 @@ impl Fts5Cursor {
         let Some((_, content)) = self.held.as_ref() else {
             return Ok(None);
         };
-        Ok(
-            match self.offsets.get(column).and_then(|at| content.get(*at)) {
-                Some(Value::Text(text)) => Some(text.utf8_bytes().into_owned()),
-                Some(Value::Blob(blob)) => Some(blob.raw().to_vec()),
-                _ => None,
-            },
-        )
+        // A number in a column is read as the text it is written as, which is what SQLite's
+        // `sqlite3_column_text` gives `highlight` and `snippet`.
+        Ok(self
+            .offsets
+            .get(column)
+            .and_then(|at| content.get(*at))
+            .and_then(text_of))
     }
 
     /// Returns every term the query asked for, across its phrases.
@@ -570,7 +653,7 @@ impl Fts5Cursor {
                 }
                 b'x' => {
                     for at in 0..self.phrases.len() {
-                        let hits = self.matched.get(at);
+                        let hits = self.evaluated.hits.get(at);
                         for column in 0..self.columns {
                             let (here, every, rows) = match hits {
                                 Some(hits) => phrase_counts(hits, row.rowid, column),
@@ -604,7 +687,11 @@ impl Fts5Cursor {
     /// @param context - the connection's shadow table access
     /// @param plan - the plan, whose first argument is the rowid
     fn filter_by_rowid(&mut self, context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
-        let Some(rowid) = plan.arguments.first().and_then(Value::as_integer) else {
+        let Some(rowid) = plan
+            .arguments
+            .first()
+            .and_then(super::constraints::rowid_of)
+        else {
             return Ok(());
         };
         let suffix: &[u8] = match self.contentless {
@@ -624,81 +711,6 @@ fn function_refusal(said: &str) -> inillucent_base::DbError {
     crate::vtab::failure(said.to_string()).with_message(said.to_string())
 }
 
-/// Joins the MATCH arguments of a plan into the one query that is run, and finds the rank setting.
-///
-/// Each argument has a role in the plan string: `t` is a query on the table's own column, `c<n>`
-/// is a query on column n alone, which is the column filter `{"name"} : (query)`, and `r` is the
-/// rank function a `rank MATCH` named. Several queries are ANDed, as SQLite does, each in its own
-/// parentheses so that an `OR` inside one cannot bind to its neighbour. The column name is
-/// quoted, which is what lets a column called `b-c` be filtered.
-///
-/// Answers `None` when a query is NULL, because a MATCH against NULL matches nothing, and when
-/// `rewrite` says a query matches nothing.
-///
-/// **Each query is rewritten before it is joined.** An FTS3 or FTS4 query is in another language
-/// from the FTS5 syntax the joining adds (`{"b"} : (...)`, `AND`, the parentheses), so the FTS3
-/// rewrite of the joined text read that syntax as FTS3 words and `b MATCH 'secret'` failed with
-/// `no such column: AND`.
-///
-/// @param plan - the plan `best_index` chose and the values it was given
-/// @param names - the table's indexed column names
-/// @param rewrite - turns one query into the FTS5 spelling, or says it matches nothing
-fn combined_pattern(
-    plan: &FilterPlan,
-    names: &[Vec<u8>],
-    rewrite: &dyn Fn(Vec<u8>) -> DbResult<Option<Vec<u8>>>,
-) -> DbResult<Option<(Vec<u8>, Option<String>)>> {
-    let roles: Vec<&str> = plan.index_string.split(',').collect();
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    let mut rank_setting: Option<String> = None;
-    for (position, argument) in plan.arguments.iter().enumerate() {
-        let role = roles.get(position).copied().unwrap_or("t");
-        let text = text_of(argument);
-        if role == "r" {
-            if rank_setting.is_none() {
-                rank_setting = text.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-            }
-            continue;
-        }
-        let Some(text) = text else {
-            return Ok(None);
-        };
-        let Some(text) = rewrite(text)? else {
-            return Ok(None);
-        };
-        let column = role
-            .strip_prefix('c')
-            .and_then(|digits| digits.parse::<usize>().ok())
-            .and_then(|at| names.get(at));
-        match column {
-            Some(name) => {
-                let mut filtered = b"{\"".to_vec();
-                filtered.extend(name.iter().flat_map(|byte| match byte {
-                    b'"' => vec![b'"', b'"'],
-                    other => vec![*other],
-                }));
-                filtered.extend_from_slice(b"\"} : (");
-                filtered.extend_from_slice(&text);
-                filtered.push(b')');
-                parts.push(filtered);
-            }
-            None => parts.push(text),
-        }
-    }
-    let pattern = match parts.len() {
-        0 => return Ok(None),
-        1 => parts.swap_remove(0),
-        _ => {
-            let wrapped: Vec<Vec<u8>> = parts
-                .into_iter()
-                .map(|part| [b"(".as_slice(), &part, b")".as_slice()].concat())
-                .collect();
-            wrapped.join(&b" AND "[..])
-        }
-    };
-    Ok(Some((pattern, rank_setting)))
-}
-
 impl VirtualCursor for Fts5Cursor {
     /// Runs the query and collects every row it matched.
     fn filter(&mut self, context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
@@ -706,7 +718,9 @@ impl VirtualCursor for Fts5Cursor {
             return Err(super::unsupported_option(&what));
         }
         self.rows.clear();
-        self.matched.clear();
+        self.special = None;
+        self.query = None;
+        self.evaluated = Evaluated::default();
         self.phrases.clear();
         self.at = 0;
         self.held = None;
@@ -741,97 +755,7 @@ impl VirtualCursor for Fts5Cursor {
         // the `MATCH` with nothing. The refusal belongs on the one query whose
         // answer depends on the dictionary. See `layout.rs`.
         super::layout::readable(context, &self.shadows, &self.pending, &self.table)?;
-        let as_written = |text: Vec<u8>| Ok(Some(text));
-        let Some((pattern, rank_setting)) = combined_pattern(plan, &self.names, &as_written)?
-        else {
-            return Ok(());
-        };
-        self.pattern = pattern.clone();
-        // The FTS3 and FTS4 front end reads `-` as an operator (bug hunt 10).
-        let rewritten = if self.dialect == Dialect::Three {
-            combined_pattern(plan, &self.names, &|text| expr::fts3_pattern(&text))?
-        } else {
-            let checked = |text: Vec<u8>| {
-                expr::refuse_stray_characters(&text)?;
-                Ok(Some(text))
-            };
-            combined_pattern(plan, &self.names, &checked)?
-        };
-        let Some((parsed, _)) = rewritten else {
-            return Ok(());
-        };
-        let query = Query::parse(&parsed, &self.tokenizer, &self.names)?;
-        // **The buffered totals, not the row.** A score is computed from the
-        // document count and the token totals, and those are staged rather than
-        // written per document - so a query inside the same transaction that
-        // read `%_data` directly would score against the state the transaction
-        // started from. That is what a buffer has to be transparent about.
-        let totals = buffered_totals(context, &self.shadows, &self.pending, self.columns);
-        let ranked = plan.index_number & PLAN_RANKED != 0;
-        // Read only when a score is: most matches never ask for one.
-        self.rank_weights.clear();
-        self.rank_setting = rank_setting;
-        if ranked {
-            self.rank_weights = self.load_rank_weights(context)?;
-        }
-        // **A ranked plan needs the positions, and most plans do not.** The
-        // cheap walk answers `None` for the queries whose answer depends on
-        // them, and those fall through to the full evaluation.
-        let cheap = if ranked {
-            None
-        } else {
-            expr::evaluate_rows(&query, context, &self.shadows, &self.pending, self.columns)?
-        };
-        let (rows, hits) = match cheap {
-            Some(rows) => (rows, Vec::new()),
-            None => expr::evaluate(&query, context, &self.shadows, &self.pending, self.columns)?,
-        };
-        self.hits_built = !hits.is_empty();
-        if ranked {
-            // The sort key has to exist before the sort, so this is the one
-            // plan that scores every row up front.
-            let scores = bm25::score(
-                &rows,
-                &hits,
-                &query,
-                context,
-                &self.shadows,
-                &totals,
-                self.columns,
-                &self.rank_weights,
-            )?;
-            self.rows = scores
-                .into_iter()
-                .map(|(rowid, score)| MatchedRow {
-                    rowid,
-                    score: Some(score),
-                })
-                .collect();
-        } else {
-            self.rows = rows
-                .into_iter()
-                .map(|rowid| MatchedRow { rowid, score: None })
-                .collect();
-        }
-        self.phrases = query.phrases.clone();
-        self.totals = totals;
-        self.matched = hits;
-        self.query = Some(query);
-        if ranked {
-            self.rows.sort_by(|left, right| {
-                // Both sides are `Some` here: this arm is only reached when
-                // `filter` scored every row, which it does for exactly this
-                // plan. An unscored row sorts as zero rather than panicking.
-                left.score
-                    .unwrap_or(0.0)
-                    .partial_cmp(&right.score.unwrap_or(0.0))
-                    .unwrap_or(core::cmp::Ordering::Equal)
-                    .then(left.rowid.cmp(&right.rowid))
-            });
-        } else {
-            self.rows.sort_by_key(|row| row.rowid);
-        }
-        Ok(())
+        self.run_match(context, plan)
     }
 
     /// Moves to the next matching row.
@@ -860,6 +784,16 @@ impl VirtualCursor for Fts5Cursor {
             if let Some(score) = row.score {
                 return Ok(Value::Real(score));
             }
+            if self.special.is_some() {
+                return Ok(Value::Null);
+            }
+            // **An unknown rank function reads as NULL here and is refused by `ORDER BY rank`.**
+            // The engine reads every column of a matched row for `count(*)` and `SELECT rowid`,
+            // and SQLite refuses the function only when the statement asks for `rank`, so an
+            // error from this read would fail statements that never mention it.
+            if self.refuse_unknown_rank_function().is_err() {
+                return Ok(Value::Null);
+            }
             if self.phrases.is_empty() {
                 // A row reached without a `MATCH` has nothing to score against,
                 // which SQLite answers NULL for.
@@ -872,23 +806,28 @@ impl VirtualCursor for Fts5Cursor {
             if self.rank_weights.is_empty() {
                 self.rank_weights = self.load_rank_weights(context)?;
             }
-            let weights = self.rank_weights.clone();
             let sizes = bm25::row_sizes(context, &self.shadows, row.rowid, self.columns)?;
+            let live = self.live_positions();
             return Ok(Value::Real(bm25::score_row(
-                row.rowid,
-                &self.matched,
-                &self.phrases,
-                &self.totals,
+                &self.stats,
+                &live,
                 &sizes,
-                &weights,
+                &self.rank_weights,
             )));
         }
         if index as i32 == self.match_column {
             // The hidden column that carries the query exists to be constrained, and read as a
-            // value it is the number of the cursor, as it is in SQLite.
+            // value it is the number of the cursor, as it is in SQLite. After a special query it
+            // is that query's answer.
+            if let Some(value) = self.special {
+                return Ok(Value::Integer(value));
+            }
             if self.dialect == Dialect::Five {
                 return Ok(Value::Integer(self.cursor_id));
             }
+            return Ok(Value::Null);
+        }
+        if self.special.is_some() {
             return Ok(Value::Null);
         }
         if self.contentless {
@@ -948,7 +887,7 @@ impl VirtualCursor for Fts5Cursor {
                     "wrong number of arguments to function snippet()",
                 ));
             }
-            let column = arguments.first().and_then(Value::as_integer).unwrap_or(0);
+            let column = int_argument(arguments.first());
             if column >= i64::try_from(self.columns).unwrap_or(i64::MAX) {
                 return Err(function_refusal("column index out of range"));
             }
@@ -989,13 +928,11 @@ impl VirtualCursor for Fts5Cursor {
         }
         // The hits are the query's, so the same maps score every row of it.
         self.ensure_hits(context)?;
-        let hits = self.matched.clone();
         let sizes = bm25::row_sizes(context, &self.shadows, row.rowid, self.columns)?;
+        let live = self.live_positions();
         Ok(Value::Real(bm25::score_row(
-            row.rowid,
-            &hits,
-            &self.phrases,
-            &self.totals,
+            &self.stats,
+            &live,
             &sizes,
             &weights,
         )))

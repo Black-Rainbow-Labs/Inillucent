@@ -1035,11 +1035,16 @@ impl Parser<'_> {
 
     /// Collects module arguments as raw source slices, split on top-level
     /// commas. A module argument is not SQL, so it is not parsed as SQL.
+    ///
+    /// **An argument runs from its first token to its last**, so a comment before or after it
+    /// is not part of it and one in the middle is, which is what SQLite hands the module:
+    /// `fts5(a, -- note\n b)` has the columns `a` and `b`, and `a /* x */ UNINDEXED` is one
+    /// argument with the comment in it.
     fn parse_module_arguments(&mut self) -> Result<Vec<Vec<u8>>, ParseError> {
         let mut arguments = Vec::new();
-        let mut start = self.cursor();
+        let mut start: Option<usize> = None;
         let mut depth = 0usize;
-        let mut end = start;
+        let mut end = 0usize;
         loop {
             let token = self.peek()?;
             match token.kind {
@@ -1050,7 +1055,7 @@ impl Parser<'_> {
                 TokenKind::Punctuator(Punctuator::RightParen) if depth == 0 => {
                     arguments.push(
                         self.source()
-                            .get(start..end)
+                            .get(start.unwrap_or(end)..end)
                             .unwrap_or(&[])
                             .trim_ascii()
                             .to_vec(),
@@ -1063,18 +1068,18 @@ impl Parser<'_> {
                 TokenKind::Punctuator(Punctuator::Comma) if depth == 0 => {
                     arguments.push(
                         self.source()
-                            .get(start..end)
+                            .get(start.unwrap_or(end)..end)
                             .unwrap_or(&[])
                             .trim_ascii()
                             .to_vec(),
                     );
                     self.bump()?;
-                    start = self.cursor();
-                    end = start;
+                    start = None;
                     continue;
                 }
                 _ => {}
             }
+            start.get_or_insert(token.span.start as usize);
             end = token.span.end as usize;
             self.bump()?;
         }

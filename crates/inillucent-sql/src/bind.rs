@@ -2816,6 +2816,7 @@ impl<'a> Binder<'a> {
         name: &[u8],
         arguments: &[ExprId],
         span: Span,
+        written: ast::NameId,
     ) -> Result<Option<BoundExpr>, ParseError> {
         let Some(first) = arguments.first() else {
             return Ok(None);
@@ -2847,6 +2848,11 @@ impl<'a> Binder<'a> {
             .is_some_and(|info| info.folded == entry.table.folded);
         if !self_column {
             return Ok(None);
+        }
+        // Inside an aggregate's arguments SQLite has no row of the table to ask, so the name is
+        // the function that always fails.
+        if self.inside_aggregate {
+            return Err(no_such_function(self.ast.text(written), span));
         }
         let mut rest = Vec::with_capacity(arguments.len() - 1);
         for argument in arguments.iter().skip(1) {
@@ -4286,7 +4292,7 @@ impl<'a> Binder<'a> {
         let star = arguments.is_none();
         let list = arguments.unwrap_or_default();
         if !star && !distinct && !list.is_empty() {
-            if let Some(bound) = self.bind_auxiliary_call(&folded, &list, span)? {
+            if let Some(bound) = self.bind_auxiliary_call(&folded, &list, span, name)? {
                 return Ok(bound);
             }
         }

@@ -161,8 +161,8 @@ check a run against.
 | tier | targets | tests | cadence | what it is for |
 |---|---:|---:|---|---|
 | `smoke` | 1 | 10 | `change` | the ten-second answer: a real file opened, written, reopened, read |
-| `unit` | 31 | 1,522 | `change` | every crate's own `#[cfg(test)]` modules |
-| `engine` | 124 | 608 | `change` | SQL and storage behaviour over real database files |
+| `unit` | 31 | 1,521 | `change` | every crate's own `#[cfg(test)]` modules |
+| `engine` | 125 | 612 | `change` | SQL and storage behaviour over real database files |
 | `differential` | 45 | 406 | `change` | graded against the pinned SQLite 3.53.4 |
 | `durability` | 63 | 296 | `merge` | crashes, injected faults, corruption and concurrency |
 | `e2e` | 46 | 476 | `change` | the public surfaces an application binds to, end to end |

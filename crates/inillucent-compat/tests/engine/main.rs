@@ -41,6 +41,7 @@ mod format_refusal;
 mod fts5_bulk_edits;
 mod fts5_commit_cost;
 mod fts5_legacy_layout;
+mod fts5_query_cost;
 mod fts5_segments;
 mod functions;
 mod hostile;
