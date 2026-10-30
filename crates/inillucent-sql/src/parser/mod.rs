@@ -950,10 +950,9 @@ impl<'a> Parser<'a> {
         if token.kind == TokenKind::Float {
             self.bump()?;
             let text = token.text(self.source).to_vec();
-            return Ok(self.ast.add_expr(
-                Expr::Literal(Literal::String(text)),
-                token.span,
-            ));
+            return Ok(self
+                .ast
+                .add_expr(Expr::Literal(Literal::String(text)), token.span));
         }
         if Parser::token_is_word(token) && !self.peek_at(1)?.is(Punctuator::LeftParen) {
             self.bump()?;

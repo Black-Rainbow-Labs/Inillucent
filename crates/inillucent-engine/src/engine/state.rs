@@ -417,7 +417,8 @@ impl Pragmas {
 
     /// Moves `PRAGMA data_version` on by one, because another connection committed.
     pub(crate) fn note_another_commit(&self) {
-        self.data_version.set(self.data_version.get().saturating_add(1));
+        self.data_version
+            .set(self.data_version.get().saturating_add(1));
     }
 
     /// Returns recursive triggers.
@@ -505,11 +506,12 @@ impl Pragmas {
     /// @param database - the number of the database that went
     pub(crate) fn database_detached(&self, database: usize) {
         let mut held = self.scoped.borrow_mut();
-        let moved: std::collections::BTreeMap<(usize, &'static str), i64> = std::mem::take(&mut *held)
-            .into_iter()
-            .filter(|((at, _), _)| *at != database)
-            .map(|((at, name), value)| ((if at > database { at - 1 } else { at }, name), value))
-            .collect();
+        let moved: std::collections::BTreeMap<(usize, &'static str), i64> =
+            std::mem::take(&mut *held)
+                .into_iter()
+                .filter(|((at, _), _)| *at != database)
+                .map(|((at, name), value)| ((if at > database { at - 1 } else { at }, name), value))
+                .collect();
         *held = moved;
     }
 
@@ -521,7 +523,10 @@ impl Pragmas {
     /// Puts back the settings kept per database after a `VACUUM`.
     ///
     /// @param held - what `scoped_all` returned
-    pub(crate) fn set_scoped_all(&self, held: std::collections::BTreeMap<(usize, &'static str), i64>) {
+    pub(crate) fn set_scoped_all(
+        &self,
+        held: std::collections::BTreeMap<(usize, &'static str), i64>,
+    ) {
         *self.scoped.borrow_mut() = held;
     }
 

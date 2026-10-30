@@ -445,7 +445,10 @@ pub fn lint(shell: &mut Shell, arguments: &[&str]) {
             }
             // The columns the key names in the parent, and the parent's primary key when it
             // names none. Joined with a bare comma, as SQLite writes them.
-            let named: Vec<String> = targets.into_iter().filter(|name| !name.is_empty()).collect();
+            let named: Vec<String> = targets
+                .into_iter()
+                .filter(|name| !name.is_empty())
+                .collect();
             let parent_key = match named.is_empty() {
                 true => parent_key_columns(shell, &parent),
                 false => named.join(","),

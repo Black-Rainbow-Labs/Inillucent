@@ -29,7 +29,10 @@ fn check_arguments(argument: Option<&PragmaArgument>) -> (usize, Option<Vec<u8>>
     match text.trim().parse::<i32>() {
         Ok(number) if number > 0 => (usize::try_from(number).unwrap_or(DEFAULT_ERROR_LIMIT), None),
         Ok(_) => (DEFAULT_ERROR_LIMIT, None),
-        Err(_) => (DEFAULT_ERROR_LIMIT, Some(text.to_ascii_lowercase().into_bytes())),
+        Err(_) => (
+            DEFAULT_ERROR_LIMIT,
+            Some(text.to_ascii_lowercase().into_bytes()),
+        ),
     }
 }
 
@@ -44,10 +47,8 @@ fn check_violation_query(
     at: usize,
 ) -> String {
     let quote = |text: &[u8]| String::from_utf8_lossy(text).replace('"', "\"\"");
-    let schema = inillucent_sql::catalog_view::CatalogView::database_name(
-        &database.schema.catalog,
-        at,
-    );
+    let schema =
+        inillucent_sql::catalog_view::CatalogView::database_name(&database.schema.catalog, at);
     let broken: Vec<String> = table
         .checks
         .iter()

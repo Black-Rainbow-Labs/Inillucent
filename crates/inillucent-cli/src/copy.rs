@@ -143,7 +143,9 @@ fn export_attached_memory_database(
         schema.replace('"', "\"\""),
         scratch.replace('\'', "''")
     );
-    shell.collect(&statement).map_err(|failure| failure.message)?;
+    shell
+        .collect(&statement)
+        .map_err(|failure| failure.message)?;
     remove_log_segments(&scratch);
     remove_database_files(destination);
     std::fs::rename(&scratch, destination).map_err(|error| {

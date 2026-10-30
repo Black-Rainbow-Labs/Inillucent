@@ -1983,7 +1983,11 @@ fn pragma_opens_a_transaction(sql: &str) -> bool {
         .chars()
         .take_while(|held| held.is_alphanumeric() || *held == '_' || *held == '.')
         .collect();
-    let name = word.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    let name = word
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     matches!(
         name.as_str(),
         "user_version"

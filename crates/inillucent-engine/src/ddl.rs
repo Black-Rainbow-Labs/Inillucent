@@ -120,17 +120,39 @@ pub(crate) fn query_only_refusal() -> inillucent_base::error::DbError {
 /// @param directive - the bound statement
 fn directive_writes(directive: &Directive) -> bool {
     match directive {
-        Directive::CreateTable { if_not_exists, exists, .. }
-        | Directive::CreateTableAsSelect { if_not_exists, exists, .. }
-        | Directive::CreateVirtualTable { if_not_exists, exists, .. }
-        | Directive::CreateView { if_not_exists, exists, .. }
-        | Directive::CreateIndex { if_not_exists, exists, .. } => !(*if_not_exists && *exists),
+        Directive::CreateTable {
+            if_not_exists,
+            exists,
+            ..
+        }
+        | Directive::CreateTableAsSelect {
+            if_not_exists,
+            exists,
+            ..
+        }
+        | Directive::CreateVirtualTable {
+            if_not_exists,
+            exists,
+            ..
+        }
+        | Directive::CreateView {
+            if_not_exists,
+            exists,
+            ..
+        }
+        | Directive::CreateIndex {
+            if_not_exists,
+            exists,
+            ..
+        } => !(*if_not_exists && *exists),
         Directive::CreateTrigger { .. }
         | Directive::Alter { .. }
         | Directive::Reindex { .. }
         | Directive::Vacuum { .. }
         | Directive::Analyze { .. } => true,
-        Directive::Drop { if_exists, exists, .. } => !(*if_exists && !*exists),
+        Directive::Drop {
+            if_exists, exists, ..
+        } => !(*if_exists && !*exists),
         _ => false,
     }
 }

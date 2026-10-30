@@ -233,9 +233,8 @@ pub(crate) fn table_text_problem(sql: &[u8]) -> Option<String> {
     let key_columns: Vec<ExprId> = constraints
         .iter()
         .filter_map(|(_, constraint)| match constraint {
-            TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
-                Some(columns.iter().map(|key| key.expr))
-            }
+            TableConstraint::PrimaryKey { columns, .. }
+            | TableConstraint::Unique { columns, .. } => Some(columns.iter().map(|key| key.expr)),
             _ => None,
         })
         .flatten()
@@ -310,7 +309,9 @@ fn unresolved_column(
             continue;
         }
         if key_columns.contains(&id) {
-            return Some("expressions prohibited in PRIMARY KEY and UNIQUE constraints".to_string());
+            return Some(
+                "expressions prohibited in PRIMARY KEY and UNIQUE constraints".to_string(),
+            );
         }
         let written = match table {
             Some(qualifier) => format!(

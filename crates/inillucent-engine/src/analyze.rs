@@ -63,7 +63,10 @@ impl ImportedDatabase {
         argument: Option<&inillucent_sql::directive::PragmaArgument>,
         at: Option<usize>,
     ) -> DbResult<Outcome> {
-        let mask = argument.map_or(DEFAULT_OPTIMIZE_MASK, inillucent_sql::declare::argument_integer);
+        let mask = argument.map_or(
+            DEFAULT_OPTIMIZE_MASK,
+            inillucent_sql::declare::argument_integer,
+        );
         let mut targets: Vec<(usize, Vec<u8>)> = Vec::new();
         if mask & OPTIMIZE_ANALYZE != 0 {
             targets = self.tables_to_optimize(mask, at)?;
@@ -143,7 +146,11 @@ impl ImportedDatabase {
         if rows == 0 {
             return Ok(false);
         }
-        if table.indexes.iter().any(|index| index.prefix_rows.is_empty()) {
+        if table
+            .indexes
+            .iter()
+            .any(|index| index.prefix_rows.is_empty())
+        {
             return Ok(true);
         }
         let Some(counted) = table.analysed_rows else {

@@ -514,11 +514,13 @@ impl crate::ImportedDatabase {
                 // `UNIQUE` constraint is built before the key exists and reports 0.
                 let descending = index.origin == inillucent_sql::catalog_view::IndexOrigin::Created
                     && table
-                    .indexes
-                    .iter()
-                    .filter(|held| held.origin == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey)
-                    .flat_map(|held| held.columns.iter())
-                    .any(|key| key.column == Some(position) && key.declared_descending);
+                        .indexes
+                        .iter()
+                        .filter(|held| {
+                            held.origin == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey
+                        })
+                        .flat_map(|held| held.columns.iter())
+                        .any(|key| key.column == Some(position) && key.declared_descending);
                 rows.push(vec![
                     OwnedDatum::Int(rows.len() as i64),
                     OwnedDatum::Int(i64::from(position)),
@@ -593,7 +595,8 @@ impl crate::ImportedDatabase {
                 _ => None,
             })
             .unwrap_or_default();
-        let declared = inillucent_sql::parser::parse_next_statement(&table.create_sql, 0, &limits).ok();
+        let declared =
+            inillucent_sql::parser::parse_next_statement(&table.create_sql, 0, &limits).ok();
         index
             .columns
             .iter()
@@ -611,10 +614,13 @@ impl crate::ImportedDatabase {
                     return None;
                 };
                 let column = columns.get(usize::from(key.column?))?;
-                column.constraints.iter().find_map(|(_, constraint)| match constraint {
-                    ColumnConstraint::Collate(name) => Some(parsed.ast.text(*name).to_vec()),
-                    _ => None,
-                })
+                column
+                    .constraints
+                    .iter()
+                    .find_map(|(_, constraint)| match constraint {
+                        ColumnConstraint::Collate(name) => Some(parsed.ast.text(*name).to_vec()),
+                        _ => None,
+                    })
             })
             .collect()
     }

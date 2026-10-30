@@ -70,7 +70,9 @@ impl crate::ImportedDatabase {
             };
             return named_integer(
                 "cache_size",
-                self.pragmas.scoped(database, "cache_size").unwrap_or(default),
+                self.pragmas
+                    .scoped(database, "cache_size")
+                    .unwrap_or(default),
             );
         };
         // Read as `sqlite3Atoi` reads it, so a number outside 32 bits is 0, as for `main`.
