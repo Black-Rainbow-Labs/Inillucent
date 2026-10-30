@@ -382,6 +382,23 @@ Read three neighbouring files before you write a new one. Then follow these rule
 8. If the change was deployed in any way (a release, a push to `main`, a site publish),
    `pwsh packaging/ci-status.ps1` exits 0. Section 3 says why.
 
+### Before you hand a change back: delete retired worktree evidence older than a day
+
+When a worktree on this machine is retired, its `_agent_output` is moved into
+`_agent_output/retired-worktrees/<name>/` in the main checkout. That evidence is kept for one day
+after the retire, and nothing else deletes it. By 2026-10-28 the folder had grown to 226 GB, 147 GB
+of it one change's benchmark databases. So the last step of every change made here is:
+
+```bash
+node <ai-service checkout>/scripts/clean-retired-worktrees.cjs <your worktree or the main checkout>
+```
+
+The `ai-service` checkout is the one beside this repository's main checkout. The script deletes only
+the entries directly inside `retired-worktrees` whose folder was made more than 24 hours ago,
+prints what it deleted and the total freed, and exits 0 even when one entry cannot be deleted.
+`--dry-run` lists what it would delete. Do not leave scratch databases of several gigabytes in
+`_agent_output`: delete them before you finish, and keep the numbers in a results file.
+
 ---
 
 ## 3. Releasing
