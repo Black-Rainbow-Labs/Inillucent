@@ -288,19 +288,31 @@ fn build_object(arguments: &[Argument<'_>], binary: bool) -> DbResult<Answer> {
 }
 
 /// Reads one argument as a path.
+///
+/// **A blob is read as the text its bytes spell.** SQLite reads a path with `sqlite3_value_text`,
+/// so `json_extract('{}', x'24')` is the path `$` and `json_set('1', x'4142', 1)` names the path
+/// `AB` in its message. Both used to name the path `?`.
+///
+/// @param argument - the path argument
 fn path_of(argument: &Argument<'_>) -> DbResult<Vec<path::Step>> {
-    let Value::Text(text) = argument.value else {
-        let rendered = match argument.value {
-            Value::Integer(value) => value.to_string(),
-            Value::Real(value) => String::from_utf8(numeric::real_to_text(*value))
-                .unwrap_or_else(|_| String::from("?")),
-            Value::Null => String::from("NULL"),
-            _ => String::from("?"),
-        };
-        return Err(path::bad_path(&rendered));
+    let bytes = match argument.value {
+        Value::Text(text) => text.utf8_bytes().to_vec(),
+        Value::Blob(blob) => blob.raw().to_vec(),
+        Value::Integer(value) => return Err(path::bad_path(&value.to_string())),
+        Value::Real(value) => {
+            let rendered = String::from_utf8(numeric::real_to_text(*value))
+                .unwrap_or_else(|_| String::from("?"));
+            return Err(path::bad_path(&rendered));
+        }
+        Value::Null => return Err(path::bad_path("NULL")),
     };
-    let bytes = text.utf8_bytes();
-    let source = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) if matches!(argument.value, Value::Blob(_)) => {
+            return Err(path::bad_path(&String::from_utf8_lossy(&bytes)))
+        }
+        Err(_) => return Err(malformed()),
+    };
     path::parse(source)
 }
 
@@ -737,11 +749,16 @@ fn pretty(arguments: &[Argument<'_>]) -> DbResult<Answer> {
     let Some(node) = document(first)? else {
         return Ok(Answer::null());
     };
-    let indent = match arguments.get(1) {
-        Some(Argument {
-            value: Value::Text(text),
-            ..
-        }) => String::from_utf8(text.utf8_bytes().to_vec()).unwrap_or_else(|_| "    ".to_string()),
+    // **The second argument is the indent text, whatever its type.** SQLite reads it with
+    // `sqlite3_value_text`, so `json_pretty('[1]', 2)` indents with the character `2` and a blob
+    // indents with its bytes. Only NULL, or no argument, gives the four spaces.
+    let indent = match arguments.get(1).map(|argument| argument.value) {
+        Some(Value::Text(text)) => String::from_utf8_lossy(&text.utf8_bytes()).into_owned(),
+        Some(Value::Blob(blob)) => String::from_utf8_lossy(blob.raw()).into_owned(),
+        Some(Value::Integer(value)) => value.to_string(),
+        Some(Value::Real(value)) => {
+            String::from_utf8_lossy(&numeric::real_to_text(*value)).into_owned()
+        }
         _ => "    ".to_string(),
     };
     Ok(Answer::marked(Value::owned_text(
@@ -785,9 +802,6 @@ fn valid(arguments: &[Argument<'_>]) -> DbResult<Answer> {
     // The flags are checked before the document, so a NULL document with a bad flag
     // is an error and not NULL.
     let flags = valid_flags(arguments.get(1))?;
-    let Some(flags) = flags else {
-        return Ok(Answer::null());
-    };
     if first.value.is_null() {
         return Ok(Answer::null());
     }
@@ -808,15 +822,17 @@ fn valid(arguments: &[Argument<'_>]) -> DbResult<Answer> {
 
 /// Reads the second argument of `json_valid`, which must be between 1 and 15.
 ///
-/// `Ok(None)` is a NULL flags argument, which makes the answer NULL.
+/// **A NULL flags argument is read as 0, which is out of range, so it is an error.** SQLite reads
+/// the argument with `sqlite3_value_int64`, which turns NULL into 0, so `json_valid(100, NULL)`
+/// raises the same error as `json_valid(100, 0)`. It answered NULL.
 ///
 /// @param argument - the flags argument, when the call has one
-fn valid_flags(argument: Option<&Argument<'_>>) -> DbResult<Option<i64>> {
+fn valid_flags(argument: Option<&Argument<'_>>) -> DbResult<i64> {
     let Some(argument) = argument else {
-        return Ok(Some(1));
+        return Ok(1);
     };
     let requested = match argument.value {
-        Value::Null => return Ok(None),
+        Value::Null => 0,
         Value::Integer(value) => *value,
         Value::Real(value) => *value as i64,
         Value::Text(text) => leading_integer(&text.utf8_bytes()),
@@ -827,7 +843,7 @@ fn valid_flags(argument: Option<&Argument<'_>>) -> DbResult<Option<i64>> {
             "FLAGS parameter to json_valid() must be between 1 and 15",
         ));
     }
-    Ok(Some(requested))
+    Ok(requested)
 }
 
 /// Returns the integer a text starts with, or 0, as SQLite converts a string to a number.

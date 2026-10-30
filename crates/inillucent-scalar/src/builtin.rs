@@ -630,7 +630,15 @@ fn unistr_quote(value: &Value<'static>, encoding: TextEncoding) -> Value<'static
     let Value::Text(text) = value else {
         return quote(value, encoding);
     };
-    let bytes = text.utf8_bytes();
+    // **The text ends at its first NUL.** SQLite walks the argument as a C string, so a NUL is
+    // the end of it and never the control character ` `: `unistr_quote('a' || char(0) ||
+    // 'b')` is `'a'`.
+    let all_bytes = text.utf8_bytes();
+    let end = all_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(all_bytes.len());
+    let bytes = all_bytes.get(..end).unwrap_or(&all_bytes);
     if !bytes.iter().any(|byte| *byte < 0x20) {
         return quote(value, encoding);
     }

@@ -11,7 +11,7 @@
 //! `fmod` and so keeps the sign of its left operand - `mod(-7, 3)` is -1, not 2.
 
 use inillucent_sql::function::MathFunc;
-use inillucent_value::{numeric as numeric_syntax, Value};
+use inillucent_value::{numeric as numeric_syntax, TextEncoding, Value};
 
 // Compiled on every platform so its tests run everywhere; only Windows calls it.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -115,10 +115,17 @@ pub fn call(func: MathFunc, arguments: &[Value<'static>]) -> Value<'static> {
         // to the one argument form, so `log(10, NULL)` was `log10(10)`. SQLite divides the
         // natural log of the second argument by the natural log of the base, and answers NULL
         // unless both are positive, so a base at or below 1 (`log(0.5, 2)`) is NULL as well.
-        MathFunc::Log if arguments.len() > 1 => second.and_then(|value| {
+        //
+        // **The second argument is read the way `sqlite3_value_double` reads it, not as a number
+        // or nothing.** SQLite checks only that the base is a number. The value is then read as a
+        // double with no check, so text takes its leading number (`log(1.5, '12abc')` is log base
+        // 1.5 of 12), a blob is read as text (`log(2, x'38')` is log base 2 of 8), and text with no
+        // number in it is 0, which is not positive and gives NULL.
+        MathFunc::Log if arguments.len() > 1 => {
+            let value = arguments.get(1).map_or(0.0, loose_double);
             let base = first.ln();
             (first > 0.0 && base > 0.0 && value > 0.0).then(|| value.ln() / base)
-        }),
+        }
         MathFunc::Log => positive(first, f64::log10),
         MathFunc::Mod => second.and_then(|second| (second != 0.0).then(|| first % second)),
         MathFunc::Pow => second.map(|second| first.powf(second)),
@@ -236,6 +243,19 @@ fn numeric(value: Option<&Value<'static>>) -> Option<Number> {
                 _ => None,
             }
         }
+    }
+}
+
+/// Reads a value as a double with no check that it is a number, as `sqlite3_value_double` does.
+///
+/// @param value - the argument; NULL reads as 0, text and blobs read their leading number
+fn loose_double(value: &Value<'static>) -> f64 {
+    match value {
+        Value::Null => 0.0,
+        Value::Integer(integer) => *integer as f64,
+        Value::Real(real) => *real,
+        Value::Text(text) => numeric_syntax::atof(text.raw(), text.encoding()).value,
+        Value::Blob(blob) => numeric_syntax::atof(blob.raw(), TextEncoding::Utf8).value,
     }
 }
 

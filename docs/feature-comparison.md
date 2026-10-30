@@ -475,7 +475,10 @@ The `localtime` and `utc` modifiers convert between the machine's time zone and 
 does. The answer depends on the operating system's time zone data and on the zone the process runs
 in, so the same query gives different answers on two machines. That is true in SQLite too. If a
 query must give the same answer everywhere, store the offset with the value and convert it in the
-application. `date_and_time_functions_match_the_oracle` in
+application. On Windows both engines apply the zone's current daylight saving rules to every year,
+because SQLite asks the C runtime's `localtime_s`: `datetime('2000-03-15 12:00:00', 'localtime')`
+uses the rule in force today and not the one the zone had in 2000. On Unix both use the system's
+time zone database, which has each year's own rule. `date_and_time_functions_match_the_oracle` in
 `crates/inillucent-compat/tests/differential/advanced_sql.rs` compares both engines on one machine.
 
 ### Math functions

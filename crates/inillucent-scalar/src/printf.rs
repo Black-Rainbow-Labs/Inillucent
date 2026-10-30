@@ -202,8 +202,16 @@ fn parse_spec(template: &[u8], start: usize) -> Option<(Spec, usize)> {
     loop {
         match template.get(index).copied() {
             Some(b'-') => spec.left = true,
-            Some(b'+') => spec.plus = true,
-            Some(b' ') => spec.space = true,
+            // SQLite keeps one prefix character and the last one written wins, so `%+ d` writes a
+            // space and `% +d` writes a plus sign.
+            Some(b'+') => {
+                spec.plus = true;
+                spec.space = false;
+            }
+            Some(b' ') => {
+                spec.space = true;
+                spec.plus = false;
+            }
             Some(b'0') => spec.zero = true,
             Some(b'#') => spec.alternate = true,
             Some(b',') => spec.group = true,
@@ -268,7 +276,7 @@ fn render(spec: &Spec, argument: Option<&Value<'static>>, encoding: TextEncoding
     match spec.conversion {
         b'd' | b'i' | b'u' => integer(spec, integer_of(argument)),
         b'x' => based(spec, integer_of(argument), 16, false),
-        // SQLite prints `%p` as uppercase hexadecimal, like `%X`.
+        // SQLite prints `%p` as uppercase hexadecimal, like `%X`, but its `#` prefix is `0x`.
         b'X' | b'p' => based(spec, integer_of(argument), 16, true),
         b'o' => based(spec, integer_of(argument), 8, false),
         b'r' => ordinal(spec, integer_of(argument)),
@@ -283,10 +291,10 @@ fn render(spec: &Spec, argument: Option<&Value<'static>>, encoding: TextEncoding
             // whole is *not* wrapped, which is what makes it usable inside a
             // `CREATE` statement being assembled. A NULL is `(NULL)`, as it is
             // for `%q`.
-            if matches!(argument, None | Some(Value::Null)) {
-                return b"(NULL)".to_vec();
-            }
-            let text = limited(text_of(argument, encoding), spec);
+            let text = match argument {
+                None | Some(Value::Null) => limited(b"(NULL)".to_vec(), spec),
+                _ => limited(text_of(argument, encoding), spec),
+            };
             let mut out = Vec::new();
             for byte in text {
                 if byte == b'"' {
@@ -462,6 +470,17 @@ fn grouped(digits: &[u8]) -> Vec<u8> {
 }
 
 /// Renders a hexadecimal or octal conversion.
+///
+/// **The `0` flag raises the precision to the width before the `#` prefix is written, so the
+/// prefix is outside the zeros.** SQLite does it in that order: `printf('%#010x', 255)` is
+/// `0x00000000ff`, twelve characters in a field of ten, and `printf('%#05o', 1)` is `000001`. The
+/// zeros used to be added afterwards, which put them in front of the `0x`. `%p` writes uppercase
+/// digits and a lowercase `0x`.
+///
+/// @param spec - the conversion as it was written
+/// @param value - the number, read as unsigned
+/// @param base - 16 or 8
+/// @param upper - whether the digits are uppercase
 fn based(spec: &Spec, value: i64, base: u32, upper: bool) -> Vec<u8> {
     let unsigned = value as u64;
     let mut text = match base {
@@ -470,11 +489,16 @@ fn based(spec: &Spec, value: i64, base: u32, upper: bool) -> Vec<u8> {
         8 => format!("{unsigned:o}"),
         _ => unsigned.to_string(),
     };
-    if let Some(precision) = spec.precision {
+    let mut precision = spec.precision;
+    if spec.zero && precision.is_none_or(|precision| precision < spec.width) {
+        precision = Some(spec.width);
+    }
+    if let Some(precision) = precision {
         text = String::from_utf8_lossy(&zero_filled(text.as_bytes(), precision)).into_owned();
     }
     if spec.alternate && unsigned != 0 {
         match base {
+            16 if spec.conversion == b'p' => text.insert_str(0, "0x"),
             16 if upper => text.insert_str(0, "0X"),
             16 => text.insert_str(0, "0x"),
             8 => text.insert(0, '0'),
@@ -598,12 +622,12 @@ fn quoted(
     // A NULL is `NULL` unquoted for `%Q` and the literal text `(NULL)` for
     // `%q`, which is the marker SQLite writes wherever a string was expected
     // and none was given.
+    //
+    // **The precision cuts that marker like any other text.** SQLite measures the marker
+    // as the argument, so `printf('%.2Q', NULL)` is `NU` and `printf('%.2q', NULL)` is `(N`.
     if matches!(argument, None | Some(Value::Null)) {
-        return if wrap {
-            b"NULL".to_vec()
-        } else {
-            b"(NULL)".to_vec()
-        };
+        let marker: &[u8] = if wrap { b"NULL" } else { b"(NULL)" };
+        return limited(marker.to_vec(), spec);
     }
     let text = limited(text_of(argument, encoding), spec);
     if spec.alternate {

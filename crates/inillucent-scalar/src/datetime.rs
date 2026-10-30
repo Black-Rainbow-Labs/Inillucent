@@ -35,7 +35,7 @@
 //!   moved, recorded when it happens and subtracted when `floor` asks.
 
 use inillucent_sql::function::TimeFunc;
-use inillucent_value::{numeric, TextEncoding, Value};
+use inillucent_value::{fpdecode, numeric, TextEncoding, Value};
 
 mod state;
 
@@ -199,22 +199,10 @@ pub fn call(
             }
         }
         TimeFunc::Date => render(day, civil, b"%Y-%m-%d", YearStyle::Signed),
-        TimeFunc::Time => render(
-            day,
-            civil,
-            if subsec { b"%H:%M:%f" } else { b"%H:%M:%S" },
-            YearStyle::Signed,
-        ),
-        TimeFunc::DateTime => render(
-            day,
-            civil,
-            if subsec {
-                b"%Y-%m-%d %H:%M:%f"
-            } else {
-                b"%Y-%m-%d %H:%M:%S"
-            },
-            YearStyle::Signed,
-        ),
+        TimeFunc::Time if subsec => with_subsec_tail(day, civil, b"%H:%M:"),
+        TimeFunc::Time => render(day, civil, b"%H:%M:%S", YearStyle::Signed),
+        TimeFunc::DateTime if subsec => with_subsec_tail(day, civil, b"%Y-%m-%d %H:%M:"),
+        TimeFunc::DateTime => render(day, civil, b"%Y-%m-%d %H:%M:%S", YearStyle::Signed),
         TimeFunc::StrfTime => {
             let format = format.unwrap_or_default();
             let format = if subsec {
@@ -838,11 +826,70 @@ fn parse_amount(text: &[u8]) -> Option<f64> {
         Some(b'+') | Some(b'-') => text.get(1..)?,
         _ => text,
     };
-    if magnitude.is_empty() || !numeric::looks_numeric(magnitude, TextEncoding::Utf8) {
+    // SQLite's scanner takes one sign, and the sign was taken above. A second one (`++1`, `+-.5`)
+    // is text after the number, so the modifier is not recognised. `looks_numeric` accepts its
+    // own sign, so the second one has to be refused here.
+    if magnitude.is_empty()
+        || matches!(magnitude.first(), Some(b'+' | b'-'))
+        || !numeric::looks_numeric(magnitude, TextEncoding::Utf8)
+    {
         return None;
     }
     let parsed = numeric::atof(magnitude, TextEncoding::Utf8).value;
     Some(if negative { -parsed } else { parsed })
+}
+
+/// Renders the part of `time()` or `datetime()` before the seconds, then writes the seconds with
+/// milliseconds.
+///
+/// **`time()` and `datetime()` round the milliseconds up and `strftime('%f')` does not.** They
+/// compute `(int)(1000.0 * s + 0.5)` and write it as seconds and three digits, so
+/// `datetime('2000-01-01 00:00:16.9885', 'subsec')` is `16.989`, while `strftime('%f', ...)` of the
+/// same value goes through `printf` and is `16.988`. Unlike `%f`, this does not hold the seconds
+/// at 59.999.
+///
+/// @param day - the Julian day
+/// @param civil - the broken down fields to read
+/// @param head - the format for everything up to the seconds
+fn with_subsec_tail(day: f64, civil: Civil, head: &[u8]) -> Value<'static> {
+    let Some(mut text) = modifier_bytes(&render(day, civil, head, YearStyle::Signed)) else {
+        return Value::Null;
+    };
+    let milliseconds = (1000.0 * civil.second + 0.5) as i64;
+    let tail = format!(
+        "{:02}.{:03}",
+        milliseconds / 1000 % 100,
+        milliseconds % 1000
+    );
+    text.extend_from_slice(tail.as_bytes());
+    Value::owned_text(&text).unwrap_or(Value::Null)
+}
+
+/// Writes seconds as SQLite's `%06.3f` does, for `%f` and for `datetime(x, 'subsec')`.
+///
+/// **SQLite's own printf rounds the third decimal, and Rust's formatter does not.** SQLite adds
+/// half of the last place to the decimal expansion and then cuts it, so `16.9885` is `16.989`.
+/// Rust rounds the exact binary value, and the nearest double to 16.9885 is slightly below it, so
+/// it printed `16.988`. The text comes from the same decoder `printf` uses. SQLite also holds the
+/// seconds at 59.999 at most, so a leap second is never written as `60.000`.
+///
+/// @param seconds - the seconds and fraction of the minute
+fn fractional_seconds(seconds: f64) -> Vec<u8> {
+    let format = fpdecode::Format {
+        conversion: fpdecode::Conversion::Fixed,
+        precision: Some(3),
+        prefix: None,
+        alternate: false,
+        alternate2: false,
+        zero_pad: true,
+        thousands: false,
+        upper: false,
+    };
+    let mut digits = fpdecode::render(seconds.min(59.999), &format);
+    while digits.len() < 6 {
+        digits.insert(0, b'0');
+    }
+    digits
 }
 
 /// Renders one moment through a `strftime` format.
@@ -879,10 +926,7 @@ fn render(day: f64, civil: Civil, format: &[u8], years: YearStyle) -> Value<'sta
                 let text = format!("{:2}", civil.day);
                 out.extend_from_slice(text.as_bytes());
             }
-            b'f' => {
-                let text = format!("{:06.3}", civil.second);
-                out.extend_from_slice(text.as_bytes());
-            }
+            b'f' => out.extend_from_slice(&fractional_seconds(civil.second)),
             b'F' => {
                 push_year(&mut out, civil.year, years);
                 let text = format!("-{:02}-{:02}", civil.month, civil.day);
@@ -972,27 +1016,27 @@ fn render(day: f64, civil: Civil, format: &[u8], years: YearStyle) -> Value<'sta
 
 /// Renders a double the way C's `%.16g` does.
 ///
-/// Sixteen significant digits, trailing zeros removed, and the fixed form for
-/// an exponent in the range a Julian day lives in. Only `%J` needs it, and it
-/// needs it exactly: the shortest round-trip rendering Rust gives has
-/// seventeen digits for the same value.
+/// Sixteen significant digits with trailing zeros removed, switching to the exponent form below
+/// 1e-4 as `%g` does: `strftime('%J', 1e-5)` is `1e-05`. Only `%J` needs it, and it needs it
+/// exactly, because the shortest round-trip rendering Rust gives has seventeen digits for the same
+/// value. The digits come from the decoder `printf` uses, so the two cannot drift apart.
 ///
 /// @param value - the number to render
 fn sixteen_significant(value: f64) -> String {
-    if !value.is_finite() || value == 0.0 {
+    if !value.is_finite() {
         return format!("{value}");
     }
-    let exponent = value.abs().log10().floor() as i32;
-    if !(-5..16).contains(&exponent) {
-        return format!("{value}");
-    }
-    let decimals = (15 - exponent).max(0) as usize;
-    let text = format!("{value:.decimals$}");
-    if !text.contains('.') {
-        return text;
-    }
-    let trimmed = text.trim_end_matches('0');
-    trimmed.trim_end_matches('.').to_string()
+    let format = fpdecode::Format {
+        conversion: fpdecode::Conversion::General,
+        precision: Some(16),
+        prefix: None,
+        alternate: false,
+        alternate2: false,
+        zero_pad: false,
+        thousands: false,
+        upper: false,
+    };
+    String::from_utf8_lossy(&fpdecode::render(value, &format)).into_owned()
 }
 
 /// Appends a year.

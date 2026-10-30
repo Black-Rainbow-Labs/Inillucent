@@ -622,7 +622,13 @@ impl JsonCall {
                 let Ok(text) = std::str::from_utf8(path) else {
                     return Ok(None);
                 };
-                held.steps = Some((path.to_vec(), json::path::parse(text)?));
+                // **A path that does not parse is reported by the general path, not here.**
+                // SQLite reads the document first, so `json_extract('abc', 'x')` is
+                // `malformed JSON` and only a valid document reports `bad JSON path`.
+                let Ok(steps) = json::path::parse(text) else {
+                    return Ok(None);
+                };
+                held.steps = Some((path.to_vec(), steps));
             }
         }
         if held.document.as_ref().map(|(seen, _)| seen.as_slice()) == Some(document) {
@@ -1339,9 +1345,6 @@ impl Eval for Pattern {
                 ));
             }
         }
-        if operand.is_null() || pattern.is_null() {
-            return Ok(Computed::Borrowed(Datum::Null));
-        }
         // **The escape is one character, and one that is not is refused**
         // (task-2066 section 4.2, item 27). This took the first byte of
         // whatever was written, so `ESCAPE ''` silently meant "no escape" -
@@ -1362,6 +1365,12 @@ impl Eval for Pattern {
             }
             None => None,
         };
+        // **A NULL subject or pattern is answered after the escape is checked.** SQLite's
+        // `likeFunc` refuses a bad `ESCAPE` before it looks at either side, so
+        // `'a' LIKE NULL ESCAPE ''` is an error and not NULL.
+        if operand.is_null() || pattern.is_null() {
+            return Ok(Computed::Borrowed(Datum::Null));
+        }
         // **Text against text needs no copy, and the common shapes no matcher
         // (task-2175).** Copying both sides into owned values for every row was
         // nearly half of `label LIKE '%9 lorem%'` over 100,000 rows, and the

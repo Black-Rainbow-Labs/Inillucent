@@ -20,8 +20,21 @@
 //! such a value is the length and hex of the four byte encoding of that
 //! character, which is not what `sqlite3` reports for the one byte it was given.
 //! No input produced by a real text editor reaches the reserved range.
+//!
+//! **A character of the reserved range is left alone until a stand in has been made.** The
+//! engine can produce any character itself: `SELECT char(1114111)` is the valid character
+//! U+10FFFF, and writing it as the byte `FF` is wrong. A stand in and that character are the same
+//! text once they are inside the engine, so no rule can tell them apart. What can be told is
+//! whether the shell has made any stand in at all: it makes one only for a byte that is not UTF-8,
+//! and when it has not, every character of the range came from the engine and is written as it
+//! is. A process that has read invalid bytes and also prints a character of the range cannot be
+//! answered correctly.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether `decode` has made a stand in in this process.
+static STAND_INS_MADE: AtomicBool = AtomicBool::new(false);
 
 /// The code point that stands for the byte `0x00`; only 0x80 to 0xFF are used.
 const BASE: u32 = 0x10_FF00;
@@ -47,6 +60,9 @@ fn stood_for(character: char) -> Option<u8> {
 
 /// Turns bytes into text, giving each byte that is not UTF-8 its stand in.
 ///
+/// Making a stand in is recorded, because `encode` leaves the reserved range alone until one has
+/// been made.
+///
 /// @param bytes - a value, a line of input or a file
 pub fn decode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -64,6 +80,7 @@ pub fn decode(bytes: &[u8]) -> String {
                 // is every remaining byte.
                 let length = error.error_len().unwrap_or(bad.len()).max(1);
                 let (invalid, after) = bad.split_at(length.min(bad.len()));
+                STAND_INS_MADE.store(true, Ordering::Relaxed);
                 out.extend(invalid.iter().map(|byte| stand_in(*byte)));
                 rest = after;
             }
@@ -75,7 +92,15 @@ pub fn decode(bytes: &[u8]) -> String {
 ///
 /// @param text - text that may hold stand ins
 pub fn encode(text: &str) -> Cow<'_, [u8]> {
-    if !text.chars().any(|character| stood_for(character).is_some()) {
+    encode_given(text, STAND_INS_MADE.load(Ordering::Relaxed))
+}
+
+/// Turns text back into bytes, reading the reserved range as stand ins only when any were made.
+///
+/// @param text - text that may hold stand ins
+/// @param stand_ins_made - whether `decode` has made a stand in in this process
+fn encode_given(text: &str, stand_ins_made: bool) -> Cow<'_, [u8]> {
+    if !stand_ins_made || !text.chars().any(|character| stood_for(character).is_some()) {
         return Cow::Borrowed(text.as_bytes());
     }
     let mut out = Vec::with_capacity(text.len());
@@ -175,6 +200,16 @@ mod tests {
         assert_eq!(encode(&decode(&all)).as_ref(), all.as_slice());
         let mixed = b"caf\xE9 \xF0\x9F\x98\x80 \xFF\xFE end\xE2\x82";
         assert_eq!(encode(&decode(mixed)).as_ref(), mixed.as_slice());
+    }
+
+    /// A character of the reserved range the engine made is written as itself.
+    ///
+    /// `SELECT char(1114111)` is U+10FFFF, four bytes, and was written as the single byte `FF`.
+    #[test]
+    fn the_engines_own_reserved_character_is_written_whole() {
+        let text = "\u{10FFFF}|\u{10FFFE}|\u{10FF80}";
+        assert_eq!(encode_given(text, false).as_ref(), text.as_bytes());
+        assert_eq!(encode_given("\u{10FFFF}", true).as_ref(), b"\xFF");
     }
 
     /// Valid UTF-8 is not touched.

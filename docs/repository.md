@@ -244,7 +244,7 @@ prerequisite in `tests/selection.toml` is missing from this table or has a diffe
 | `btree-corpus` | 1 | the saved sequences under `compat/corpus/btree/`, which are committed |
 | `cc` | 1 | a C compiler on `PATH`, for the program that links the C ABI |
 | `cuda` | 1 | a graphics card that ONNX Runtime can run the model on, and the CUDA build of the runtime: `inillucent setup-embeddings runtime --gpu`. Only card 0 is used |
-| `local-timezone` | 1 | a local time zone set in the operating system: `localtime_r` on Unix, `SystemTimeToTzSpecificLocalTime` on Windows |
+| `local-timezone` | 1 | a local time zone set in the operating system: `localtime_r` on Unix, `GetTimeZoneInformation` on Windows |
 | `mysql` | 1 | a running MySQL server, named by `INILLUCENT_TEST_MYSQL_URL` |
 | `narrow-slots` | 1 | the narrow integer slots compiled in, set by a constant in `crates/inillucent-tree/src/leaf.rs` |
 | `network` | 1 | outbound network access, turned on by setting `INILLUCENT_NETWORK_TESTS` |

@@ -387,11 +387,7 @@ pub fn insert_into_array(
         lookup(node, steps)?;
         return Ok(());
     }
-    if matches!(last, Step::Key(_)) {
-        return Err(inillucent_base::error::misuse(format!(
-            "not an array element: '{written}'"
-        )));
-    }
+    refuse_key_into_object(node, steps, written)?;
     let Some(container) = follow(node, init) else {
         return Ok(());
     };
@@ -411,6 +407,53 @@ pub fn insert_into_array(
         return Ok(());
     }
     items.insert(at, value);
+    Ok(())
+}
+
+/// Refuses `json_array_insert` when the path walks an object to a key that is not an array.
+///
+/// **The refusal belongs to an object and not to a key step as such.** SQLite raises `not an
+/// array element` when the walk reaches an object and the key is missing (`$.b` in `{"a":1}`,
+/// and `$.x.c` as well) or is the last step (`$.a` in `{"a":1}`). A key step against a value that
+/// is not an object finds nothing and changes nothing: `json_array_insert('3', '$.a', 1)` and
+/// `json_array_insert('[1]', '$.a', 1)` answer their input. This was refused for any path whose
+/// last step was a key.
+///
+/// @param node - the document
+/// @param steps - the path
+/// @param written - the path as it was written, for the refusal
+fn refuse_key_into_object(node: &Node, steps: &[Step], written: &str) -> DbResult<()> {
+    let mut current = node;
+    for (at, step) in steps.iter().enumerate() {
+        let next = match (step, current) {
+            (Step::Key(name), Node::Object(members)) => {
+                let found = members
+                    .iter()
+                    .find(|(label, _)| label_matches(label, name))
+                    .map(|(_, held)| held);
+                match found {
+                    Some(held) if at.saturating_add(1) < steps.len() => held,
+                    _ => {
+                        return Err(inillucent_base::error::misuse(format!(
+                            "not an array element: '{written}'"
+                        )))
+                    }
+                }
+            }
+            (Step::Index(index), Node::Array(items)) => match items.get(*index) {
+                Some(held) => held,
+                None => return Ok(()),
+            },
+            (Step::FromEnd(back), Node::Array(items)) => {
+                match items.len().checked_sub(*back).and_then(|at| items.get(at)) {
+                    Some(held) => held,
+                    None => return Ok(()),
+                }
+            }
+            _ => return Ok(()),
+        };
+        current = next;
+    }
     Ok(())
 }
 
