@@ -613,15 +613,17 @@ fn projection_chain(
         let translated = translate(&column.expr, &space, params, frame)?;
         projected.push(compile(&translated, &types)?);
     }
+    let result_width = projected.len();
     let mut keys = Vec::with_capacity(select.order_by.len());
-    // **A computed sort key is appended to the row before the sort.** The
-    // sorter reads a column, and `ORDER BY low DESC` over `on_hand <=
-    // reorder_level AS low`, or `ORDER BY lower(name)`, is not one, so both
-    // were refused as "a windowed query ordered by a computed expression".
-    // The key is evaluated over the widened row, appended after it, and
-    // sorted by; the projection reads only the columns before it.
-    let whole = width.saturating_add(select.windows.len());
-    let mut computed_keys: Vec<Box<dyn crate::expr::Eval>> = Vec::new();
+    // **The sort sees the projected row and the keys, never the buffered one.** The sorter used
+    // to sit below the projection, so every row it held carried every value the window pass
+    // buffered and every window result: with `LENGTH(group_concat(x) OVER ())` that is 168,000
+    // bytes a row for 8,000 rows, written to and read back from the spill file, 10 s against
+    // SQLite's 0.3 s, and a row over the reader's window was a failed read (bug hunt 11). Each
+    // key is evaluated over the widened row, appended after the projected columns, sorted by,
+    // and dropped after the sort. An `ORDER BY low DESC` over `on_hand <= reorder_level AS low`,
+    // or `ORDER BY lower(name)`, is not a column either, so every key is carried the same way.
+    let mut carried_keys: Vec<Box<dyn crate::expr::Eval>> = Vec::new();
     for term in &select.order_by {
         // An ordinal or an alias names an output column, so what it orders by
         // is that column's expression - which reads the widened row like every
@@ -634,13 +636,10 @@ fn projection_chain(
                 .ok_or_else(|| misuse("an ORDER BY ordinal outside the result list"))?,
             other => other,
         };
-        let column = match translate(expr, &space, params, frame)? {
-            Expr::Column(column) => column,
-            translated => {
-                computed_keys.push(compile(&translated, &types)?);
-                whole.saturating_add(computed_keys.len()).saturating_sub(1)
-            }
-        };
+        carried_keys.push(compile(&translate(expr, &space, params, frame)?, &types)?);
+        let column = result_width
+            .saturating_add(carried_keys.len())
+            .saturating_sub(1);
         let descending = term.order == SortOrder::Descending;
         keys.push(SortKey {
             column,
@@ -667,16 +666,15 @@ fn projection_chain(
         head =
             Box::new(Distinct::new(distinct_collations(select), head).spilling_to(catalog.spill()));
     }
-    head = Box::new(Project::new(projected, head));
-    if !keys.is_empty() {
-        head = Box::new(Sort::new(keys, head).spilling_to(catalog.spill()));
+    if keys.is_empty() {
+        return Ok(Box::new(Project::new(projected, head)));
     }
-    if !computed_keys.is_empty() {
-        let mut extended: Vec<Box<dyn crate::expr::Eval>> = (0..whole)
-            .map(|column| compile(&Expr::Column(column), &types))
-            .collect::<DbResult<Vec<_>>>()?;
-        extended.extend(computed_keys);
-        head = Box::new(Project::new(extended, head));
-    }
-    Ok(head)
+    let carried_types = vec![StaticType::Unknown; result_width.saturating_add(carried_keys.len())];
+    let trimmed = (0..result_width)
+        .map(|column| compile(&Expr::Column(column), &carried_types))
+        .collect::<DbResult<Vec<_>>>()?;
+    head = Box::new(Project::new(trimmed, head));
+    head = Box::new(Sort::new(keys, head).spilling_to(catalog.spill()));
+    projected.extend(carried_keys);
+    Ok(Box::new(Project::new(projected, head)))
 }

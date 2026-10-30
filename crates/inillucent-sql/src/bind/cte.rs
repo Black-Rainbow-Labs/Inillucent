@@ -712,7 +712,8 @@ impl<'a> Binder<'a> {
         };
         // A definition already being bound cannot be bound again: that
         // is a cycle, and following it does not end.
-        if self.binding_ctes.contains(&cte.select) {
+        let binding = (std::ptr::from_ref(self.ast) as usize, cte.select);
+        if self.binding_ctes.contains(&binding) {
             // SQLite names the expression and points at nothing.
             let _ = span;
             return Err(ParseError::new(
@@ -723,7 +724,7 @@ impl<'a> Binder<'a> {
                 Span::default(),
             ));
         }
-        self.binding_ctes.push(cte.select);
+        self.binding_ctes.push(binding);
         // **A definition sees the names of its own `WITH` and the ones
         // outside it, not the ones of a `WITH` nested in the query that
         // happens to use it.** The levels above the definition's own are set
@@ -804,6 +805,35 @@ impl<'a> Binder<'a> {
         }
         (found, database_name)
     }
+}
+
+/// Refuses a query whose FROM list, once the derived tables SQLite flattens are part of it, is
+/// longer than SQLite builds.
+///
+/// **Counted here because the planner cannot refuse.** Nested common table expressions that each
+/// read the one above several times flatten to the product of their term counts: four levels of
+/// nine references is 6,561 terms, which the planner's join order search never finished, and which
+/// SQLite stops at 200 terms with `too many FROM clause terms`. A list of more than 64 terms that
+/// is still left at the join is `at most 64 tables in a join`.
+///
+/// @param bound - the bound statement
+pub(super) fn refuse_a_join_that_is_too_wide(
+    bound: &crate::bind::BoundSelect,
+) -> Result<(), ParseError> {
+    let widest = core::iter::once(bound)
+        .chain(bound.compounds.iter().map(|(_, arm)| arm))
+        .map(crate::plan::flatten::flattened_term_count)
+        .max()
+        .unwrap_or(0);
+    let message = match widest {
+        200.. => "too many FROM clause terms, max: 200",
+        65.. => "at most 64 tables in a join",
+        _ => return Ok(()),
+    };
+    Err(ParseError::new(
+        ParseErrorKind::Refused(message.to_string()),
+        Span::default(),
+    ))
 }
 
 /// Returns SQLite's refusal of a common table expression that reads itself where it may not.

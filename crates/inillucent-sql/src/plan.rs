@@ -23,7 +23,7 @@ use crate::cost;
 mod adjacent;
 mod covering;
 mod describe;
-mod flatten;
+pub(crate) mod flatten;
 mod hint;
 mod implied;
 mod join_cost;
@@ -1092,7 +1092,7 @@ fn holds_subquery(select: &BoundSelect) -> bool {
         })
         || select.sources.iter().any(|source| {
             source.constraint.iter().any(expression_holds_subquery)
-                || matches!(&source.rows, SourceRows::Subquery(block) if holds_subquery(block))
+                || subquery_rows::rows_hold_subquery(&source.rows)
         })
 }
 

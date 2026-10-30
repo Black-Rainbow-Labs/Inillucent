@@ -88,6 +88,10 @@ use crate::scan::Projection;
 // business rewriting the call sites: `physical::Params`, `physical::prepare`
 // and `physical::run` all still resolve.
 mod chain;
+mod constant_terms;
+mod derived_limit;
+mod growing;
+pub use growing::GrowingSource;
 mod joins;
 mod params;
 mod run;

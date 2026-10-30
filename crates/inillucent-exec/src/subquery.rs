@@ -280,6 +280,18 @@ fn gather<'a>(select: &'a BoundSelect, into: &mut Vec<Block<'a>>) {
         if let inillucent_sql::bind::SourceRows::Subquery(block) = &source.rows {
             gather(block, into);
         }
+        // **A recursive CTE's own `LIMIT` and `OFFSET` and the subqueries in its arms are the
+        // statement's too.** `LIMIT (SELECT 3)` on a recursive CTE was refused as "a correlated
+        // subquery used as a value", because the fold never looked inside the recursion and the
+        // slot the limit reads was empty.
+        if let inillucent_sql::bind::SourceRows::Recursive(body) = &source.rows {
+            for (_op, arm) in body.seeds.iter().chain(body.steps.iter()) {
+                gather(arm, into);
+            }
+            for expr in body.limit.iter().chain(body.offset.iter()) {
+                gather_expression(expr, into);
+            }
+        }
         if let Some(constraint) = &source.constraint {
             gather_expression(constraint, into);
         }

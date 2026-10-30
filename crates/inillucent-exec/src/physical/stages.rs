@@ -265,6 +265,9 @@ pub enum Source<'t> {
     /// `WHERE` above an unbounded recursion can end it. Materialising the
     /// recursion first never returned for such a query.
     Recursive(Box<RecursiveSource<'t>>),
+    /// A derived table over a recursion, run with a growing bound while the query above reads it;
+    /// see `growing`.
+    Growing(Box<GrowingSource<'t>>),
     /// A fixed number of rows of no columns at all.
     ///
     /// What drives `SELECT 1`, `SELECT date('now')` and every other query with
@@ -437,6 +440,10 @@ impl Source<'_> {
                 )?;
                 downstream.finish()
             }
+            Source::Growing(source) => {
+                source.run(downstream)?;
+                downstream.finish()
+            }
             Source::Recursive(fill) => {
                 crate::recursive::stream_recursive(
                     &crate::recursive::Recursion {
@@ -476,7 +483,7 @@ impl Source<'_> {
             Source::Vector(_, _) => "VECTOR SEARCH",
             Source::Rows(_) => "SCAN SUBQUERY",
             Source::Virtual(_) => "SCAN VIRTUAL TABLE",
-            Source::Recursive(_) => "SCAN SUBQUERY",
+            Source::Recursive(_) | Source::Growing(_) => "SCAN SUBQUERY",
             Source::Constant(_) => "CONSTANT ROW",
         }
     }

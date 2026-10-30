@@ -60,6 +60,28 @@ pub(super) fn flatten_derived_tables(select: &mut BoundSelect, in_compound: bool
     }
 }
 
+/// Returns how many FROM terms a query has once every derived table SQLite flattens is part of it.
+///
+/// Each derived table that `can_flatten` is counted as the terms of its own query and any other
+/// FROM term as one. This is the length of the FROM list SQLite's flattener builds, which it
+/// refuses at 200 terms (`too many FROM clause terms, max: 200`) and the join at 64 tables (`at
+/// most 64 tables in a join`).
+///
+/// @param select - the bound query
+pub(crate) fn flattened_term_count(select: &BoundSelect) -> usize {
+    select
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| match &source.rows {
+            SourceRows::Subquery(block) if can_flatten(select, position, false) => {
+                flattened_term_count(block)
+            }
+            _ => 1,
+        })
+        .sum()
+}
+
 /// Turns each outer join whose null extended side the `WHERE` cannot leave
 /// null into a join that does not null extend it, as SQLite's join
 /// simplification does.

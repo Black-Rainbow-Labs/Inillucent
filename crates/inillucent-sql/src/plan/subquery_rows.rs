@@ -10,6 +10,30 @@
 
 use super::*;
 
+/// Returns whether the rows of a FROM term hold a subquery used as a value.
+///
+/// A derived table holds one when its query does. A recursive CTE holds one when its own `LIMIT`
+/// or `OFFSET` or any of its arms does: `LIMIT (SELECT 3)` on a recursive CTE was refused as "a
+/// correlated subquery used as a value", because the flag `subquery::fold` asks first was clear
+/// and the slot the limit reads was never filled.
+///
+/// @param rows - where the FROM term's rows come from
+pub(super) fn rows_hold_subquery(rows: &SourceRows) -> bool {
+    match rows {
+        SourceRows::Subquery(block) => holds_subquery(block),
+        SourceRows::Recursive(body) => {
+            body.limit.iter().any(expression_holds_subquery)
+                || body.offset.iter().any(expression_holds_subquery)
+                || body
+                    .seeds
+                    .iter()
+                    .chain(body.steps.iter())
+                    .any(|(_op, arm)| holds_subquery(arm))
+        }
+        _ => false,
+    }
+}
+
 /// Returns what one FROM term's path costs in the join order search, and how
 /// many rows it produces.
 ///

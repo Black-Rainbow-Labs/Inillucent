@@ -107,6 +107,18 @@ pub struct Correlation {
     once: bool,
     /// The answer kept for a block that is `once`.
     kept: std::cell::RefCell<Option<OwnedDatum>>,
+    /// Whether the block's answer is the same for the same fed values, so the answer to the last
+    /// row is the answer to the next row that feeds the same ones.
+    ///
+    /// **A correlated `EXISTS` that reads only an outer term the join has already moved past ran
+    /// once for every row of the inner term** (bug hunt 11): 1,250 ms against SQLite's 0.27 ms
+    /// for 2,500 rows, because the operator sits above every join and a row is a row. A block is
+    /// memoised only when nothing it reads can change while the statement runs and nothing in
+    /// it can answer differently for the same values: no volatile or registered function, no
+    /// nested subquery, and no table the statement writes.
+    memoised: bool,
+    /// The fed values of the last row and the answer given for them.
+    last: std::cell::RefCell<Option<(Vec<OwnedDatum>, OwnedDatum)>>,
     /// The block's chain, built at its first outer row and run again for each
     /// one after (task-2183).
     ///
@@ -453,11 +465,28 @@ impl Correlation {
                 return Ok(kept);
             }
         }
+        let fed = match self.memoised {
+            true => Some(
+                self.feeds
+                    .iter()
+                    .map(|(column, _)| feed(*column))
+                    .collect::<DbResult<Vec<OwnedDatum>>>()?,
+            ),
+            false => None,
+        };
+        if let (Some(fed), Some((last, answer))) = (&fed, self.last.borrow().as_ref()) {
+            if fed == last {
+                return Ok(answer.clone());
+            }
+        }
         let counting = Answering::begin();
         let answer = self.run(catalog, bound, feed)?;
         drop(counting);
         if self.once {
             *self.kept.borrow_mut() = Some(answer.clone());
+        }
+        if let Some(fed) = fed {
+            *self.last.borrow_mut() = Some((fed, answer.clone()));
         }
         Ok(answer)
     }
@@ -638,6 +667,7 @@ impl Correlation {
     /// Forgets the answer a `once` block kept, so the next statement runs it.
     pub fn forget(&self) {
         *self.kept.borrow_mut() = None;
+        *self.last.borrow_mut() = None;
     }
 
     /// Runs the block for one outer row.
@@ -883,6 +913,7 @@ fn prepare_blocks(
         let mut block = block;
         let once = block.correlations.is_empty()
             && target_root.is_some_and(|root| !reads_table(&block, root));
+        let memoised = answers_the_same_for_the_same_values(&block, target_root);
         let owned = owned_sources(&block);
         let mut feeds = Vec::new();
         let mut next = first_free_parameter(&mut block);
@@ -935,6 +966,8 @@ fn prepare_blocks(
             prepared: choice,
             feeds,
             once,
+            memoised,
+            last: std::cell::RefCell::new(None),
             kept: std::cell::RefCell::new(None),
             chain: std::cell::RefCell::new(None),
             tried: std::cell::Cell::new(false),
@@ -945,6 +978,27 @@ fn prepare_blocks(
         });
     }
     Ok(prepared)
+}
+
+/// Reports whether a block answers the same for the same values of the outer row.
+///
+/// False for a block with a volatile or registered function or a nested subquery anywhere in it,
+/// and for one that reads the table the statement changes, whose rows change between outer rows.
+///
+/// @param block - the query, with its outer references still in it
+/// @param target_root - the root page of the table the statement changes, when it changes one
+fn answers_the_same_for_the_same_values(block: &BoundSelect, target_root: Option<u32>) -> bool {
+    if target_root.is_some_and(|root| reads_table(block, root)) {
+        return false;
+    }
+    let mut repeatable = true;
+    let mut copy = block.clone();
+    inillucent_sql::rewrite::rewrite_select(&mut copy, &mut |expr: &mut BoundExpr| {
+        if !inillucent_sql::plan::is_repeatable_condition(expr) {
+            repeatable = false;
+        }
+    });
+    repeatable
 }
 
 /// Reports whether a block reads a table, at any depth.

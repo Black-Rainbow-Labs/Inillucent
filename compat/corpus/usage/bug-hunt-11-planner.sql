@@ -55,3 +55,72 @@ SELECT count(*) FROM e WHERE json_extract(payload, '$.n') BETWEEN 1 AND 5;
 SELECT count(*) FROM e WHERE json_extract(payload, '$.n') IN (1, 7);
 SELECT id FROM e ORDER BY json_extract(payload, '$.n') LIMIT 3;
 SELECT payload FROM e WHERE json_extract(payload, '$.n') > 4 ORDER BY id;
+-- case: bug-hunt-11/planner/view-over-recursive-cte-with-limit
+CREATE VIEW v1(term) AS WITH r(term, next) AS (SELECT 1, 1 UNION ALL SELECT next, term + next FROM r) SELECT term FROM r;
+SELECT term FROM v1 LIMIT 5;
+SELECT term FROM v1 WHERE term > 3 LIMIT 3;
+SELECT count(*) FROM (SELECT term FROM v1 LIMIT 7);
+-- case: bug-hunt-11/planner/view-with-cte-named-like-the-view
+CREATE VIEW fib(term) AS WITH fib(term, next) AS (SELECT 1, 1 UNION ALL SELECT next, term + next FROM fib) SELECT term FROM fib;
+SELECT term FROM fib LIMIT 5;
+-- case: bug-hunt-11/planner/materialized-cte-over-a-limited-recursive-cte
+WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a + b FROM fib), top10 AS MATERIALIZED (SELECT a FROM fib LIMIT 10) SELECT a FROM top10;
+WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a + b FROM fib), top10 AS NOT MATERIALIZED (SELECT a FROM fib LIMIT 10) SELECT sum(a) FROM top10;
+-- case: bug-hunt-11/planner/window-group-concat-with-outer-order-by
+CREATE TABLE p(x TEXT);
+WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 8000) INSERT INTO p SELECT PRINTF('%020d', i) FROM n;
+SELECT count(*), max(l) FROM (SELECT LENGTH(GROUP_CONCAT(x) OVER ()) AS l FROM p ORDER BY x);
+-- case: bug-hunt-11/planner/correlated-exists-on-the-outer-row-only
+CREATE TABLE t1(id, x);
+CREATE TABLE t2(id, x, y, z);
+INSERT INTO t1(id,x) VALUES(1,2);
+WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM c WHERE n<2500) INSERT INTO t2(id,x,y,z) SELECT n, 0, 1, 44 FROM c;
+CREATE INDEX t1x ON t1(x);
+CREATE INDEX t2y ON t2(y);
+SELECT count(t1.id), count(t2.id) FROM t1, t2 WHERE t1.id = t2.y AND t1.x = 2 AND EXISTS(SELECT 1 FROM t2 WHERE t2.y = t1.id AND t2.z = 33);
+-- case: bug-hunt-11/planner/recursive-cte-limit-is-a-scalar-subquery
+WITH RECURSIVE p(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM p LIMIT (SELECT 3)) SELECT count(*) FROM p;
+CREATE TABLE x(a);
+INSERT INTO x VALUES(1),(2),(3);
+WITH RECURSIVE p(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM p LIMIT (SELECT count(*)+1 FROM x)) SELECT count(*) FROM p;
+-- case: bug-hunt-11/planner/uncorrelated-subquery-not-run-when-where-is-false
+CREATE TABLE t(a);
+INSERT INTO t VALUES (9223372036854775807), (1);
+SELECT 'q4', 1 FROM t WHERE NULL AND (SELECT sum(a) FROM t);
+SELECT 'q5', 1 FROM t WHERE 0 AND (SELECT sum(a) FROM t);
+SELECT 'q6', count(*) FROM t WHERE 1 = 0 AND (SELECT sum(a) FROM t);
+-- case: bug-hunt-11/planner/cte-over-a-view-whose-body-has-a-cte
+CREATE VIEW fibv AS WITH RECURSIVE fib(a, b) AS (SELECT 1, 1 UNION ALL SELECT b, a + b FROM fib) SELECT a FROM fib;
+WITH top AS MATERIALIZED (SELECT a FROM fibv LIMIT 4) SELECT sum(a) FROM top;
+WITH fib AS MATERIALIZED (SELECT a FROM fibv LIMIT 4) SELECT sum(a) FROM fib;
+WITH top AS (SELECT a FROM fibv LIMIT 4) SELECT sum(a) FROM top;
+SELECT sum(a) FROM (SELECT a FROM fibv LIMIT 4);
+-- case: bug-hunt-11/planner/derived-recursive-cte-with-limit-and-offset
+SELECT n FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r) LIMIT 3 OFFSET 2;
+SELECT n FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r LIMIT 4) LIMIT 10;
+SELECT n FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r LIMIT 20) LIMIT 2;
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r), w AS (SELECT n * 2 AS d FROM r) SELECT d FROM w LIMIT 3;
+-- case: bug-hunt-11/planner/recursive-cte-limit-and-offset-subqueries
+CREATE TABLE x(a);
+INSERT INTO x VALUES(1),(2),(3);
+WITH RECURSIVE p(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM p LIMIT 10 OFFSET (SELECT 2)) SELECT min(n), max(n) FROM p;
+WITH RECURSIVE p(n) AS (SELECT (SELECT 5) UNION ALL SELECT n+(SELECT 1) FROM p WHERE n < (SELECT 8)) SELECT sum(n) FROM p;
+-- case: bug-hunt-11/planner/constant-where-terms-stop-at-the-first-false-one
+CREATE TABLE t(a);
+INSERT INTO t VALUES (9223372036854775807), (1);
+SELECT 1 FROM t WHERE NULL AND (SELECT sum(a) FROM t);
+SELECT 1 FROM t WHERE 0 AND (SELECT sum(a) FROM t);
+SELECT count(*) FROM t WHERE 1 = 0 AND (SELECT sum(a) FROM t);
+SELECT count(*) FROM t WHERE 1 AND (SELECT sum(a) FROM t);
+-- case: bug-hunt-11/planner/constant-where-term-after-a-true-one-still-raises
+CREATE TABLE t(a);
+INSERT INTO t VALUES (9223372036854775807), (1);
+SELECT a FROM t WHERE a > 0 AND NULL AND (SELECT sum(a) FROM t);
+SELECT a FROM t WHERE (SELECT sum(a) FROM t) AND 0;
+-- case: bug-hunt-11/planner/nested-cte-flattens-past-the-from-term-limit
+WITH RECURSIVE c AS NOT MATERIALIZED (WITH RECURSIVE c AS NOT MATERIALIZED (WITH RECURSIVE c AS NOT MATERIALIZED (WITH RECURSIVE c AS NOT MATERIALIZED (WITH c AS (VALUES(0)) SELECT 1 FROM c LEFT JOIN c ON ltrim(1)) SELECT 1 FROM c,c,c,c,c,c,c,c,c) SELECT 2 FROM c,c,c,c,c,c,c,c,c) SELECT 3 FROM c,c,c,c,c,c,c,c,c) SELECT 4 FROM c,c,c,c,c,c,c,c,c;
+-- case: bug-hunt-11/planner/nested-cte-below-the-from-term-limit
+WITH c AS NOT MATERIALIZED (WITH c AS NOT MATERIALIZED (WITH c AS NOT MATERIALIZED (VALUES(0)) SELECT 1 FROM c,c,c,c) SELECT 2 FROM c,c,c,c) SELECT 3 FROM c,c,c,c;
+WITH c AS NOT MATERIALIZED (WITH c AS NOT MATERIALIZED (WITH c AS NOT MATERIALIZED (VALUES(0)) SELECT 1 FROM c,c,c,c,c,c) SELECT 2 FROM c,c,c,c,c,c) SELECT 3 FROM c,c,c,c,c,c;
+-- case: bug-hunt-11/planner/join-wider-than-64-tables
+WITH c AS NOT MATERIALIZED (WITH c AS NOT MATERIALIZED (VALUES(0)) SELECT 1 FROM c,c,c,c,c,c,c,c,c) SELECT 2 FROM c,c,c,c,c,c,c,c,c;

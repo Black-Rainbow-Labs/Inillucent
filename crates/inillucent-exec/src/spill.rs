@@ -265,14 +265,20 @@ impl RunReader {
                 return Ok(None);
             }
             let remaining = self.run.bytes.saturating_sub(consumed);
-            let want = usize::try_from(remaining.min(self.window as u64)).unwrap_or(self.window);
             let already = self.held.len().saturating_sub(self.at);
-            if want <= already {
+            if u64::try_from(already).is_ok_and(|held| held >= remaining) {
                 // Everything left is already in the window and it still does
                 // not decode, so the run is short. `decode_row` says which.
                 return decode_row(self.held.get(self.at..).unwrap_or(&[]))
                     .map(|held| held.map(|(row, _)| row));
             }
+            // **A fill is always larger than what the window already holds past the next row.**
+            // It was the window alone, so a leftover of 64 KiB or more that held the front of a
+            // row larger than that (a window function's `group_concat` over 8,000 rows is 168 KB
+            // in every row) satisfied `want <= already`, and the run was called short:
+            // `a spilled row did not decode`, for a run that was whole.
+            let fill = self.window.max(already.saturating_add(WINDOW));
+            let want = usize::try_from(remaining.min(fill as u64)).unwrap_or(fill);
             let mut buffer = vec![0u8; want];
             file.read_at(self.run.at.saturating_add(consumed), &mut buffer)?;
             self.start = consumed;
@@ -812,6 +818,33 @@ mod tests {
         while let Some(row) = reader.next(&file).expect("a row") {
             read.push(row);
         }
+        assert_eq!(read, rows, "a row past the window was not read back");
+    }
+
+    /// **Several rows each larger than the window, one after another, are all read.**
+    ///
+    /// A fill of 256 KiB that held the end of one 168 KB row and the front of the next left more
+    /// than the 64 KiB window past the row being read, and `want <= already` called a whole run
+    /// short: `a spilled row did not decode`. A window function's `group_concat` over 8,000 rows
+    /// of 20 bytes is a 168 KB value in every row of the answer.
+    #[test]
+    fn rows_each_larger_than_the_window_are_all_read() {
+        let mut file = InMemory::default();
+        let rows: Vec<Vec<OwnedDatum>> = (0..40)
+            .map(|n| {
+                vec![
+                    OwnedDatum::Int(n),
+                    OwnedDatum::Text(vec![b'a' + (n % 26) as u8; 168_000]),
+                ]
+            })
+            .collect();
+        let run = write(&mut file, &rows);
+        let mut reader = RunReader::new(run);
+        let mut read = Vec::new();
+        while let Some(row) = reader.next(&file).expect("a row") {
+            read.push(row);
+        }
+        assert_eq!(read.len(), rows.len(), "rows were lost");
         assert_eq!(read, rows, "a row past the window was not read back");
     }
 

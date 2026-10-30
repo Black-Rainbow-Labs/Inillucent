@@ -59,7 +59,7 @@ pub struct BinderScratch {
     schemas: Vec<(usize, u32)>,
     ctes: Vec<Vec<CteBinding>>,
     recursing: Vec<RecursiveTarget>,
-    binding_ctes: Vec<ast::SelectId>,
+    binding_ctes: Vec<(usize, ast::SelectId)>,
     correlations: Vec<usize>,
     windows: Vec<BoundWindow>,
     named_windows: Vec<(Vec<u8>, ast::WindowId)>,

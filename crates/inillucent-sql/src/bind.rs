@@ -1159,7 +1159,12 @@ pub struct Binder<'a> {
     /// inner `WITH` may bind the same name to a different query and that one is
     /// not a cycle - `WITH c AS (WITH c AS (SELECT 7) SELECT * FROM c)` is an
     /// ordinary query SQLite answers.
-    binding_ctes: Vec<ast::SelectId>,
+    ///
+    /// **With the address of the `Ast` the id is an index into.** A view's body is parsed into an
+    /// arena of its own and bound by a binder that takes over this list, so the first query of the
+    /// view and the first of the statement are both `SelectId(0)`. A `WITH` that read a view whose
+    /// body held a CTE was refused as `circular reference` for sharing an id with its own CTE.
+    binding_ctes: Vec<(usize, ast::SelectId)>,
     /// The enclosing FROM terms the block being bound has read.
     correlations: Vec<usize>,
     /// How deep the binder is inside nested query blocks.
@@ -1551,6 +1556,7 @@ impl<'a> Binder<'a> {
             ast::Statement::Empty => Ok(BoundStatement::Empty),
             ast::Statement::Select(select) => {
                 let bound = self.bind_select(*select)?;
+                cte::refuse_a_join_that_is_too_wide(&bound)?;
                 Ok(BoundStatement::Select(Box::new(bound)))
             }
             ast::Statement::Insert(insert) => {

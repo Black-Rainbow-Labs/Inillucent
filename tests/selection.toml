@@ -1022,6 +1022,14 @@ covers = ["inillucent-catalog", "inillucent-engine"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "correlated_repeated_values"
+tier = "engine"
+covers = ["inillucent-exec"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "expression_index_covering"
 tier = "engine"
 covers = ["inillucent-exec", "inillucent-sql"]
@@ -1033,6 +1041,14 @@ name = "engine"
 module = "expression_index_shapes"
 tier = "engine"
 covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "window_sort_narrow_rows"
+tier = "engine"
+covers = ["inillucent-exec"]
 
 [[target]]
 package = "inillucent-compat"

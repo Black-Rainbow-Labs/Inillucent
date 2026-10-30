@@ -1316,7 +1316,8 @@ fn push_filters(
         return Ok(chain);
     }
     if let Some(constant) = &up.plan.constant_filter {
-        let translated = translate_scan(constant, up.space, up.params)?;
+        let constant = crate::physical::constant_terms::tested_terms(constant, up.params);
+        let translated = translate_scan(&constant, up.space, up.params)?;
         chain = Box::new(Filter::constant(
             compile(&translated, up.scan_types)?,
             chain,
@@ -2161,6 +2162,7 @@ fn constant_filter_rejects(plan: &PhysicalPlan, params: &Params) -> bool {
     let Some(constant) = &plan.constant_filter else {
         return false;
     };
+    let constant = &crate::physical::constant_terms::tested_terms(constant, params);
     // A term that calls random() is tested by the filter operator and must not
     // be tested a second time here, which would change its odds.
     if inillucent_sql::plan::calls_a_volatile_function(constant) {
@@ -2264,6 +2266,24 @@ pub(crate) fn source_for_run<'t>(
                             params: params.clone(),
                         },
                     )));
+                }
+            }
+            // **A derived table over a recursion is read as the query above asks for rows**, so a
+            // `WHERE` between it and a `LIMIT` cannot keep it from stopping; see `growing`.
+            if let AccessPath::Subquery {
+                plan: inner,
+                correlated: false,
+                affinities,
+                ..
+            } = &term.path
+            {
+                if limit.is_none() && crate::physical::growing::can_grow(inner) {
+                    return Ok(Source::Growing(Box::new(crate::physical::GrowingSource {
+                        catalog,
+                        plan: (**inner).clone(),
+                        params: params.clone(),
+                        affinities: affinities.clone(),
+                    })));
                 }
             }
             let rows = materialise_stage(plan, catalog, params, stage, limit)?;

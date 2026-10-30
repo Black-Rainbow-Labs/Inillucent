@@ -1015,6 +1015,10 @@ pub(crate) fn materialise_stage(
             // `inner.compounds`. Checking the windows first ran only the first
             // arm and dropped every row of the others. `run_compound` runs a
             // windowed first arm itself, as the top level does.
+            // **The statement above's bound goes into the query the derived table runs**, so a
+            // `LIMIT` over a view of an unbounded recursion stops it; see `derived_limit`.
+            let bounded = crate::physical::derived_limit::bounded_inner_plan(inner, limit);
+            let inner = bounded.as_ref().unwrap_or(inner);
             let rows = if !inner.compounds.is_empty() {
                 run_compound(inner, catalog, params)?.0
             } else if !inner.select.windows.is_empty() {
@@ -1094,7 +1098,7 @@ pub(crate) fn materialise_stage(
 ///
 /// @param rows - the rows the query produced
 /// @param affinities - each column's affinity, where Blob is none
-fn store_with_affinity(
+pub(super) fn store_with_affinity(
     rows: Vec<Vec<OwnedDatum>>,
     affinities: &[inillucent_value::Affinity],
 ) -> Vec<Vec<OwnedDatum>> {
