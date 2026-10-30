@@ -190,8 +190,12 @@ mod tests {
         reached
     }
 
-    /// A thread with a stack of 1 MiB reports room below that, and a recursion that asks
+    /// A thread asked for a stack of 1 MiB reports room near that, and a recursion that asks
     /// [`has_room`] stops before it overflows.
+    ///
+    /// **Linux gives such a thread about 2 MiB.** glibc rounds the request up and adds the
+    /// thread's static TLS, and the first Linux run of this test reported 2,092,175 bytes, so the
+    /// bound is 4 MiB and the depth is checked against the room the thread reported.
     #[test]
     fn a_small_thread_runs_out_of_room_before_it_overflows() {
         let reached = std::thread::Builder::new()
@@ -204,10 +208,14 @@ mod tests {
             .join()
             .expect("the thread finished");
         let (at_start, depth) = reached;
-        assert!(at_start <= (1 << 20), "room at the start was {at_start}");
+        assert!(at_start <= (4 << 20), "room at the start was {at_start}");
         assert!(at_start > MARGIN, "room at the start was {at_start}");
-        // 1 MiB minus the margin, in frames of at least 512 bytes.
-        assert!(depth > 100 && depth < 2048, "descended {depth} levels");
+        // The room minus the margin, in frames of at least 512 bytes.
+        let most = (at_start - MARGIN) / 512;
+        assert!(
+            depth > 100 && depth <= most,
+            "descended {depth} levels of at most {most}"
+        );
     }
 
     /// A thread with a larger stack reports more room, so the answer follows the thread.
