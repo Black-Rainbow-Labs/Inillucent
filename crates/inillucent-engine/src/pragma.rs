@@ -139,6 +139,23 @@ impl ImportedDatabase {
                 return Ok(outcome);
             }
         }
+        self.pragma_by_name(name, argument, at)
+    }
+
+    /// Answers the pragmas that set or read one named setting, after the shared readers declined.
+    ///
+    /// The second half of [`ImportedDatabase::pragma`]: one arm for each pragma this engine knows, then the
+    /// refusal for a name on SQLite's list and the empty answer for a name that is not.
+    ///
+    /// @param name - the pragma's folded name
+    /// @param argument - the value it was given, when it was given one
+    /// @param at - the attached database it was qualified with, `None` for `main`
+    fn pragma_by_name(
+        &mut self,
+        name: &[u8],
+        argument: Option<&PragmaArgument>,
+        at: Option<usize>,
+    ) -> DbResult<Outcome> {
         match name {
             // `default_cache_size` is the deprecated spelling of the same
             // setting, and SQLite still answers it.

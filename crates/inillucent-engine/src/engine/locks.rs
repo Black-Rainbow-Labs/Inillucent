@@ -215,6 +215,26 @@ impl ImportedDatabase {
         if taking && settles && held_before < inillucent_vfs::FileLock::Reserved {
             self.storage.quiet_checked.set(quiet);
         }
+        self.enter_attached_and_reload(writing, inside, settles, moved, cookie_before)
+    }
+
+    /// Takes the attached files' locks and reloads the schema when another process committed.
+    ///
+    /// The last part of [`ImportedDatabase::enter_within`], separated to keep that function short.
+    ///
+    /// @param writing - whether the statement changes the database
+    /// @param inside - whether a transaction is already open
+    /// @param settles - whether this connection may re-derive what it read at open
+    /// @param moved - whether `main` was resynchronised from the file for this statement
+    /// @param cookie_before - the schema cookie before anything was adopted from the file
+    fn enter_attached_and_reload(
+        &mut self,
+        writing: bool,
+        inside: bool,
+        settles: bool,
+        moved: bool,
+        cookie_before: i32,
+    ) -> DbResult<()> {
         // **Every attached file takes its own lock, for the same reason `main`
         // does (task-1979, C2).** An attachment was the one file this engine
         // wrote with no lock at all, so two processes with different `main`

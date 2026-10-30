@@ -2484,36 +2484,7 @@ impl<'a> Binder<'a> {
                 Span::default(),
             ));
         }
-        let instead_of = parts.time == Some(ast::TriggerTime::InsteadOf);
-        match target.kind {
-            TableKind::View if !instead_of => {
-                return Err(refused(
-                    format!(
-                        "cannot create {} trigger on view: {}",
-                        if parts.time == Some(ast::TriggerTime::After) {
-                            "AFTER"
-                        } else {
-                            "BEFORE"
-                        },
-                        String::from_utf8_lossy(&target.name)
-                    ),
-                    Span::default(),
-                ));
-            }
-            TableKind::Table if instead_of => {
-                return Err(refused(
-                    format!(
-                        "cannot create INSTEAD OF trigger on table: {}",
-                        String::from_utf8_lossy(&target.name)
-                    ),
-                    Span::default(),
-                ));
-            }
-            TableKind::Virtual | TableKind::Subquery => {
-                return Err(unsupported("a trigger on that object", Span::default()));
-            }
-            _ => {}
-        }
+        Self::refuse_trigger_on_wrong_object(parts.time, &target)?;
         // `UPDATE OF a, b` is deliberately *not* checked against the table's
         // columns. The pinned build accepts `UPDATE OF nosuchcolumn` and simply
         // never fires the trigger, and refusing it here would make inillucent's
@@ -2537,6 +2508,49 @@ impl<'a> Binder<'a> {
             table: target.name.clone(),
             exists,
         })
+    }
+
+    /// Refuses a trigger whose timing does not suit the object it is attached to.
+    ///
+    /// SQLite allows `INSTEAD OF` only on a view and `BEFORE` or `AFTER` only on a table, and has no triggers on virtual tables or derived tables.
+    ///
+    /// @param time - the trigger's written timing, when it wrote one
+    /// @param target - the table or view the trigger is on
+    fn refuse_trigger_on_wrong_object(
+        time: Option<ast::TriggerTime>,
+        target: &crate::catalog_view::TableInfo,
+    ) -> Result<(), ParseError> {
+        let instead_of = time == Some(ast::TriggerTime::InsteadOf);
+        match target.kind {
+            TableKind::View if !instead_of => {
+                return Err(refused(
+                    format!(
+                        "cannot create {} trigger on view: {}",
+                        if time == Some(ast::TriggerTime::After) {
+                            "AFTER"
+                        } else {
+                            "BEFORE"
+                        },
+                        String::from_utf8_lossy(&target.name)
+                    ),
+                    Span::default(),
+                ));
+            }
+            TableKind::Table if instead_of => {
+                return Err(refused(
+                    format!(
+                        "cannot create INSTEAD OF trigger on table: {}",
+                        String::from_utf8_lossy(&target.name)
+                    ),
+                    Span::default(),
+                ));
+            }
+            TableKind::Virtual | TableKind::Subquery => {
+                return Err(unsupported("a trigger on that object", Span::default()));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Finds the table a `CREATE INDEX` is on, and the schema the index goes in.

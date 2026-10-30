@@ -57,6 +57,12 @@ mod raise;
 mod rowvalue;
 mod rowvalue_query;
 mod scratch;
+mod small;
+pub use small::block_over;
+use small::{
+    denied, no_such_window, short_circuit_constant, subquery_table, window_aggregate,
+    DISTRUSTED_SCHEMA_WORD,
+};
 mod set_rules;
 mod truth;
 mod where_alias;
@@ -2105,7 +2111,8 @@ impl<'a> Binder<'a> {
         {
             return Err(refused(
                 format!(
-                    "unsafe use of virtual table \"{}\"",
+                    "{} use of virtual table \"{}\"",
+                    DISTRUSTED_SCHEMA_WORD,
                     String::from_utf8_lossy(&written)
                 ),
                 span,
@@ -4463,91 +4470,4 @@ impl<'a> Binder<'a> {
 /// wants said in the reference's words, and it renders as one.
 pub(crate) fn refused(detail: impl Into<String>, span: Span) -> ParseError {
     ParseError::new(ParseErrorKind::Refused(detail.into()), span)
-}
-
-/// Returns a block that reads one FROM term and nothing else.
-///
-/// Everything a `SELECT` can carry is empty here on purpose: this exists to
-/// wrap a term the binder has already produced so the compiler can iterate it,
-/// not to stand in for a query somebody wrote.
-pub fn block_over(
-    source: BoundSource,
-    filter: Option<BoundExpr>,
-    columns: Vec<BoundResultColumn>,
-) -> BoundSelect {
-    BoundSelect {
-        sources: vec![source],
-        filter,
-        group_by: Vec::new(),
-        having: None,
-        columns,
-        distinct: false,
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        aggregates: Vec::new(),
-        values: Vec::new(),
-        compounds: Vec::new(),
-        windows: Vec::new(),
-        correlations: Vec::new(),
-        shared: None,
-        serial: 0,
-    }
-}
-
-fn subquery_table(alias: &[u8], names: &[Vec<u8>], select: &BoundSelect) -> TableInfo {
-    TableInfo::subquery(alias.to_vec(), 0, subquery_columns(select, names))
-}
-
-/// Returns the aggregate a name spells inside an `OVER` clause.
-///
-/// `min` and `max` are the awkward pair: with one argument they are aggregates
-/// and with two or more they are scalars, and only the argument count tells
-/// them apart. Inside a window the one-argument form is always the aggregate,
-/// which is why the ordinary aggregate lookup - which has to leave them out -
-/// is not enough here.
-fn window_aggregate(folded: &[u8], arguments: usize) -> Option<AggregateFunc> {
-    if let Some(func) = function::lookup_aggregate(folded) {
-        return Some(func);
-    }
-    match (folded, arguments) {
-        (b"min", 1) => Some(AggregateFunc::Min),
-        (b"max", 1) => Some(AggregateFunc::Max),
-        _ => None,
-    }
-}
-
-/// Returns a "no such window" failure.
-fn no_such_window(name: &[u8], span: Span) -> ParseError {
-    // SQLite points at nothing for this failure.
-    let _ = span;
-    ParseError::new(
-        ParseErrorKind::Refused(format!("no such window: {}", String::from_utf8_lossy(name))),
-        Span::default(),
-    )
-}
-
-/// Returns an authorizer refusal.
-fn denied(what: &'static str, span: Span) -> ParseError {
-    ParseError::new(ParseErrorKind::Unsupported(what), span)
-}
-
-/// Returns the constant SQLite folds an `AND` or an `OR` to, when one operand
-/// is a literal that decides it.
-///
-/// SQLite drops the other operand of `AND` when one is the literal 0, and of
-/// `OR` when one is a non zero literal. What is dropped is never evaluated,
-/// subqueries in it included.
-///
-/// @param op - the operator
-/// @param left - the bound left operand
-/// @param right - the bound right operand
-fn short_circuit_constant(op: BinaryOp, left: &BoundExpr, right: &BoundExpr) -> Option<BoundExpr> {
-    let zero = |expr: &BoundExpr| matches!(expr, BoundExpr::Integer(0));
-    let non_zero = |expr: &BoundExpr| matches!(expr, BoundExpr::Integer(held) if *held != 0);
-    match op {
-        BinaryOp::And if zero(left) || zero(right) => Some(BoundExpr::Integer(0)),
-        BinaryOp::Or if non_zero(left) || non_zero(right) => Some(BoundExpr::Integer(1)),
-        _ => None,
-    }
 }
