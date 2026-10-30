@@ -220,7 +220,9 @@ impl crate::ImportedDatabase {
             self.sort_covering(owner.root);
         }
         let _ = index;
-        self.rebuild_tables()?;
+        if !self.replace_table_named(&owner.name)? {
+            self.rebuild_tables()?;
+        }
         self.refresh_catalog();
         let catalog = tail.elapsed().as_nanos();
         // **`seal` is timed apart from the catalog work, because they are
@@ -500,11 +502,15 @@ impl crate::ImportedDatabase {
     ///
     /// @param table_root - the table whose list changed
     pub(crate) fn sort_covering(&mut self, table_root: u32) {
-        let sizes: HashMap<u32, usize> = self
-            .schema
-            .trees
+        // Only the trees this table's list names are measured. Measuring every tree of the
+        // schema made each `CREATE INDEX` cost time in proportion to the trees that already
+        // existed.
+        let Some(roots) = self.schema.covering.get(&table_root) else {
+            return;
+        };
+        let sizes: HashMap<u32, usize> = roots
             .iter()
-            .map(|(root, tree)| (*root, tree.byte_size()))
+            .filter_map(|root| Some((*root, self.schema.trees.get(root)?.byte_size())))
             .collect();
         if let Some(roots) = self.schema.covering.get_mut(&table_root) {
             roots.sort_by_key(|root| sizes.get(root).copied().unwrap_or(usize::MAX));

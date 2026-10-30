@@ -31,6 +31,7 @@ mod chunk_text;
 mod compiled_chain_reuse;
 mod conformance;
 mod connection_isolation;
+mod ddl_schema_scale;
 mod delete_order;
 mod derived_table_lookup_work;
 mod dml;

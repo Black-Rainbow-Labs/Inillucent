@@ -417,6 +417,7 @@ impl crate::ImportedDatabase {
             position,
             self.schema.tables.len(),
             self.schema.catalog_generation,
+            false,
         ));
         Ok(true)
     }

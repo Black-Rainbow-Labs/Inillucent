@@ -829,12 +829,14 @@ pub(crate) struct Schema {
     pub(crate) catalog_generation: u64,
     /// What an open or a `VACUUM` has to repair or accept in a file an older release wrote.
     pub(crate) repairs: Repairs,
-    /// The one table `define_table` appended since the last catalog refresh, when that is all
-    /// that changed: its position in `tables`, how long `tables` was after the append, and the
-    /// generation the catalog had. `refresh_catalog` adds that table to the catalog it holds
-    /// instead of building the catalog again from every table, which made each `CREATE TABLE`
-    /// cost time in proportion to the tables that already existed.
-    pub(crate) appended: Option<(usize, usize, u64)>,
+    /// The one table a statement added to `tables`, or re-derived in place, since the last catalog
+    /// refresh, when that is all that changed: its position in `tables`, how long `tables` was
+    /// afterwards, the generation the catalog had, and whether the table was re-derived in place
+    /// (an index or a trigger was added to it) rather than added (a table or a view).
+    /// `refresh_catalog` adds the table to the catalog it holds, or swaps it in, instead of
+    /// building the catalog again from every table, which made each `CREATE` statement cost time
+    /// in proportion to the tables that already existed.
+    pub(crate) appended: Option<(usize, usize, u64, bool)>,
     pub(crate) trees: HashMap<u32, PagedTree>,
     pub(crate) layouts: HashMap<u32, std::rc::Rc<SourceLayout>>,
     /// For each table root, its index roots ordered smallest tree first.

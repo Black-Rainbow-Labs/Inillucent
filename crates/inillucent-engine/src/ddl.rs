@@ -66,6 +66,7 @@ mod index;
 mod module_rename;
 pub(crate) mod pads;
 mod reindex;
+mod replace;
 mod table;
 mod tree;
 

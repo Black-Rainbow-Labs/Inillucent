@@ -61,10 +61,16 @@ impl crate::ImportedDatabase {
     /// cache is the bug this function exists to make unwriteable: the next
     /// execution would take a plan built against the tree that used to be there.
     pub(crate) fn refresh_catalog(&mut self) {
-        self.refresh_column_pads();
-        if self.refresh_catalog_for_appended_table() {
+        // **One table's pad when one table changed.** The fast refreshes below leave every other
+        // table as it was, so only the table they touched can need its tree's pad.
+        let narrow = self
+            .refresh_catalog_for_replaced_table()
+            .or_else(|| self.refresh_catalog_for_appended_table());
+        if let Some(position) = narrow {
+            self.refresh_column_pad_at(position);
             return;
         }
+        self.refresh_column_pads();
         // **The keys are re-planned every time the schema changes**, and this
         // is the only place that can do it: a foreign key records the child's
         // side alone, so the parent's trigger is found by asking every table
@@ -212,10 +218,8 @@ impl crate::ImportedDatabase {
     /// module-owned index, no imposter and no statistics to re-read, so the catalog is the held
     /// one with the new table in the position it has in `tables`. It answers `false`, leaving
     /// the full refresh to run, when anything else has happened since the table was appended.
-    fn refresh_catalog_for_appended_table(&mut self) -> bool {
-        let Some((position, length, generation)) = self.schema.appended.take() else {
-            return false;
-        };
+    fn refresh_catalog_for_appended_table(&mut self) -> Option<usize> {
+        let (position, length, generation, _) = self.schema.appended.take()?;
         // A generation of zero is a catalog no refresh has built yet, which has neither the
         // eponymous tables nor `temp` for a table to be added to.
         let unchanged = generation == self.schema.catalog_generation
@@ -224,17 +228,47 @@ impl crate::ImportedDatabase {
             && self.session_state.virtual_tables.is_empty()
             && self.schema.imposters.is_empty()
             && !self.any_foreign_key();
-        let Some(table) = self.schema.tables.get(position).filter(|_| unchanged) else {
-            return false;
-        };
+        let table = self.schema.tables.get(position).filter(|_| unchanged)?;
         if self.schema.catalog.tables.len() < position {
-            return false;
+            return None;
         }
         let added = std::rc::Rc::new(table.clone());
         self.schema.catalog.tables.insert(position, added);
         self.forget_compiled_statements();
         self.schema.catalog_generation = self.schema.catalog_generation.saturating_add(1);
-        true
+        Some(position)
+    }
+    /// Refreshes the catalog after `replace_indexed_table` re-derived one table, by putting that
+    /// table in the place the catalog already holds it, and reports whether it did.
+    ///
+    /// **Why.** The full refresh copies every table into a new catalog, so each `CREATE INDEX`
+    /// cost time in proportion to the tables that already existed. It answers `false`, leaving
+    /// the full refresh to run, when anything else has happened since the table was replaced or
+    /// when the catalog does not hold the table at the position the connection does.
+    fn refresh_catalog_for_replaced_table(&mut self) -> Option<usize> {
+        let (position, length, generation, _) = self
+            .schema
+            .appended
+            .take_if(|(_, _, _, in_place)| *in_place)?;
+        let unchanged = generation == self.schema.catalog_generation
+            && generation > 0
+            && length == self.schema.tables.len()
+            && self.session_state.virtual_tables.is_empty()
+            && self.schema.imposters.is_empty()
+            && !self.any_foreign_key();
+        let table = self.schema.tables.get(position).filter(|_| unchanged)?;
+        let held = self.schema.catalog.tables.get(position);
+        if !held.is_some_and(|held| held.folded == table.folded && held.database == table.database)
+        {
+            return None;
+        }
+        let replacement = std::rc::Rc::new(table.clone());
+        if let Some(slot) = self.schema.catalog.tables.get_mut(position) {
+            *slot = replacement;
+        }
+        self.forget_compiled_statements();
+        self.schema.catalog_generation = self.schema.catalog_generation.saturating_add(1);
+        Some(position)
     }
     /// Returns one `TableInfo` per eponymous module the registry holds.
     ///

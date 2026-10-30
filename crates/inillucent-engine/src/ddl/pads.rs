@@ -150,6 +150,21 @@ pub(crate) fn stored_default(
     Some(value)
 }
 
+/// Returns how many columns the tree of a rowid table has, without deriving its shape.
+///
+/// The rowid, then every stored column that is not the rowid's own alias; the same count
+/// `table_shape` makes its column list from.
+///
+/// @param info - the table as the catalog declares it
+fn rowid_tree_width(info: &TableInfo) -> usize {
+    let alias = info.rowid_alias.map(usize::from);
+    let stored = (0..info.columns.len())
+        .filter(|declared| !crate::engine::tables::is_virtual_column(info, *declared))
+        .filter(|declared| Some(*declared) != alias)
+        .count();
+    stored.saturating_add(1)
+}
+
 /// Returns what each tree column reads as in a leaf written without it.
 ///
 /// One entry per tree column. A column with no literal default, or none at all, reads as
@@ -186,16 +201,42 @@ impl ImportedDatabase {
     /// that already has its pad is left alone, which is every tree after the first
     /// refresh.
     pub(crate) fn refresh_column_pads(&mut self) {
-        for info in &self.schema.tables {
+        for position in 0..self.schema.tables.len() {
+            self.refresh_column_pad_at(position);
+        }
+    }
+
+    /// Gives one table's tree the pad that tells it what an older leaf reads as.
+    ///
+    /// The catalog refreshes that change one table, which a `CREATE TABLE` or `CREATE INDEX`
+    /// does, call this for that table alone: every other tree already has the pad it had at the
+    /// last full refresh.
+    ///
+    /// @param position - the table's position in `tables`
+    pub(crate) fn refresh_column_pad_at(&mut self, position: usize) {
+        let Some(info) = self.schema.tables.get(position) else {
+            return;
+        };
+        {
             if info.kind != inillucent_sql::catalog_view::TableKind::Table || info.module.is_some()
             {
-                continue;
+                return;
             }
             let Some(tree) = self.schema.trees.get_mut(&info.root) else {
-                continue;
+                return;
             };
+            // **A tree that already has its pad and the right width is skipped without deriving
+            // its shape.** Deriving it allocates a column list and a layout for every table, at
+            // every catalog refresh, so 6,000 tables in one transaction spent most of their time
+            // here: the refresh cost time in proportion to the tables that already existed.
+            if !info.without_rowid
+                && tree.pad().width() != 0
+                && tree.columns().len() == rowid_tree_width(info)
+            {
+                return;
+            }
             let Some((columns, layout)) = shape_of_table(info) else {
-                continue;
+                return;
             };
             // **The catalog is what says how many columns the tree has.** A tree with fewer
             // is shorter because another process ran `ADD COLUMN` on the file, and the
@@ -204,7 +245,7 @@ impl ImportedDatabase {
             // was rolled back, and the catalog rows were restored without it.
             let changed = columns.len() != tree.columns().len();
             if !changed && tree.pad().width() != 0 {
-                continue;
+                return;
             }
             let fills = column_fills(info, &layout);
             tree.set_shape(columns, fills);

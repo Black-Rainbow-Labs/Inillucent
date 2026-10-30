@@ -1014,6 +1014,14 @@ covers = ["inillucent-exec", "inillucent-sql"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "ddl_schema_scale"
+tier = "engine"
+covers = ["inillucent-catalog", "inillucent-engine"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "expression_index_covering"
 tier = "engine"
 covers = ["inillucent-exec", "inillucent-sql"]

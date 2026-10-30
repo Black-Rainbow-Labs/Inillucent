@@ -416,6 +416,18 @@ pub fn trigger_from_create_sql(sql: &[u8]) -> DbResult<TriggerInfo> {
     })
 }
 
+/// How many tables `table_from_create_sql` has derived in this process.
+static TABLES_DERIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns how many tables have been derived from their `CREATE` text in this process.
+///
+/// A test reads it before and after a statement to count the work the statement did: a
+/// `CREATE INDEX` that derives every table of the schema again derives as many as the schema
+/// holds, and one that derives only the table it indexed derives one, however large the schema.
+pub fn tables_derived() -> u64 {
+    TABLES_DERIVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Parses a `CREATE TABLE` statement into a table entry.
 ///
 /// This is public because it is how a test builds a catalog without a file, and
@@ -426,6 +438,7 @@ pub fn trigger_from_create_sql(sql: &[u8]) -> DbResult<TriggerInfo> {
 /// keeps the reordered text, so a later `ALTER`, `dump` or `VACUUM` works on
 /// SQL the grammar accepts.
 pub fn table_from_create_sql(sql: &[u8], database: usize, root: u32) -> DbResult<TableInfo> {
+    TABLES_DERIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let limits = Limits::default();
     match parse_next_statement(sql, 0, &limits) {
         Ok(parsed) => table_from_parsed_sql(sql, parsed, database, root),

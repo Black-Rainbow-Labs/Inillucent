@@ -100,7 +100,16 @@ impl crate::ImportedDatabase {
                 tree_id: 0,
             },
         )?;
-        self.rebuild_tables()?;
+        // **Only the table the object belongs to is derived again**, so a view or a trigger costs
+        // the same in a schema of three thousand tables as in one of three.
+        let narrow = match kind {
+            ObjectKind::View => self.append_recorded_view()?,
+            ObjectKind::Trigger => self.replace_table_named(table)?,
+            _ => false,
+        };
+        if !narrow {
+            self.rebuild_tables()?;
+        }
         self.refresh_catalog();
         self.seal()?;
         Ok(Outcome::empty())
