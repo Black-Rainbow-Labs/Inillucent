@@ -61,7 +61,7 @@ mod helpers;
 pub(crate) use dropped_parents::DroppedParent;
 mod index;
 mod module_rename;
-mod pads;
+pub(crate) mod pads;
 mod reindex;
 mod table;
 mod tree;

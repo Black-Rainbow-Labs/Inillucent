@@ -2073,7 +2073,7 @@ fn run_chunk_from(shell: &mut Shell, chunk: &str, first_end: Option<usize>) {
 /// failure does not distinguish "still typing" from "misspelt". What a shell
 /// needs to know is narrower and decidable - has a semicolon been reached that
 /// is not inside a trigger body - so that is what is computed.
-fn complete_statement(_shell: &Shell, text: &str) -> Option<usize> {
+pub(crate) fn complete_statement(_shell: &Shell, text: &str) -> Option<usize> {
     let mut state = State::Start;
     let bytes = text.as_bytes();
     let mut at = 0usize;

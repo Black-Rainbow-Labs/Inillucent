@@ -281,9 +281,33 @@ impl SqliteFile {
     /// than in the record, and an `INTEGER PRIMARY KEY` column's record field is
     /// NULL because of it. Prepending makes the row the new engine's shape.
     ///
+    /// A record with fewer fields than `columns` reads NULL for the missing ones.
+    /// Use [`SqliteFile::read_table_filled`] when the table has had columns added.
+    ///
     /// @param root - the table's root page
     /// @param columns - how many record fields the table declares
     pub fn read_table(&mut self, root: u32, columns: usize) -> DbResult<Vec<Vec<OwnedDatum>>> {
+        self.read_table_filled(root, columns, &mut |_| Ok(OwnedDatum::Null))
+    }
+
+    /// Reads every row of a table b-tree, filling the fields a short record lacks.
+    ///
+    /// **`ALTER TABLE ... ADD COLUMN` does not rewrite the rows already in the
+    /// table.** SQLite leaves their records with fewer fields than the table now
+    /// declares and, on every read, supplies the new column's `DEFAULT` for the
+    /// field that is not there. A reader that answered NULL for it lost the
+    /// default of every row written before the ALTER, and the migration's own
+    /// digest could not see that because it read through this same function.
+    ///
+    /// @param root - the table's root page
+    /// @param columns - how many record fields the table declares
+    /// @param fill - returns the value of record field `index` for a record too short to hold it
+    pub fn read_table_filled(
+        &mut self,
+        root: u32,
+        columns: usize,
+        fill: &mut dyn FnMut(usize) -> DbResult<OwnedDatum>,
+    ) -> DbResult<Vec<Vec<OwnedDatum>>> {
         let root = PageId::from_persisted(root)?;
         let mut cursor = BTreeCursor::table(root);
         let mut payload: Vec<u8> = Vec::with_capacity(512);
@@ -299,7 +323,7 @@ impl SqliteFile {
             let mut row = Vec::with_capacity(columns.saturating_add(1));
             row.push(OwnedDatum::Int(rowid));
             for index in 0..columns {
-                row.push(owned_from_record(&record, index)?);
+                row.push(field_or_fill(&record, index, fill)?);
             }
             out.push(row);
             more = cursor.next(&mut self.pager)?;
@@ -316,6 +340,23 @@ impl SqliteFile {
     /// @param root - the index's root page
     /// @param columns - how many fields an entry holds, rowid included
     pub fn read_index(&mut self, root: u32, columns: usize) -> DbResult<Vec<Vec<OwnedDatum>>> {
+        self.read_index_filled(root, columns, &mut |_| Ok(OwnedDatum::Null))
+    }
+
+    /// Reads every entry of an index b-tree, filling the fields a short entry lacks.
+    ///
+    /// A `WITHOUT ROWID` table is an index b-tree, and `ADD COLUMN` leaves its
+    /// entries short in the same way it leaves a rowid table's records short.
+    ///
+    /// @param root - the index's root page
+    /// @param columns - how many fields an entry holds
+    /// @param fill - returns the value of field `index` for an entry too short to hold it
+    pub fn read_index_filled(
+        &mut self,
+        root: u32,
+        columns: usize,
+        fill: &mut dyn FnMut(usize) -> DbResult<OwnedDatum>,
+    ) -> DbResult<Vec<Vec<OwnedDatum>>> {
         let root = PageId::from_persisted(root)?;
         // A full walk never compares, so plain binary ordering over the key
         // columns is enough to build the cursor.
@@ -331,13 +372,29 @@ impl SqliteFile {
             let record = RecordRef::with_fields(&payload, &fields, header_len, encoding);
             let mut row = Vec::with_capacity(columns);
             for index in 0..columns {
-                row.push(owned_from_record(&record, index)?);
+                row.push(field_or_fill(&record, index, fill)?);
             }
             out.push(row);
             more = cursor.next(&mut self.pager)?;
         }
         Ok(out)
     }
+}
+
+/// Returns one record field, or what `fill` says for a record too short to hold it.
+///
+/// @param record - the decoded record
+/// @param index - which field to read
+/// @param fill - supplies the value of a field the record does not have
+fn field_or_fill(
+    record: &RecordRef<'_>,
+    index: usize,
+    fill: &mut dyn FnMut(usize) -> DbResult<OwnedDatum>,
+) -> DbResult<OwnedDatum> {
+    if index >= record.field_count() {
+        return fill(index);
+    }
+    owned_from_record(record, index)
 }
 
 /// Converts one record field into an owned value.

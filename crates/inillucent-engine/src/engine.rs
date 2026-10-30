@@ -45,6 +45,7 @@ pub mod bulk;
 pub mod compiled;
 pub mod counters;
 pub mod explain;
+pub mod fills;
 pub mod functions;
 pub mod integrity;
 pub mod keys;

@@ -685,7 +685,7 @@ impl crate::ImportedDatabase {
     /// does not have - reports itself rather than silently becoming NULL.
     ///
     /// @param default_sql - the `DEFAULT` text as the declaration wrote it
-    pub(super) fn constant_default(&mut self, default_sql: &[u8]) -> DbResult<OwnedDatum> {
+    pub(crate) fn constant_default(&mut self, default_sql: &[u8]) -> DbResult<OwnedDatum> {
         // A bare word, quoted or not, is a string in a default (`DEFAULT "q"`,
         // `DEFAULT hello`), because a default has no column in scope. Running it
         // as `SELECT "q"` would look for a column.

@@ -118,6 +118,7 @@ pub(crate) use engine::tables::*;
 pub(crate) use engine::write::*;
 // `Statement` and `Outcome` were `pub` at this root before the split and stay
 // `pub` at it after.
+pub use engine::fills::{record_declared_positions, RecordFills};
 pub use engine::rowshape::{identity_columns, logical_row, source_layout_of, stored_as};
 pub use engine::statements::{Outcome, Statement};
 // The dump prints stored `CREATE TABLE` text through this, so a table that

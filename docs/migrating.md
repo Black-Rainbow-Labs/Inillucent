@@ -135,17 +135,23 @@ What comes across:
 
 | Object | What happens |
 |---|---|
-| tables, indexes, views, triggers | copied |
+| tables, indexes, views | copied |
+| triggers | copied. Several triggers on one event fire in the order SQLite fires them, newest first |
+| a column added with `ALTER TABLE ... ADD COLUMN` | rows written before the `ALTER` have no value stored for the column, and SQLite reads its `DEFAULT` for them. The copy writes that default, with the column's affinity applied, into every such row, in a `WITHOUT ROWID` table as well |
+| an index on a `WITHOUT ROWID` table | copied. SQLite leaves a primary key column out of the entry when the index already lists it, and the copy writes the whole primary key after the indexed columns, as inillucent's own `CREATE INDEX` does |
+| a source file of zero bytes | SQLite opens it as an empty database, and the migration publishes an empty database |
 | `PRAGMA application_id`, `PRAGMA user_version` | copied, and checked by `pragma.application_id` and `pragma.user_version` |
 | FTS5 tables | rebuilt. The text is read from the SQLite table's `<name>_content` table and indexed again by inillucent's FTS5. The row ids stay the same. Columns declared `UNINDEXED` are kept and options such as `prefix='2,3'` are read |
 | a table of 1,000 or more columns | copied, up to 2,000 columns when each number fits 32 bits (about 3,200 would fit one 32 KiB page) and about 1,925 when each needs eight bytes. A table with a wider row fails with the status `unsupported` and the message `a row of N columns does not fit one page`. A copy that stores such a row moves the new file to format 4 |
-| an FTS5 table with `content=''` or `content='other'` | the migration fails. SQLite keeps no copy of the text in that table, so there is nothing to rebuild from |
-| a virtual table using any other module, such as `rtree` | the migration fails, and the check `carried.<name>` names the module |
+| an FTS5 table with external content, such as `content='posts'` | rebuilt from the content table. The table `posts` is copied like any other table, and then the index is built from it with the FTS5 `rebuild` command |
+| an FTS5 table with `content=''` | the migration fails. SQLite keeps the index and no copy of the text for a contentless table, so there is no text to build a new index from. The check `carried.<name>` says the table is contentless |
+| `rtree` and `rtree_i32` tables | copied. The rows are read from the leaves of SQLite's `<name>_node` table and inserted into inillucent's own R*Tree, which keeps coordinates as 32 bit values as SQLite does. An R*Tree with auxiliary columns fails the migration with the status `unsupported` |
+| a virtual table using any other module | the migration fails, and the check `carried.<name>` names the module |
 
-This is the failure for a file that holds an R-Tree table:
+This is the failure for a file that holds a virtual table of a module that is not built in:
 
 ```text
-Error [corrupt]: app.rdb was not published: carried.r: r uses the rtree module, whose storage is SQLite's own; this engine has no content table to rebuild it from
+Error [corrupt]: app.rdb was not published: carried.m: m uses the mymodule module, whose storage is SQLite's own; this engine has no content table to rebuild it from
 ```
 
 The SQLite file is read by `inillucent-sqlite-reader`, which is part of inillucent. No SQLite

@@ -84,11 +84,11 @@ const FIXTURES: [(&str, &str, Expect); 3] = [
     (
         "warehouse",
         "FTS5 with external content, 8,000 rows, a wide composite key",
-        // Not a defect: an external content index has no text of its own, so
-        // there is nothing in the file to carry, and the tool says exactly
-        // that rather than producing an index that answers nothing. The three
-        // ordinary tables all pass their counts and digests first.
-        Expect::Refused("keeps no content table"),
+        // The index has no text of its own: it reads the `document` table. The
+        // migration copies `document` and builds the index from it with the FTS5
+        // `rebuild` command. It used to be refused, because there was nothing in
+        // the file to copy.
+        Expect::Publishes,
     ),
 ];
 
@@ -306,8 +306,7 @@ fn every_realistic_fixture_migrates_value_for_value() {
     //
     // The floor is what the two published fixtures hold: `browser-history`'s
     // four tables and `chat-archive`'s four, 15,018 rows and 5,409 of them.
-    // `warehouse` is refused by its external content index and contributes
-    // none. Raise both numbers when a fixture grows a table.
+    // Raise both numbers when a fixture grows a table.
     assert!(
         tables_checked >= 8,
         "only {tables_checked} tables were compared across {migrated} fixtures, so the \
@@ -737,20 +736,16 @@ fn a_partial_index_and_a_sequence_survive_a_realistic_migration() {
     );
 }
 
-/// An external content FTS5 index is refused by name rather than half carried.
+/// An external content FTS5 index is rebuilt from the table that holds its text.
 ///
-/// **This is not a defect and the refusal is the feature.** An FTS5 table
-/// declared `content='document'` holds no text of its own: the index points at
-/// rows in another table. A migration that carried the index without the
-/// content would produce a table that answers nothing, and one that
-/// materialised it would double the corpus. What the tool does instead is say
-/// so, by name, and publish nothing - which is what the assertion below pins.
-///
-/// The three ordinary tables in the same fixture pass their counts and their
-/// digests first, so the refusal is about the index rather than about the
-/// database.
+/// An FTS5 table declared `content='document'` holds no text of its own: the
+/// index points at rows in another table. The migration copies `document` and
+/// builds the index from it with the FTS5 `rebuild` command, and the check
+/// `carried.document_fts` says how many rows were indexed. The answers to
+/// searches are compared with the pinned SQLite, so an index that exists and
+/// finds nothing fails here.
 #[test]
-fn an_external_content_index_is_refused_by_name() {
+fn an_external_content_index_is_rebuilt_from_its_content_table() {
     let Some(shell) = reference() else {
         inillucent_compat::differential::skipping(
             "the pinned SQLite oracle is not built; run tools/sqlite-reference.{ps1,sh}",
@@ -759,8 +754,7 @@ fn an_external_content_index_is_refused_by_name() {
     };
     let Some(source) = fixture("warehouse") else {
         inillucent_compat::differential::skipping(
-            "compat/fixtures/realistic/warehouse.db is not built; run \
-             tools/build-realistic-fixtures.sh",
+            "compat/fixtures/realistic/warehouse.db is not built; run              tools/build-realistic-fixtures.sh",
         );
         return;
     };
@@ -772,52 +766,51 @@ fn an_external_content_index_is_refused_by_name() {
             why.detail().unwrap_or_default()
         )
     });
-
-    let documents = ask_sqlite(&shell, &source, "SELECT count(*) FROM document;")
-        .first()
-        .and_then(|line| line.parse::<i64>().ok())
-        .unwrap_or(0);
     assert!(
-        documents >= 8_000,
-        "the warehouse fixture holds {documents} documents, which is not the fixture this file \
-         describes"
+        report.passed(),
+        "the warehouse migration did not verify: {:?}",
+        report
+            .failures()
+            .iter()
+            .map(|check| check.line())
+            .collect::<Vec<String>>()
     );
-
-    let passed: Vec<&str> = report
+    assert!(
+        destination.is_file(),
+        "a passing migration publishes its destination"
+    );
+    let carried = report
         .checks
         .iter()
-        .filter(|check| check.passed)
-        .map(|check| check.name.as_str())
-        .collect();
-    let refused: Vec<String> = report
-        .checks
-        .iter()
-        .filter(|check| !check.passed)
-        .map(|check| format!("{} {}", check.name, check.detail))
-        .collect();
+        .find(|check| check.name == "carried.document_fts")
+        .map(|check| check.detail.clone())
+        .unwrap_or_default();
+    assert!(
+        carried.contains("indexed from the content table document"),
+        "the index was not built from the content table: {carried}"
+    );
 
-    // The ordinary tables come across: three counts and three digests.
-    assert!(
-        passed.len() >= 6,
-        "only {} checks passed, so the ordinary tables did not come across and this case is \
-         about something else:\n  {}",
-        passed.len(),
-        refused.join("\n  ")
-    );
-    assert_eq!(
-        refused.len(),
-        1,
-        "the warehouse migration refused {} checks and this case is about one:\n  {}",
-        refused.len(),
-        refused.join("\n  ")
-    );
-    let only = refused.first().map(String::as_str).unwrap_or_default();
-    assert!(
-        only.contains("document_fts") && only.contains("keeps no content table"),
-        "the refusal does not name the index or say why it cannot be carried: {only}"
-    );
-    assert!(
-        !destination.is_file(),
-        "the migration refused a check and published anyway"
-    );
+    let opened =
+        ImportedDatabase::open(destination, sqlite::PAGE_SIZE, 256).unwrap_or_else(|why| {
+            panic!(
+                "the migration did not open: {}",
+                why.detail().unwrap_or_default()
+            )
+        });
+    for question in [
+        "SELECT count(*) FROM document_fts WHERE document_fts MATCH 'ledger'",
+        "SELECT count(*) FROM document_fts WHERE document_fts MATCH 'segment'",
+        "SELECT rowid FROM document_fts WHERE document_fts MATCH 'number17' ORDER BY rowid",
+    ] {
+        let theirs = ask_sqlite(&shell, &source, question);
+        assert!(
+            !theirs.is_empty(),
+            "the reference answered {question} with no rows"
+        );
+        let (rows, _) = opened
+            .run(question)
+            .unwrap_or_else(|why| panic!("{question}: {}", why.detail().unwrap_or_default()));
+        let ours: Vec<String> = rows.iter().map(|row| quote_row(row)).collect();
+        assert_eq!(theirs, ours, "{question}");
+    }
 }

@@ -1130,3 +1130,433 @@ INSERT INTO f4(rowid, \"x y\", z) VALUES(5, 'spaced', 'delta epsilon');\n";
         assert_eq!(theirs, ours, "{question}");
     }
 }
+
+/// Builds a source with the pinned shell, migrates it, and returns both ends.
+///
+/// Returns `None` when the pinned SQLite is not built, after saying so, so a
+/// machine without it skips instead of passing without having checked anything.
+///
+/// @param name - the test's scratch directory
+/// @param script - the statements that build the source
+fn migrated_from_script(name: &str, script: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let shell = reference().or_else(|| {
+        inillucent_compat::differential::skipping("the pinned SQLite shell is missing");
+        None
+    })?;
+    let area = scratch(name);
+    let source = area.join("source.db");
+    if !build_with_shell(&shell, &source, script) {
+        inillucent_compat::differential::skipping("the reference shell could not be run");
+        return None;
+    }
+    let destination = area.join("migrated.rdb");
+    let report = sqlite::migrate(&source, &destination).expect("the migration runs");
+    assert!(
+        report.passed(),
+        "the migration did not verify: {:?}",
+        report
+            .failures()
+            .iter()
+            .map(|check| check.line())
+            .collect::<Vec<String>>()
+    );
+    Some((shell, source, destination))
+}
+
+/// Asks the pinned SQLite about the source and this engine about the migrated
+/// file, and requires the same rows in the same order.
+///
+/// @param shell - the pinned `sqlite3`
+/// @param source - the SQLite file
+/// @param destination - the migrated database
+/// @param questions - statements that each return rows
+fn assert_same_answers(shell: &Path, source: &Path, destination: &Path, questions: &[&str]) {
+    let database =
+        inillucent_engine::connect::Database::open(destination).expect("the migration opens");
+    let connection = database.session();
+    for question in questions {
+        let theirs = shell_answers(shell, source, question);
+        assert!(
+            !theirs.is_empty(),
+            "the reference answered {question} with no rows, so this question grades nothing"
+        );
+        let ours: Vec<String> = connection
+            .query(question)
+            .unwrap_or_else(|error| panic!("{question}: {error:?}"))
+            .iter()
+            .map(|row| row.iter().map(list_cell).collect::<Vec<String>>().join("|"))
+            .collect();
+        assert_eq!(theirs, ours, "{question}");
+    }
+}
+
+/// **A column added with `ALTER TABLE ... ADD COLUMN` keeps its default in every
+/// row that was written before the `ALTER`.**
+///
+/// SQLite leaves those rows with fewer record fields and supplies the default
+/// when it reads them. The reader returned NULL for the missing fields, and the
+/// migration's own digest read through the same reader, so the copy lost every
+/// default and all of its checks passed. The pinned SQLite is the only reader
+/// here that did not share the defect, so the answers are compared against it:
+/// a `NOT NULL` column that holds NULL, a text default with quotes and commas,
+/// the affinity applied to a default, a rowid alias declared between the old
+/// columns and the new ones, an index built over the added column, and a
+/// `WITHOUT ROWID` table.
+#[test]
+fn a_column_added_after_rows_were_written_keeps_its_default_in_every_old_row() {
+    let script = "\
+CREATE TABLE t(a INTEGER);\n\
+INSERT INTO t VALUES(1),(2);\n\
+ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 9;\n\
+ALTER TABLE t ADD COLUMN c TEXT NOT NULL DEFAULT 'it''s, (a)';\n\
+ALTER TABLE t ADD COLUMN d TEXT DEFAULT 9;\n\
+ALTER TABLE t ADD COLUMN e REAL DEFAULT 3;\n\
+ALTER TABLE t ADD COLUMN f DEFAULT x'ab';\n\
+ALTER TABLE t ADD COLUMN g DEFAULT TRUE;\n\
+ALTER TABLE t ADD COLUMN h DEFAULT -'7';\n\
+ALTER TABLE t ADD COLUMN i DEFAULT 0x10;\n\
+ALTER TABLE t ADD COLUMN j DEFAULT NULL;\n\
+INSERT INTO t(a) VALUES(3);\n\
+CREATE INDEX t_b ON t(b);\n\
+CREATE TABLE r(a, id INTEGER PRIMARY KEY, b);\n\
+INSERT INTO r VALUES(1, 10, 2);\n\
+ALTER TABLE r ADD COLUMN c DEFAULT 7;\n\
+CREATE TABLE w(a PRIMARY KEY, b) WITHOUT ROWID;\n\
+INSERT INTO w VALUES(1, 2),(4, 5);\n\
+ALTER TABLE w ADD COLUMN c DEFAULT 5;\n\
+ALTER TABLE w ADD COLUMN d TEXT DEFAULT 'z';\n\
+INSERT INTO w VALUES(2, 3, 4, 'w');\n";
+    let Some((shell, source, destination)) = migrated_from_script("added-columns", script) else {
+        return;
+    };
+    assert_same_answers(
+        &shell,
+        &source,
+        &destination,
+        &[
+            "SELECT a, b, c, d, e FROM t ORDER BY a",
+            "SELECT quote(a), quote(b), quote(c), quote(d), quote(e), quote(f), quote(g), quote(h), quote(i), quote(j) FROM t ORDER BY a",
+            "SELECT typeof(b), typeof(c), typeof(d), typeof(e) FROM t ORDER BY a",
+            "SELECT a FROM t WHERE b = 9 ORDER BY a",
+            "SELECT a, id, b, c FROM r",
+            "SELECT a, b, c, d FROM w ORDER BY a",
+            "PRAGMA integrity_check",
+        ],
+    );
+}
+
+/// **A secondary index on a `WITHOUT ROWID` table is built whole.**
+///
+/// SQLite ends such an index entry with the primary key columns the index does
+/// not already list, so `PRIMARY KEY (a, b)` with an index on `(c)` stores
+/// `c, a, b`, and an index on `(b, a)` stores `b, a`. This engine stores the whole
+/// primary key after the indexed columns. The import read one trailing field and
+/// left the second key column NULL, so the index named rows that did not exist
+/// and a lookup through it found nothing, and when every column outside the
+/// key was indexed the migration failed its own digest.
+#[test]
+fn a_secondary_index_on_a_without_rowid_table_has_every_primary_key_column() {
+    let script = "\
+CREATE TABLE t(a, b, c, d, PRIMARY KEY(a, b)) WITHOUT ROWID;\n\
+INSERT INTO t VALUES(1,2,3,4),(5,6,7,8),(9,10,11,12);\n\
+CREATE INDEX t_c ON t(c);\n\
+CREATE INDEX t_ba ON t(b, a);\n\
+CREATE INDEX t_expr ON t(c + 1);\n\
+CREATE TABLE u(a TEXT, b, PRIMARY KEY(a)) WITHOUT ROWID;\n\
+INSERT INTO u VALUES('x', 2),('Y', 4);\n\
+CREATE INDEX u_a ON u(a);\n\
+CREATE INDEX u_nocase ON u(a COLLATE NOCASE);\n\
+CREATE TABLE v(a, b, c, PRIMARY KEY(a, b)) WITHOUT ROWID;\n\
+INSERT INTO v VALUES(1,2,3),(5,6,7);\n\
+CREATE UNIQUE INDEX v_ca ON v(c, a);\n";
+    let Some((shell, source, destination)) = migrated_from_script("wor-index", script) else {
+        return;
+    };
+    assert_same_answers(
+        &shell,
+        &source,
+        &destination,
+        &[
+            "SELECT * FROM t WHERE c = 7",
+            "SELECT * FROM t INDEXED BY t_c WHERE c = 7",
+            "SELECT * FROM t INDEXED BY t_ba WHERE b = 6",
+            "SELECT * FROM t WHERE c + 1 = 8",
+            "SELECT * FROM u WHERE a = 'x'",
+            "SELECT * FROM u INDEXED BY u_nocase WHERE a = 'y' COLLATE NOCASE",
+            "SELECT * FROM v WHERE c = 7 AND a = 5",
+            "PRAGMA integrity_check",
+        ],
+    );
+}
+
+/// **Triggers fire in the order the source fires them.**
+///
+/// SQLite fires several triggers on one event newest first. The import wrote the
+/// trigger rows in the order the loader listed them, which is already newest
+/// first, and the destination's loader reverses that again, so a migrated file
+/// fired its triggers oldest first.
+#[test]
+fn triggers_on_one_event_fire_in_the_order_the_source_fires_them() {
+    let script = "\
+CREATE TABLE tg(a INTEGER PRIMARY KEY, b);\n\
+CREATE TABLE lg(m);\n\
+CREATE TABLE other(x);\n\
+CREATE TRIGGER zz AFTER INSERT ON tg BEGIN INSERT INTO lg VALUES('zz'); END;\n\
+CREATE TRIGGER o1 AFTER INSERT ON other BEGIN INSERT INTO lg VALUES('o1'); END;\n\
+CREATE TRIGGER aa AFTER INSERT ON tg BEGIN INSERT INTO lg VALUES('aa'); END;\n\
+CREATE TRIGGER o2 AFTER INSERT ON other BEGIN INSERT INTO lg VALUES('o2'); END;\n\
+CREATE TRIGGER mm AFTER INSERT ON tg BEGIN INSERT INTO lg VALUES('mm'); END;\n";
+    let Some((shell, source, destination)) = migrated_from_script("trigger-order", script) else {
+        return;
+    };
+    let database =
+        inillucent_engine::connect::Database::open(&destination).expect("the migration opens");
+    let connection = database.session();
+    connection
+        .execute_batch("INSERT INTO tg(b) VALUES(1); INSERT INTO other VALUES(1);")
+        .expect("the inserts fire the triggers");
+    let ours: Vec<String> = connection
+        .query("SELECT group_concat(m) FROM (SELECT m FROM lg ORDER BY rowid)")
+        .expect("the log reads")
+        .iter()
+        .map(|row| row.iter().map(list_cell).collect::<Vec<String>>().join("|"))
+        .collect();
+    let theirs = Command::new(&shell)
+        .arg("-noheader")
+        .arg(&source)
+        .arg("INSERT INTO tg(b) VALUES(1); INSERT INTO other VALUES(1); SELECT group_concat(m) FROM (SELECT m FROM lg ORDER BY rowid);")
+        .output()
+        .expect("the reference runs");
+    let theirs: Vec<String> = String::from_utf8_lossy(&theirs.stdout)
+        .replace("\r\n", "\n")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(theirs, vec!["mm,aa,zz,o2,o1".to_string()]);
+    assert_eq!(ours, theirs);
+}
+
+/// **An FTS5 table with external content is built from its content table, and a
+/// contentless one is refused with a reason.**
+///
+/// `content='posts'` stores no text of its own, so there was nothing to copy and
+/// the migration refused the whole file. The text is in `posts`, which is carried
+/// like any table, and an FTS5 `rebuild` builds the index from it. `content=''`
+/// keeps no text anywhere, so it is still refused, and the refusal says why.
+#[test]
+fn an_external_content_fts5_table_is_rebuilt_and_a_contentless_one_is_refused() {
+    let script = "\
+CREATE TABLE posts(id INTEGER PRIMARY KEY, title, body);\n\
+INSERT INTO posts VALUES(1,'hello world','first body'),(2,'second','another body');\n\
+CREATE VIRTUAL TABLE f USING fts5(title, body, content='posts', content_rowid='id');\n\
+INSERT INTO f(f) VALUES('rebuild');\n";
+    let Some((shell, source, destination)) = migrated_from_script("fts5-external", script) else {
+        return;
+    };
+    assert_same_answers(
+        &shell,
+        &source,
+        &destination,
+        &[
+            "SELECT rowid FROM f WHERE f MATCH 'body' ORDER BY rowid",
+            "SELECT rowid, title FROM f WHERE f MATCH 'hello'",
+            "SELECT rowid FROM f WHERE f MATCH 'title:second'",
+        ],
+    );
+
+    let area = scratch("fts5-contentless");
+    let source = area.join("source.db");
+    let contentless = "\
+CREATE VIRTUAL TABLE f USING fts5(title, body, content='');\n\
+INSERT INTO f(rowid, title, body) VALUES(1, 'hello', 'x');\n";
+    if !build_with_shell(&shell, &source, contentless) {
+        inillucent_compat::differential::skipping("the reference shell could not be run");
+        return;
+    }
+    let report = sqlite::migrate(&source, &area.join("migrated.rdb")).expect("the migration runs");
+    assert!(
+        !report.passed(),
+        "a contentless table has no text to migrate"
+    );
+    let said: Vec<String> = report.failures().iter().map(|check| check.line()).collect();
+    assert!(
+        said.iter()
+            .any(|line| line.contains("contentless") && line.contains("content=''")),
+        "the refusal does not say the table is contentless: {said:?}"
+    );
+    assert!(
+        !area.join("migrated.rdb").exists(),
+        "a refused migration published a file"
+    );
+}
+
+/// **An R*Tree table is carried, with every row it holds.**
+///
+/// The migration used to fail the whole file with status `corrupt` for a source
+/// that was not damaged. The rows are read out of SQLite's node blobs, so the
+/// table has enough rows to make the tree more than one node deep.
+#[test]
+fn an_rtree_table_is_carried_with_every_row() {
+    let mut script =
+        String::from("CREATE VIRTUAL TABLE rt USING rtree(id, minx, maxx, miny, maxy);\n");
+    script.push_str("CREATE VIRTUAL TABLE ri USING rtree_i32(id, a, b);\n");
+    for id in 1..=300 {
+        script.push_str(&format!(
+            "INSERT INTO rt VALUES({id}, {id}.5, {id}.75, {}.25, {}.5);\n",
+            id % 17,
+            id % 17 + 2
+        ));
+        script.push_str(&format!("INSERT INTO ri VALUES({id}, {id}, {});\n", id + 3));
+    }
+    let Some((shell, source, destination)) = migrated_from_script("rtree", &script) else {
+        return;
+    };
+    assert_same_answers(
+        &shell,
+        &source,
+        &destination,
+        &[
+            "SELECT count(*) FROM rt",
+            "SELECT id, minx, maxx, miny, maxy FROM rt ORDER BY id",
+            "SELECT id FROM rt WHERE minx >= 100 AND maxx <= 120 ORDER BY id",
+            "SELECT id, a, b FROM ri ORDER BY id",
+            "SELECT id FROM ri WHERE a >= 10 AND b <= 20 ORDER BY id",
+        ],
+    );
+}
+
+/// **A source of zero bytes migrates to an empty database.**
+///
+/// SQLite opens a zero byte file as an empty database, and a program that makes
+/// its database file before it first opens it leaves exactly that.
+#[test]
+fn a_zero_byte_source_migrates_to_an_empty_database() {
+    let area = scratch("zero-bytes");
+    let source = area.join("source.db");
+    std::fs::write(&source, b"").expect("the empty source is written");
+    let destination = area.join("migrated.rdb");
+    let report = sqlite::migrate(&source, &destination).expect("the migration runs");
+    assert!(
+        report.passed(),
+        "{:?}",
+        report
+            .failures()
+            .iter()
+            .map(|check| check.line())
+            .collect::<Vec<String>>()
+    );
+    assert!(
+        destination.is_file(),
+        "the empty database was not published"
+    );
+    assert_eq!(
+        std::fs::metadata(&source).map(|held| held.len()).ok(),
+        Some(0)
+    );
+    let database =
+        inillucent_engine::connect::Database::open(&destination).expect("the migration opens");
+    let connection = database.session();
+    let rows = connection
+        .query("SELECT count(*) FROM sqlite_schema")
+        .expect("the schema reads");
+    assert_eq!(rows, vec![vec![OwnedDatum::Int(0)]]);
+    connection
+        .execute_batch("CREATE TABLE later(a); INSERT INTO later VALUES(1);")
+        .expect("the empty database accepts a table");
+}
+
+/// **A dump of a migrated view whose text ends in a line comment replays.**
+///
+/// SQLite stores `CREATE VIEW v AS SELECT a FROM t -- note` with its comment.
+/// The dump wrote `;` straight after the text, which is inside the comment, so the
+/// next line of the dump was read as part of the view. SQLite's own `.dump` puts
+/// the `;` on a line of its own when the text holds `--`; the dump here is
+/// compared with it byte for byte and then replayed.
+#[test]
+fn a_dump_of_a_view_ending_in_a_line_comment_matches_sqlite_and_replays() {
+    let script = "\
+CREATE TABLE t(a);\n\
+INSERT INTO t VALUES(1),(2);\n\
+CREATE VIEW v AS SELECT a FROM t -- note\n;\n\
+CREATE VIEW w AS SELECT a FROM t -- one; two\n;\n\
+CREATE INDEX t_a ON t(a) -- index note\n;\n";
+    let Some((shell, source, destination)) = migrated_from_script("dump-comment", script) else {
+        return;
+    };
+    let area = destination
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let theirs = Command::new(&shell)
+        .arg(&source)
+        .arg(".dump")
+        .output()
+        .expect("the reference dumps");
+    let theirs = String::from_utf8_lossy(&theirs.stdout).replace("\r\n", "\n");
+    let destination_text = destination.to_string_lossy().to_string();
+    let ours = inillucent_compat::cliproc::run(
+        &inillucent_compat::cliproc::program("inillucent-shell"),
+        &[destination_text.as_str(), ".dump"],
+    );
+    let ours_text = ours.stdout.replace("\r\n", "\n");
+    assert_eq!(ours_text, theirs, "the dump differs from SQLite's");
+
+    let script_path = area.join("dump.sql");
+    std::fs::write(&script_path, ours_text.as_bytes()).expect("the dump is written");
+    let fresh = area.join("replayed.rdb");
+    let fresh_text = fresh.to_string_lossy().to_string();
+    let read = format!(".read {}", script_path.to_string_lossy().replace('\\', "/"));
+    let replay = inillucent_compat::cliproc::run(
+        &inillucent_compat::cliproc::program("inillucent-shell"),
+        &[
+            fresh_text.as_str(),
+            read.as_str(),
+            "SELECT a FROM v ORDER BY a",
+        ],
+    );
+    assert_eq!(
+        replay.code,
+        0,
+        "the dump did not replay:\n{}",
+        replay.said()
+    );
+    assert!(
+        replay
+            .stdout
+            .replace("\r\n", "\n")
+            .lines()
+            .any(|line| line == "2"),
+        "the replayed view returned no rows:\n{}",
+        replay.said()
+    );
+}
+
+/// **`VACUUM` on a migrated file leaves the same connection's integrity check clean.**
+///
+/// The file was sound and the connection was not: `VACUUM` reopens the rebuilt
+/// file and then put the old catalog tree handle back over the new one, because
+/// the code that carries attached databases across took the catalog tree's handle
+/// for an attached database's. A migrated file keeps its catalog tree after its
+/// tables and a rebuilt one before them, so the stale root page was a table's
+/// page, and `PRAGMA integrity_check` answered that a page was used twice.
+#[test]
+fn integrity_check_after_vacuum_on_a_migrated_file_is_clean_in_the_same_connection() {
+    let script = "\
+CREATE TABLE a(x);\n\
+INSERT INTO a VALUES(1);\n\
+CREATE TABLE b(y);\n\
+CREATE INDEX b_y ON b(y);\n\
+INSERT INTO b VALUES(2);\n";
+    let Some((_shell, _source, destination)) = migrated_from_script("vacuum-integrity", script)
+    else {
+        return;
+    };
+    let database =
+        inillucent_engine::connect::Database::open(&destination).expect("the migration opens");
+    let connection = database.session();
+    connection.execute_batch("VACUUM").expect("the vacuum runs");
+    let rows = connection
+        .query("PRAGMA integrity_check")
+        .expect("the check runs");
+    assert_eq!(rows, vec![vec![OwnedDatum::Text(b"ok".to_vec())]]);
+}

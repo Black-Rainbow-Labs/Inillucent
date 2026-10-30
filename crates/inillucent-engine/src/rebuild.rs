@@ -945,7 +945,16 @@ impl AttachedSchemas {
     ///
     /// @param database - the connection about to be reopened
     pub(crate) fn take(database: &mut ImportedDatabase) -> AttachedSchemas {
-        let is_attached = |root: &u32| *root >= crate::FIRST_ATTACHED_HANDLE;
+        // **`main`'s own catalog tree is not an attached database's.** It is registered
+        // under `SCHEMA_VIEW_ROOT`, which is the top of the handle range and so passes
+        // a test for "at or above the first attached handle". Carried over, it
+        // replaced the catalog tree the reopened file had just attached with the old
+        // file's, whose root page is wherever the old file put it. A migrated file
+        // keeps its catalog tree after its tables, a rebuilt one before them, so the
+        // stale root named a table's page and the next integrity check in the same
+        // connection reported a page used twice. The file was sound.
+        let is_attached =
+            |root: &u32| *root >= crate::FIRST_ATTACHED_HANDLE && *root != crate::SCHEMA_VIEW_ROOT;
         let trees = std::mem::take(&mut database.schema.trees)
             .into_iter()
             .filter(|(root, _)| is_attached(root))

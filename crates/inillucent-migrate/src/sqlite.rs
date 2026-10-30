@@ -45,7 +45,7 @@ use inillucent_base::error::{corrupt, misuse};
 use inillucent_base::hash::Sha256;
 use inillucent_base::DbResult;
 use inillucent_catalog::load::table_from_create_sql;
-use inillucent_engine::{logical_row, source_layout_of, ImportedDatabase};
+use inillucent_engine::{logical_row, source_layout_of, ImportedDatabase, RecordFills};
 use inillucent_sqlite_reader::SqliteFile;
 use inillucent_tree::datum::OwnedDatum;
 
@@ -181,6 +181,21 @@ impl Report {
     }
 }
 
+/// The page size SQLite gives a database it creates, which an empty file stands for.
+const EMPTY_FILE_PAGE_SIZE: u32 = 4096;
+
+/// Reports whether a file exists and holds no bytes.
+///
+/// **SQLite opens a zero byte file as an empty database**, and a program that
+/// creates its database file before it first opens it leaves exactly that. It has
+/// no header to read, so it is the one source this module does not open as a
+/// SQLite file: the migration publishes an empty database instead.
+///
+/// @param path - the file the source names
+fn is_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|held| held.is_file() && held.len() == 0)
+}
+
 /// Returns `(user_version, application_id)` out of a SQLite file's header.
 ///
 /// Read from the bytes rather than asked as a pragma, because the header is the
@@ -222,6 +237,16 @@ fn header_versions(path: &Path) -> (u32, u32) {
 ///
 /// @param path - the SQLite database to read
 pub fn inventory(path: &Path) -> DbResult<SqliteInventory> {
+    if is_empty_file(path) {
+        return Ok(SqliteInventory {
+            path: path.to_path_buf(),
+            page_size: EMPTY_FILE_PAGE_SIZE,
+            page_count: 0,
+            user_version: 0,
+            application_id: 0,
+            tables: Vec::new(),
+        });
+    }
     let mut file = SqliteFile::open(path.to_path_buf()).map_err(|error| {
         corrupt(format!(
             "{} could not be opened as a SQLite database: {}",
@@ -330,10 +355,19 @@ fn read_one_table(
     })?;
     // A `WITHOUT ROWID` table's pages are index pages, so its rows are read as
     // index entries rather than as table rows.
+    // **A short record reads as the column's default**, as it does in SQLite and as
+    // the import writes it. `ALTER TABLE ... ADD COLUMN` leaves the rows that were
+    // already there with fewer fields, and reading NULL for the missing ones made
+    // the source side of the digest agree with a copy that had lost every default.
+    let mut fills = RecordFills::new(&info);
     let stored = if info.without_rowid {
-        file.read_index(object.root, info.columns.len())
+        file.read_index_filled(object.root, info.columns.len(), &mut |field| {
+            fills.fill(field)
+        })
     } else {
-        file.read_table(object.root, info.columns.len())
+        file.read_table_filled(object.root, info.columns.len(), &mut |field| {
+            fills.fill(field)
+        })
     }
     .map_err(|error| {
         corrupt(format!(
@@ -437,24 +471,28 @@ pub fn migrate(source: &Path, destination: &Path) -> DbResult<Report> {
     // The build. A failure here - a full disk, a read-only directory, a source
     // page that decodes as far as the inventory and no further - leaves the
     // staging file where it fell and never touches the destination.
-    let mut built =
+    let empty = is_empty_file(source);
+    let mut built = if empty {
+        ImportedDatabase::create(staged.clone(), PAGE_SIZE, FRAMES)
+    } else {
         ImportedDatabase::import_into(source.to_path_buf(), staged.clone(), PAGE_SIZE, FRAMES)
-            .map_err(|error| {
-                // **Only a damaged source is reported as damaged.** Every failure here used to
-                // be wrapped in `corrupt`, whose message is the fixed text "database disk image
-                // is malformed", so a table with 2,000 columns that no page could hold was
-                // reported as a malformed file (bug hunt 10). A refusal keeps its own code and
-                // its own words.
-                if error.unsupported().is_some() {
-                    return error;
-                }
-                corrupt(format!(
-                    "{} could not be built from {}: {}",
-                    staged.display(),
-                    source.display(),
-                    error.message()
-                ))
-            })?;
+    }
+    .map_err(|error| {
+        // **Only a damaged source is reported as damaged.** Every failure here used to
+        // be wrapped in `corrupt`, whose message is the fixed text "database disk image
+        // is malformed", so a table with 2,000 columns that no page could hold was
+        // reported as a malformed file (bug hunt 10). A refusal keeps its own code and
+        // its own words.
+        if error.unsupported().is_some() {
+            return error;
+        }
+        corrupt(format!(
+            "{} could not be built from {}: {}",
+            staged.display(),
+            source.display(),
+            error.message()
+        ))
+    })?;
     // Checkpointed and closed before a single row is verified.
     built.checkpoint().map_err(|error| {
         corrupt(format!(
@@ -477,7 +515,11 @@ pub fn migrate(source: &Path, destination: &Path) -> DbResult<Report> {
     // thing anyway - "the declaration of `f_data` did not parse: database disk
     // image is malformed", about a file that was neither malformed nor at
     // fault.
-    let carried = rebuild_full_text(source, &staged)?;
+    let carried = if empty {
+        Vec::new()
+    } else {
+        rebuild_full_text(source, &staged)?
+    };
 
     // **The two schema pragmas move with the database** (task-2066 §4.1.7).
     // `application_id` says which application owns the file and `user_version`
@@ -1029,11 +1071,37 @@ fn rebuild_full_text(source: &Path, staged: &Path) -> DbResult<Vec<Check>> {
     let mut file = SqliteFile::open(source.to_path_buf())?;
     let schema = file.schema()?;
     let mut checks = Vec::new();
-    let mut work: Vec<(String, String, Vec<String>, Vec<Vec<OwnedDatum>>)> = Vec::new();
+    let mut work: Vec<(String, String, Vec<String>, FullTextText)> = Vec::new();
     for object in &schema {
         let Some(module) = virtual_module(&object.sql) else {
             continue;
         };
+        if module.eq_ignore_ascii_case("rtree") || module.eq_ignore_ascii_case("rtree_i32") {
+            let columns = fts5_columns(&object.sql);
+            // Auxiliary columns (`+name`) are stored in `<name>_rowid`, not in the node
+            // blobs this reads, so a table that has one is refused by name.
+            if columns.iter().any(|column| column.starts_with('+')) {
+                return Err(inillucent_base::error::refusal(format!(
+                    "{} is an R*Tree with auxiliary columns, which cannot be carried",
+                    object.name
+                ))
+                .with_unsupported("an R*Tree with auxiliary columns"));
+            }
+            let rows = read_rtree_rows(
+                &mut file,
+                &schema,
+                &object.name,
+                columns.len(),
+                module.ends_with("i32"),
+            )?;
+            work.push((
+                object.name.clone(),
+                object.sql.clone(),
+                columns,
+                FullTextText::RtreeRows(rows),
+            ));
+            continue;
+        }
         if !module.eq_ignore_ascii_case("fts5") {
             checks.push(Check::failed(
                 &format!("carried.{}", object.name),
@@ -1056,6 +1124,32 @@ fn rebuild_full_text(source: &Path, staged: &Path) -> DbResult<Vec<Check>> {
             ));
             continue;
         }
+        // **Where the text is depends on the `content` option.** An ordinary table
+        // keeps it in `<name>_content`. `content='posts'` keeps none and reads the
+        // text from the table `posts` every time, so once `posts` is carried the
+        // index is built from it. `content=''` stores no text anywhere.
+        match fts5_content_option(&object.sql) {
+            Some(table) if table.is_empty() => {
+                checks.push(Check::failed(
+                    &format!("carried.{}", object.name),
+                    format!(
+                        "{} is a contentless FTS5 table (content=''): SQLite stores the index and no copy of the text, so there is no text in this file to build a new index from. Recreate it with its text stored, or drop it, and migrate again",
+                        object.name
+                    ),
+                ));
+                continue;
+            }
+            Some(table) => {
+                work.push((
+                    object.name.clone(),
+                    object.sql.clone(),
+                    columns,
+                    FullTextText::ExternalContent(table),
+                ));
+                continue;
+            }
+            None => {}
+        }
         let content = format!("{}_content", object.name);
         let Some(held) = schema
             .iter()
@@ -1074,48 +1168,279 @@ fn rebuild_full_text(source: &Path, staged: &Path) -> DbResult<Vec<Check>> {
         };
         // `<name>_content` is `id` plus one column per indexed column, in order.
         let rows = file.read_table(held.root, columns.len().saturating_add(1))?;
-        work.push((object.name.clone(), object.sql.clone(), columns, rows));
+        work.push((
+            object.name.clone(),
+            object.sql.clone(),
+            columns,
+            FullTextText::Copied(rows),
+        ));
     }
     if work.is_empty() {
         return Ok(checks);
     }
     let database = inillucent_engine::connect::Database::open(staged)?;
     let connection = database.session();
-    for (name, sql, columns, rows) in work {
+    for (name, sql, columns, text) in work {
         connection.execute_batch(&sql)?;
-        // **The docid moves with the row.** An application that stored the
-        // rowid an fts5 table handed it - which is what `<name>_content`'s `id`
-        // is, and what every search adapter joins on - would find it pointing
-        // at a different document if the rebuild renumbered.
-        let names = columns
-            .iter()
-            .map(|column| format!("\"{column}\""))
-            .collect::<Vec<String>>()
-            .join(", ");
-        let mut carried = 0u64;
-        for row in &rows {
-            // `read_table` prepends the cell's rowid, and the record then
-            // carries `id` (NULL, because it is the rowid alias) followed by
-            // `c0`, `c1`, ... - so the first indexed column is at 2.
-            let values = columns
-                .iter()
-                .enumerate()
-                .map(|(at, _)| sql_literal(row.get(at.saturating_add(2))))
-                .collect::<Vec<String>>()
-                .join(", ");
-            let docid = sql_literal(row.first());
-            connection.execute_batch(&format!(
-                "INSERT INTO \"{name}\"(rowid, {names}) VALUES ({docid}, {values})"
-            ))?;
-            carried = carried.saturating_add(1);
-        }
-        checks.push(Check::passed(
-            &format!("carried.{name}"),
-            format!("{carried} rows rebuilt through this engine's own fts5"),
-        ));
+        checks.push(match text {
+            FullTextText::Copied(rows) => {
+                insert_full_text_rows(&connection, &name, &columns, &rows)?
+            }
+            FullTextText::RtreeRows(rows) => {
+                insert_rtree_rows(&connection, &name, &columns, &rows)?
+            }
+            FullTextText::ExternalContent(table) => {
+                rebuild_from_content_table(&connection, &name, &table)
+            }
+        });
     }
     database.checkpoint()?;
     Ok(checks)
+}
+
+/// Where the text of a source FTS5 table is, which decides how its index is built.
+enum FullTextText {
+    /// The rows of `<name>_content`, to be inserted through this engine's fts5.
+    Copied(Vec<Vec<OwnedDatum>>),
+    /// The name of the table the index reads its text from (`content='posts'`).
+    ExternalContent(String),
+    /// The rows of an R*Tree table, each its id and then its coordinates.
+    RtreeRows(Vec<Vec<OwnedDatum>>),
+}
+
+/// Reads every row of a SQLite R*Tree table out of its `<name>_node` shadow table.
+///
+/// **An R*Tree keeps its rows in the leaves of a tree of nodes, not in a table.**
+/// A node is a blob: the root's first two bytes are the depth of the tree, the
+/// next two are the number of cells, and each cell is an eight byte id followed by
+/// four bytes per coordinate, all big endian, 32 bit floats or 32 bit integers for
+/// `rtree_i32`. In an interior node the id is the number of a child node. The
+/// root is node 1. The rows are read from the leaves and inserted through this
+/// engine's own R*Tree, which rounds a coordinate to 32 bits as SQLite does.
+///
+/// @param file - the SQLite source
+/// @param schema - the source's schema rows
+/// @param name - the R*Tree table
+/// @param columns - how many columns it declares, the id included
+/// @param integers - whether the coordinates are 32 bit integers
+fn read_rtree_rows(
+    file: &mut SqliteFile,
+    schema: &[inillucent_sqlite_reader::SchemaObject],
+    name: &str,
+    columns: usize,
+    integers: bool,
+) -> DbResult<Vec<Vec<OwnedDatum>>> {
+    let shadow = format!("{name}_node");
+    let Some(held) = schema
+        .iter()
+        .find(|held| held.kind == "table" && held.name.eq_ignore_ascii_case(&shadow))
+    else {
+        return Err(corrupt(format!(
+            "{name}: its node table {shadow} is missing"
+        )));
+    };
+    let mut nodes: std::collections::HashMap<i64, Vec<u8>> = std::collections::HashMap::new();
+    for row in file.read_table(held.root, 2)? {
+        if let (Some(OwnedDatum::Int(number)), Some(OwnedDatum::Blob(data))) =
+            (row.first(), row.get(2))
+        {
+            nodes.insert(*number, data.clone());
+        }
+    }
+    let cell = 8usize.saturating_add(columns.saturating_sub(1).saturating_mul(4));
+    let depth = nodes
+        .get(&1)
+        .and_then(|root| root.get(..2))
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map_or(0, |bytes| usize::from(u16::from_be_bytes(bytes)));
+    let mut rows = Vec::new();
+    let mut pending: Vec<(i64, usize)> = vec![(1, depth)];
+    while let Some((number, level)) = pending.pop() {
+        let Some(data) = nodes.get(&number) else {
+            continue;
+        };
+        let count = data
+            .get(2..4)
+            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+            .map_or(0, |bytes| usize::from(u16::from_be_bytes(bytes)));
+        for at in 0..count {
+            let start = 4usize.saturating_add(at.saturating_mul(cell));
+            let Some(bytes) = data.get(start..start.saturating_add(cell)) else {
+                return Err(corrupt(format!(
+                    "{name}: node {number} is shorter than its cell count"
+                )));
+            };
+            let id = bytes
+                .get(..8)
+                .and_then(|raw| <[u8; 8]>::try_from(raw).ok())
+                .map_or(0, i64::from_be_bytes);
+            if level > 0 {
+                pending.push((id, level - 1));
+                continue;
+            }
+            let mut row = vec![OwnedDatum::Int(id)];
+            for coordinate in bytes.get(8..).unwrap_or_default().chunks(4) {
+                let raw = <[u8; 4]>::try_from(coordinate)
+                    .map_err(|_| corrupt(format!("{name}: a cell holds a partial coordinate")))?;
+                row.push(if integers {
+                    OwnedDatum::Int(i64::from(i32::from_be_bytes(raw)))
+                } else {
+                    OwnedDatum::Real(f64::from(f32::from_be_bytes(raw)))
+                });
+            }
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|one, two| format!("{one:?}").cmp(&format!("{two:?}")));
+    Ok(rows)
+}
+
+/// Inserts the rows read out of a source R*Tree table into the new one.
+///
+/// @param connection - the migrated database, where the table was just created
+/// @param name - the R*Tree table
+/// @param columns - its declared columns, the id first
+/// @param rows - each row's id and then its coordinates
+fn insert_rtree_rows(
+    connection: &inillucent_engine::connect::Connection<'_>,
+    name: &str,
+    columns: &[String],
+    rows: &[Vec<OwnedDatum>],
+) -> DbResult<Check> {
+    let names = columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<String>>()
+        .join(", ");
+    for row in rows {
+        let values = row
+            .iter()
+            .map(|value| sql_literal(Some(value)))
+            .collect::<Vec<String>>()
+            .join(", ");
+        connection.execute_batch(&format!(
+            "INSERT INTO \"{name}\"({names}) VALUES ({values})"
+        ))?;
+    }
+    Ok(Check::passed(
+        &format!("carried.{name}"),
+        format!(
+            "{} rows read from the R*Tree's node table and inserted",
+            rows.len()
+        ),
+    ))
+}
+
+/// Inserts the rows of a source FTS5 table's own content table into the new one.
+///
+/// @param connection - the migrated database, where the table was just created
+/// @param name - the FTS5 table
+/// @param columns - the columns it indexes, in order
+/// @param rows - the rows of the source's `<name>_content`, each led by its rowid
+fn insert_full_text_rows(
+    connection: &inillucent_engine::connect::Connection<'_>,
+    name: &str,
+    columns: &[String],
+    rows: &[Vec<OwnedDatum>],
+) -> DbResult<Check> {
+    // **The docid moves with the row.** An application that stored the
+    // rowid an fts5 table handed it - which is what `<name>_content`'s `id`
+    // is, and what every search adapter joins on - would find it pointing
+    // at a different document if the rebuild renumbered.
+    let names = columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<String>>()
+        .join(", ");
+    let mut carried = 0u64;
+    for row in rows {
+        // `read_table` prepends the cell's rowid, and the record then
+        // carries `id` (NULL, because it is the rowid alias) followed by
+        // `c0`, `c1`, ... - so the first indexed column is at 2.
+        let values = columns
+            .iter()
+            .enumerate()
+            .map(|(at, _)| sql_literal(row.get(at.saturating_add(2))))
+            .collect::<Vec<String>>()
+            .join(", ");
+        let docid = sql_literal(row.first());
+        connection.execute_batch(&format!(
+            "INSERT INTO \"{name}\"(rowid, {names}) VALUES ({docid}, {values})"
+        ))?;
+        carried = carried.saturating_add(1);
+    }
+    Ok(Check::passed(
+        &format!("carried.{name}"),
+        format!("{carried} rows rebuilt through this engine's own fts5"),
+    ))
+}
+
+/// Builds an external content FTS5 table's index from the table that holds its text.
+///
+/// **`content='posts'` stores no text of its own.** SQLite keeps only the index
+/// in the FTS5 table's shadow tables and reads the text from `posts` whenever it
+/// needs it, so there is nothing to copy. `posts` was carried with every other
+/// table, and `INSERT INTO name(name) VALUES('rebuild')` reads it row by row and
+/// builds an index this engine can search.
+///
+/// @param connection - the migrated database, where the table was just created
+/// @param name - the FTS5 table
+/// @param table - the content table or view its declaration names
+fn rebuild_from_content_table(
+    connection: &inillucent_engine::connect::Connection<'_>,
+    name: &str,
+    table: &str,
+) -> Check {
+    let quoted = name.replace('"', "\"\"");
+    let said = connection
+        .execute_batch(&format!(
+            "INSERT INTO \"{quoted}\"(\"{quoted}\") VALUES('rebuild')"
+        ))
+        .and_then(|()| connection.query(&format!("SELECT count(*) FROM \"{quoted}\"")));
+    match said {
+        Ok(rows) => {
+            let count = match rows.first().and_then(|row| row.first()) {
+                Some(OwnedDatum::Int(number)) => *number,
+                _ => 0,
+            };
+            Check::passed(
+                &format!("carried.{name}"),
+                format!("{count} rows indexed from the content table {table}"),
+            )
+        }
+        Err(error) => Check::failed(
+            &format!("carried.{name}"),
+            format!(
+                "{name} reads its text from {table}, and its index could not be built from it: {}",
+                error.message()
+            ),
+        ),
+    }
+}
+
+/// Returns the table a `content=` option of an `fts5(...)` declaration names.
+///
+/// `None` when the declaration has no `content` option, which means the table
+/// keeps its own copy of the text. `Some("")` is `content=''`, a contentless
+/// table. A name may be quoted with single or double quotes, which are removed.
+///
+/// @param sql - the declaration as the schema stored it
+fn fts5_content_option(sql: &str) -> Option<String> {
+    let open = sql.find('(')?;
+    let close = sql.rfind(')')?;
+    let inside = sql.get(open.saturating_add(1)..close)?;
+    split_outside_quotes(inside).iter().find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("content") {
+            return None;
+        }
+        let value = value.trim();
+        let unquoted = value
+            .strip_prefix(['\'', '"', '`'])
+            .and_then(|rest| rest.strip_suffix(['\'', '"', '`']))
+            .unwrap_or(value);
+        Some(unquoted.to_string())
+    })
 }
 
 /// Returns the module a `CREATE VIRTUAL TABLE` names, when the text is one.

@@ -139,7 +139,8 @@ pub(crate) fn import_table(
     // The record's width is the count of *stored* columns, not of declared
     // ones: SQLite writes no field for a `VIRTUAL` generated column.
     let positions = stored_positions(info);
-    let raw = file.read_table(info.root, positions.len())?;
+    let mut fills = RecordFills::new(info);
+    let raw = file.read_table_filled(info.root, positions.len(), &mut |field| fills.fill(field))?;
     // `read_table` returns [rowid] ++ record slots. The rowid alias slot holds
     // NULL in every SQLite record, so it is dropped and the rowid takes its
     // place as the tree's key column.
@@ -280,7 +281,8 @@ pub(crate) fn import_keyed_table(
     let (columns, key_columns, layout) = keyed_table_shape(info)?;
     // The record's width is the count of *stored* columns: SQLite writes no
     // field for a `VIRTUAL` generated column here either.
-    let rows = file.read_index(info.root, layout.width)?;
+    let mut fills = RecordFills::new(info);
+    let rows = file.read_index_filled(info.root, layout.width, &mut |field| fills.fill(field))?;
     let rows = in_key_order(rows, &columns, key_columns);
     let borrowed: Vec<Vec<Datum<'_>>> = rows
         .iter()
@@ -333,17 +335,15 @@ fn primary_key_term_collation(
         .map(|held| collation_of(&held.collation))
 }
 
-/// Returns the column directory, key width and layout of a `WITHOUT ROWID`
-/// table's tree.
+/// Returns the declared column each field of a `WITHOUT ROWID` record holds, and
+/// how many of the leading fields are the primary key.
 ///
 /// **The field order is SQLite's, not the declaration's.** For
 /// `CREATE TABLE t(a, b, PRIMARY KEY(b))` the record is `(b, a)`, and
 /// `primary_key_position` is what says so.
 ///
 /// @param info - the table's declaration
-pub(crate) fn keyed_table_shape(
-    info: &TableInfo,
-) -> DbResult<(Vec<ColumnSpec>, usize, SourceLayout)> {
+pub(crate) fn keyed_record_order(info: &TableInfo) -> DbResult<(Vec<usize>, usize)> {
     let width = info.columns.len();
     // The record's field order: primary-key columns in their key order, then
     // every other column in declaration order.
@@ -371,6 +371,20 @@ pub(crate) fn keyed_table_shape(
             order.push(slot);
         }
     }
+    Ok((order, key_columns))
+}
+
+/// Returns the column directory, key width and layout of a `WITHOUT ROWID`
+/// table's tree.
+///
+/// The field order is the one [`keyed_record_order`] gives.
+///
+/// @param info - the table's declaration
+pub(crate) fn keyed_table_shape(
+    info: &TableInfo,
+) -> DbResult<(Vec<ColumnSpec>, usize, SourceLayout)> {
+    let width = info.columns.len();
+    let (order, key_columns) = keyed_record_order(info)?;
     let stored_width = order.len();
     let mut columns = Vec::with_capacity(stored_width);
     let mut types = Vec::with_capacity(stored_width);
@@ -441,8 +455,10 @@ pub(crate) fn keyed_table_shape(
 
 /// Imports one index into a key-ordered PAX tree.
 ///
-/// An index entry is the indexed columns followed by the rowid, which is
-/// already the new format's index-tree row shape, so nothing is rearranged.
+/// An index entry on a rowid table is the indexed columns followed by the rowid,
+/// which is already the new format's index-tree row shape, so nothing is
+/// rearranged. An index on a `WITHOUT ROWID` table is not: see
+/// [`expand_without_rowid_entry`].
 ///
 /// @param database - the file the tree is built in
 /// @param file - the open fixture
@@ -456,9 +472,21 @@ pub(crate) fn import_index(
     index: &IndexInfo,
     root: u32,
 ) -> DbResult<(TreeShape, SourceLayout)> {
-    let key_columns = index.columns.len().saturating_add(1);
-    let rows = file.read_index(root, key_columns)?;
     let (columns, layout) = index_shape(table, index, root);
+    let key_columns = columns.len();
+    let rows = if table.without_rowid {
+        let repeats = key_columns_repeated_in(table, index);
+        let stored = index
+            .columns
+            .len()
+            .saturating_add(repeats.iter().filter(|repeat| repeat.is_none()).count());
+        file.read_index(root, stored)?
+            .iter()
+            .map(|entry| expand_without_rowid_entry(index.columns.len(), &repeats, entry))
+            .collect()
+    } else {
+        file.read_index(root, key_columns)?
+    };
     let rows = in_key_order(rows, &columns, key_columns);
     let borrowed: Vec<Vec<Datum<'_>>> = rows
         .iter()
@@ -482,6 +510,108 @@ pub(crate) fn import_index(
         },
         layout,
     ))
+}
+
+/// Says, for each primary key column of a `WITHOUT ROWID` table, which key column
+/// of an index already holds it.
+///
+/// **SQLite does not store a primary key column twice.** An index on a `WITHOUT
+/// ROWID` table ends with the primary key columns, except those that the index
+/// already lists with the same collation (`isDupColumn` in SQLite's `build.c`).
+/// So for `PRIMARY KEY (a, b)` an index on `(c)` stores `c, a, b`, an index on
+/// `(b, a)` stores `b, a` and no more, and an index on `(a COLLATE NOCASE)`
+/// stores `a` and then `a` again, because the collations differ. An expression
+/// key is never the same as a column.
+///
+/// The answer has one entry per primary key column, in key order: the position of
+/// the index key column that holds it, or `None` when the entry stores it after
+/// the indexed columns.
+///
+/// @param table - the `WITHOUT ROWID` table
+/// @param index - an index on it
+pub fn key_columns_repeated_in(table: &TableInfo, index: &IndexInfo) -> Vec<Option<usize>> {
+    let key = table
+        .indexes
+        .iter()
+        .find(|held| held.origin == inillucent_sql::catalog_view::IndexOrigin::PrimaryKey);
+    identity_columns(table)
+        .iter()
+        .enumerate()
+        .map(|(position, declared)| {
+            let wanted = key_column_collation(
+                table,
+                key.and_then(|held| held.columns.get(position)),
+                *declared,
+            );
+            index.columns.iter().position(|column| {
+                column.expr_sql.is_none()
+                    && column.column.map(usize::from) == Some(*declared)
+                    && key_column_collation(table, Some(column), *declared) == wanted
+            })
+        })
+        .collect()
+}
+
+/// Returns the lowercase name of the collation a key column is ordered by.
+///
+/// The collation the key term wrote, or the table column's own when it wrote
+/// none, and `binary` when neither names one.
+///
+/// @param table - the table the key is on
+/// @param term - the key column of the index or primary key, when there is one
+/// @param declared - the table column the key column holds
+fn key_column_collation(
+    table: &TableInfo,
+    term: Option<&IndexColumnInfo>,
+    declared: usize,
+) -> Vec<u8> {
+    let written = term
+        .map(|column| column.collation.clone())
+        .unwrap_or_default();
+    let name = if written.is_empty() {
+        table
+            .columns
+            .get(declared)
+            .map(|column| column.collation.clone())
+            .unwrap_or_default()
+    } else {
+        written
+    };
+    if name.is_empty() {
+        return b"binary".to_vec();
+    }
+    name.to_ascii_lowercase()
+}
+
+/// Turns one entry of a `WITHOUT ROWID` table's index into the entry this engine
+/// stores, which holds every primary key column after the indexed columns.
+///
+/// The engine's own `CREATE INDEX` writes the whole primary key after the
+/// indexed columns whether or not the index lists some of them, and the table
+/// probe and the integrity check both read it that way. SQLite's entry leaves the
+/// repeated ones out, so each is copied from the key column that holds it.
+///
+/// @param indexed - how many key columns the index lists
+/// @param repeats - what [`key_columns_repeated_in`] says
+/// @param entry - the entry as SQLite stores it
+pub fn expand_without_rowid_entry(
+    indexed: usize,
+    repeats: &[Option<usize>],
+    entry: &[OwnedDatum],
+) -> Vec<OwnedDatum> {
+    let mut out: Vec<OwnedDatum> = entry.iter().take(indexed).cloned().collect();
+    let mut next = indexed;
+    for repeat in repeats {
+        let at = match repeat {
+            Some(held) => *held,
+            None => {
+                next = next.saturating_add(1);
+                next.saturating_sub(1)
+            }
+        };
+        out.push(entry.get(at).cloned().unwrap_or(OwnedDatum::Null));
+    }
+    out
 }
 
 /// Returns a starting point for a connection's `random()` stream.

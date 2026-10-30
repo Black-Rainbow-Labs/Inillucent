@@ -40,6 +40,11 @@ pub(crate) struct Source {
     loaded: inillucent_catalog::snapshot::DatabaseCatalog,
     /// The `CREATE` text, by `(kind, folded name)`.
     declarations: HashMap<(String, String), String>,
+    /// Where each object's row is in the source's `sqlite_schema`, by `(kind, folded name)`.
+    ///
+    /// The order is the one SQLite fires several triggers on one event in, so the
+    /// copy has to write the trigger rows in the same order.
+    schema_position: HashMap<(String, String), usize>,
 }
 
 /// The schema the import is building, as it is built.
@@ -119,8 +124,18 @@ pub(crate) fn read_source(path: PathBuf) -> DbResult<Source> {
     // the derivation - a reconstruction that round-trips today is a
     // reconstruction that stops round-tripping at the first syntax the
     // renderer forgets.
-    let declarations: HashMap<(String, String), String> = file
-        .schema()?
+    let objects = file.schema()?;
+    let schema_position: HashMap<(String, String), usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(position, object)| {
+            (
+                (object.kind.clone(), object.name.to_ascii_lowercase()),
+                position,
+            )
+        })
+        .collect();
+    let declarations: HashMap<(String, String), String> = objects
         .into_iter()
         .map(|object| {
             (
@@ -133,6 +148,7 @@ pub(crate) fn read_source(path: PathBuf) -> DbResult<Source> {
         file,
         loaded,
         declarations,
+        schema_position,
     })
 }
 
@@ -368,8 +384,30 @@ pub(crate) fn carry_treeless(source: &Source, carried: &mut Carried) {
     // source's own `sqlite_schema` text rather than from the parsed body:
     // the text is the definition, and rendering one back would lose
     // whatever the printer does not know how to write.
-    for info in &source.loaded.tables {
-        for trigger in &info.triggers {
+    //
+    // **In the order the source's schema lists them, oldest first.** The loader
+    // hands a table its triggers newest first, because SQLite fires the newest
+    // first, and writing the rows in that order made the file read back the other
+    // way round: the destination's loader reverses again, so three triggers on
+    // one event fired oldest first after a migration.
+    let mut triggers: Vec<(&TableInfo, &inillucent_sql::catalog_view::TriggerInfo)> = source
+        .loaded
+        .tables
+        .iter()
+        .flat_map(|info| info.triggers.iter().map(move |trigger| (info, trigger)))
+        .collect();
+    triggers.sort_by_key(|(_, trigger)| {
+        source
+            .schema_position
+            .get(&(
+                "trigger".to_string(),
+                String::from_utf8_lossy(&trigger.name).to_ascii_lowercase(),
+            ))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    {
+        for (info, trigger) in triggers {
             let Some(sql) = source.declarations.get(&(
                 "trigger".to_string(),
                 String::from_utf8_lossy(&trigger.name).to_ascii_lowercase(),

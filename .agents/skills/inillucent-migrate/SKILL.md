@@ -68,8 +68,10 @@ What comes across:
 |---|---|
 | tables and their rows | copied, then checked by count, digest and column list |
 | indexes, views, triggers | copied |
-| FTS5 tables | rebuilt: the text is indexed again through inillucent's own `fts5`, and the row ids are kept |
-| a virtual table using any other module, such as `rtree` | the migration fails and names the module. SQLite stores that module's data in its own format, and inillucent has no content table to rebuild it from |
+| FTS5 tables | rebuilt: the text is indexed again through inillucent's own `fts5`, and the row ids are kept. With external content (`content='posts'`) the index is built from the copied `posts` table. A contentless table (`content=''`) fails the migration, because SQLite keeps no text for it |
+| `rtree` and `rtree_i32` tables | copied row by row from SQLite's node table. One with auxiliary columns fails with the status `unsupported` |
+| columns added with `ALTER TABLE ... ADD COLUMN` | every row that was written before the `ALTER` gets the column's default, as SQLite reads it |
+| a virtual table using any other module | the migration fails and names the module. SQLite stores that module's data in its own format, and inillucent has no content table to rebuild it from |
 | `PRAGMA user_version`, `PRAGMA application_id` | copied from the source file's header and checked |
 
 `--output json` returns every check with its name, whether it passed, and a detail. This is the
@@ -297,7 +299,7 @@ because MCP uses standard input for its own messages. Set `INILLUCENT_SOURCE_URL
 | `"app.rdb" already exists. This tool never overwrites.` | the destination path is taken. The file there is untouched | pick another destination |
 | `... is left over from an earlier migration` | a server migration failed before and left its staging file | read the report beside the staging file, move the staging file somewhere else, and run again |
 | `postgres 28P01: ...` or `mysql 1045 (28000): ...` | the server refused the login. The code at the start is the server's own error code | match on the code. The wording after it can change |
-| `... was not published: carried.r: r uses the rtree module ...` | a SQLite virtual table uses a module inillucent cannot rebuild | drop that table from a copy of the source, or migrate without it |
+| `... was not published: carried.r: r uses the mymodule module ...` | a SQLite virtual table uses a module inillucent cannot rebuild | drop that table from a copy of the source, or migrate without it |
 | `verification failed; nothing was published` | a count, digest or column check disagreed | read the report. It names the table and the check |
 
 A digest failure on a SQLite source also names the rows: how many rows each side holds, which

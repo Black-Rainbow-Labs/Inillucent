@@ -11,7 +11,7 @@ use inillucent_value::Value;
 
 use crate::dump_virtual::{self, Kind};
 use crate::render::{literal, quote_literal};
-use crate::shell::Shell;
+use crate::shell::{complete_statement, Shell};
 
 /// What `.dump` was asked to leave out or to limit itself to.
 #[derive(Default)]
@@ -75,7 +75,8 @@ pub fn dump(shell: &mut Shell, options: &DumpOptions) {
     write_indexes_over_tables(shell, &tables, options.data_only);
     if !options.data_only {
         for sql in other_objects(shell, pattern.as_deref()) {
-            shell.say(&format!("{sql};"));
+            let line = terminated_object(&sql);
+            shell.say(&line);
         }
     }
     if writable {
@@ -276,7 +277,8 @@ fn say_definition(shell: &mut Shell, name: &str, sql: &str, writable: &mut bool,
     {
         make_writable(shell, writable);
         if let Some(rest) = sql.get(CREATE_TABLE..) {
-            shell.say(&format!("CREATE TABLE IF NOT EXISTS {rest};"));
+            let line = terminated(shell, &format!("CREATE TABLE IF NOT EXISTS {rest}"));
+            shell.say(&line);
         }
         if name.eq_ignore_ascii_case("sqlite_sequence") {
             shell.say("DELETE FROM sqlite_sequence;");
@@ -298,11 +300,55 @@ fn say_definition(shell: &mut Shell, name: &str, sql: &str, writable: &mut bool,
         .is_some_and(|head| head.eq_ignore_ascii_case(b"CREATE TABLE "));
     if let (true, Some(rest)) = (has_create_table, sql.get(CREATE_TABLE..)) {
         if rest.starts_with(['"', '\'']) {
-            shell.say(&format!("CREATE TABLE IF NOT EXISTS {rest};"));
+            let line = terminated(shell, &format!("CREATE TABLE IF NOT EXISTS {rest}"));
+            shell.say(&line);
             return;
         }
     }
-    shell.say(&format!("{sql};"));
+    let line = terminated(shell, sql);
+    shell.say(&line);
+}
+
+/// Returns a view, index or trigger followed by the terminator that makes it replay.
+///
+/// **The statement is the text SQLite stored, and the text may end in a comment.**
+/// A view declared `CREATE VIEW v AS SELECT a FROM t -- note` is stored with its
+/// comment, and a `;` written straight after it is part of the comment, so the
+/// dump's next line was read as a continuation of the view and the whole dump
+/// stopped replaying. SQLite's `.dump` puts the `;` on a line of its own when the
+/// text holds `--` anywhere, without looking for where the comment is, and
+/// writes it straight after the text otherwise.
+///
+/// @param sql - the statement as the schema stores it
+fn terminated_object(sql: &str) -> String {
+    if sql.contains("--") {
+        return format!("{sql}\n;");
+    }
+    format!("{sql};")
+}
+
+/// Returns a table definition followed by the terminator that makes it replay.
+///
+/// The same problem as [`terminated_object`], and SQLite's `.dump` solves it
+/// differently for tables: when the text holds `/*` or `--` it tries no addition,
+/// then `*/`, then a newline, and takes the first that makes the statement
+/// complete.
+///
+/// @param shell - the shell the dump is written through, which knows where a statement ends
+/// @param sql - the statement as the schema stores it
+fn terminated(shell: &Shell, sql: &str) -> String {
+    /// What is written before the `;`, in the order SQLite tries them.
+    const ADDITIONS: [&str; 3] = ["", "*/", "\n"];
+
+    if sql.contains("/*") || sql.contains("--") {
+        for addition in ADDITIONS {
+            let candidate = format!("{sql}{addition};");
+            if complete_statement(shell, &candidate) == Some(candidate.len()) {
+                return candidate;
+            }
+        }
+    }
+    format!("{sql};")
 }
 
 /// Writes `PRAGMA writable_schema=ON` the first time it is needed.
