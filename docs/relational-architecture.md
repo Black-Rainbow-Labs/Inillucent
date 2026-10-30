@@ -914,8 +914,16 @@ the rule, and the write path and the leaf builder both use it. A row of many num
 still be larger than a page, because a number is shorter than the reference that would replace it.
 A leaf spends a directory entry, a class array and an aligned slot array on every column, about 24
 to 32 bytes, so a row of more than about a thousand columns does not fit the sorted part of a
-32 KiB leaf. Such a row is kept alone in the delta area of its own leaf, which costs the directory
-entry and the row's tagged values (`crates/inillucent-tree/src/leaf/encode/oversize.rs`). A row of
+32 KiB leaf. Such rows are kept in the delta area of a leaf that has no sorted rows, which costs the
+directory entry and the row's tagged values (`crates/inillucent-tree/src/leaf/encode/oversize.rs`).
+A leaf takes as many consecutive rows as its page holds after the column directory. A bulk build,
+`VACUUM` and `INSERT ... SELECT` fill each leaf this way, and an insert that finds such a leaf full
+splits it with every existing row on the left and the arriving row starting an empty right leaf.
+A leaf with no sorted rows and several delta rows is the leaf a table holds after its first few
+inserts, so every reader and every log record handles it without change. On 2026-10-30, 1,000 rows
+of 900 integer columns took 31.4 MiB and now take 10.6 MiB, where SQLite takes 3.9 MiB. A table of
+128 columns or more also keeps its rows in the delta area when the delta area holds at least as many
+of them as the sorted part does, up to 64 rows a leaf. A row of
 integers that each need eight bytes holds about 1,925 of them. A row whose integers fit 32 bits is
 written more compactly, see "Format 4" below, and holds about 3,200. A row of more values than
 fits fails with `a row of N columns does not fit one page`.

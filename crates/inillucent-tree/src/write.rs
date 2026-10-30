@@ -119,6 +119,38 @@ fn rows_for_the_left_half<'d, R: AsRef<[Datum<'d>]>>(
     }
 }
 
+/// How many rows the left half of a split keeps, when the row that made the split is known to
+/// arrive in key order above every row of the leaf.
+///
+/// **A table of wide rows keeps every row on the left and starts the right leaf empty.** The rows
+/// of such a table sit in the delta area, a leaf holds only as many as its page has room for
+/// after the column directory, and a split that left the last row for the right half left every
+/// leaf of an appended table one row short of what a bulk build puts in it: 2 rows to a leaf where
+/// a bulk build puts 3, and 1 where it puts 2. The arriving row is the right leaf's first row, and
+/// its key is the separator. A narrow table splits as it always did.
+///
+/// @param builder - the packer, at this tree's page size and columns
+/// @param rows - the rows being split, sorted by key
+/// @param fill - how full to prefer the left half
+/// @param arriving - the key of the row being made room for, when it arrives past the leaf
+fn left_half_size<'d, R: AsRef<[Datum<'d>]>>(
+    builder: &LeafBuilder,
+    rows: &[R],
+    fill: f64,
+    arriving: Option<&[Datum<'_>]>,
+) -> DbResult<usize> {
+    if arriving.is_some() && builder.keeps_wide_rows_in_delta() {
+        if let Packed::Filled { rows: packed, .. } =
+            builder.pack_with(rows, fill, Some(&mut Measuring))?
+        {
+            if packed == rows.len() {
+                return Ok(rows.len());
+            }
+        }
+    }
+    rows_for_the_left_half(builder, rows, fill)
+}
+
 /// What a leaf that has run out of room turns out to need.
 ///
 /// Decided while the page is still borrowed, and acted on after the borrow ends
@@ -2482,7 +2514,10 @@ impl PagedTree {
                 // page ends up holding. Filling the left and leaving the room
                 // on the right is what the rows are actually going to need.
                 let fill = if appending { APPEND_FILL } else { SPLIT_FILL };
-                self.split(database, log, page, path, &borrowed, fill)?;
+                let toward = if appending { arriving } else { None };
+                self.split_carrying_toward(
+                    database, log, page, path, &borrowed, None, fill, toward,
+                )?;
                 Ok(true)
             }
             Fit::Repack(appending) => {
@@ -2653,29 +2688,6 @@ impl PagedTree {
         Ok(())
     }
 
-    /// Splits a leaf in two, giving the right half a new page.
-    ///
-    /// @param database - the file
-    /// @param log - where the record goes
-    /// @param page - the leaf being split
-    /// @param path - the interior pages above it, root first
-    /// @param rows - its live rows, sorted
-    /// @param fill - how full to pack the left half
-    fn split<'d, R: AsRef<[Datum<'d>]>>(
-        &mut self,
-        database: &mut Database,
-        log: &mut dyn TreeLog,
-        page: PageId,
-        path: &[PageId],
-        rows: &[R],
-        fill: f64,
-    ) -> DbResult<()> {
-        // A leaf with no out-of-line values carries none, and the split then
-        // spills nothing because nothing is over the threshold.
-        self.split_carrying(database, log, page, path, rows, None, fill)?;
-        Ok(())
-    }
-
     /// Encodes the two halves of a split, spilling values through one carrying
     /// spiller that is pointed at each half's rows and owner keys in turn.
     ///
@@ -2753,6 +2765,31 @@ impl PagedTree {
         carried: Option<&[Vec<Option<ExtentRef>>]>,
         fill: f64,
     ) -> DbResult<Vec<ExtentRef>> {
+        self.split_carrying_toward(database, log, page, path, rows, carried, fill, None)
+    }
+
+    /// Splits a leaf as [`PagedTree::split_carrying`] does, for an append whose arriving key is
+    /// known.
+    ///
+    /// @param database - the file
+    /// @param log - where the record goes
+    /// @param page - the leaf being split
+    /// @param path - the interior pages above it, root first
+    /// @param rows - its live rows, sorted
+    /// @param carried - the reference each already-out-of-line value is in, or `None`
+    /// @param fill - how full to pack the left half
+    /// @param arriving - the key of the row arriving past the leaf, when the split is an append
+    fn split_carrying_toward<'d, R: AsRef<[Datum<'d>]>>(
+        &mut self,
+        database: &mut Database,
+        log: &mut dyn TreeLog,
+        page: PageId,
+        path: &[PageId],
+        rows: &[R],
+        carried: Option<&[Vec<Option<ExtentRef>>]>,
+        fill: f64,
+        arriving: Option<&[Datum<'_>]>,
+    ) -> DbResult<Vec<ExtentRef>> {
         if rows.len() < 2 {
             return Err(row_larger_than_a_page());
         }
@@ -2775,7 +2812,7 @@ impl PagedTree {
         // runs for values the encode is about to write again. The two agree
         // about the count because they use the same threshold; what differs is
         // only whether the bytes are moved.
-        let taken = rows_for_the_left_half(&builder, rows, fill)?;
+        let taken = left_half_size(&builder, rows, fill, arriving)?;
         let left_rows = rows.get(..taken).unwrap_or(&[]);
         let right_rows = rows.get(taken..).unwrap_or(&[]);
         Self::refuse_a_right_half_that_does_not_fit(&builder, right_rows)?;
@@ -2784,7 +2821,7 @@ impl PagedTree {
         // packing* and the right half's first row is row zero to it.
         let (mut left_image, mut right_image, kept, moved_nothing) =
             self.encode_split_halves(&builder, database, log, left_rows, right_rows, carried)?;
-        let whole = self.separator_between(left_rows, right_rows);
+        let whole = self.separator_between(left_rows, right_rows, arriving);
         let separator = crate::separator::prepare_separator(database, log, self.tree_id(), whole)?;
         let (old_right, max_cts, from_lsn) = {
             let guard = database.pool().fetch(page)?;
@@ -2853,7 +2890,12 @@ impl PagedTree {
         // **Logged as what it did whenever a replay can redo each page from
         // that page alone** - see `Body::SplitLeaf` for the three conditions
         // and `crate::split_log` for the replay.
-        let lsn = if from_live_rows && moved_nothing && direct && !separator.is_out_of_line() {
+        let lsn = if from_live_rows
+            && moved_nothing
+            && direct
+            && !separator.is_out_of_line()
+            && !right_rows.is_empty()
+        {
             self.log_logical_split(database, log, &split, right_rows)?
         } else {
             self.log_split_images(database, log, &split)?
@@ -2891,6 +2933,9 @@ impl PagedTree {
         builder: &LeafBuilder,
         right_rows: &[R],
     ) -> DbResult<()> {
+        if right_rows.is_empty() {
+            return Ok(());
+        }
         match builder.pack_with(right_rows, 1.0, Some(&mut Measuring))? {
             Packed::Filled { rows: packed, .. } if packed == right_rows.len() => Ok(()),
             _ => Err(row_larger_than_a_page()),
@@ -2908,10 +2953,12 @@ impl PagedTree {
     ///
     /// @param left_rows - the rows the left page keeps, sorted
     /// @param right_rows - the rows the right page takes, sorted
+    /// @param arriving - the key the right page starts with when it takes no rows
     fn separator_between<'d, R: AsRef<[Datum<'d>]>>(
         &self,
         left_rows: &[R],
         right_rows: &[R],
+        arriving: Option<&[Datum<'_>]>,
     ) -> Vec<u8> {
         let key_of = |row: Option<&R>| -> Vec<u8> {
             let head: Vec<Datum<'_>> = row
@@ -2925,7 +2972,10 @@ impl PagedTree {
                 .unwrap_or_default();
             self.encode_key(&head)
         };
-        let right = key_of(right_rows.first());
+        let right = match (right_rows.first(), arriving) {
+            (None, Some(key)) => self.encode_key(key),
+            (first, _) => key_of(first),
+        };
         if right.len() <= inillucent_pool::interior::separator_inline_limit(self.page_size()) {
             return right;
         }

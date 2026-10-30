@@ -14,6 +14,7 @@ use super::layout::*;
 use super::*;
 
 mod oversize;
+use oversize::{DELTA_COMPARE_COLUMNS, DELTA_COMPARE_ROWS};
 
 /// Builds one leaf page from a set of rows.
 ///
@@ -547,22 +548,49 @@ impl LeafBuilder {
         spilling: bool,
     ) -> (usize, Layout) {
         let (placed, layout) = self.fit_columnar(rows, at, fill, spilling);
-        if placed > 0 || at >= rows.len() || !spilling {
+        if at >= rows.len() || !spilling || (placed > 0 && !self.may_prefer_delta(placed)) {
             return (placed, layout);
         }
-        // **The first row does not fit the columnar region at this fill.** Two things can still
-        // hold it, tried in order: the same region at a full page, which is what a split already
-        // falls back to, and the delta area of an otherwise empty leaf (bug hunt 10).
-        if fill < 1.0 {
-            let (full, full_layout) = self.fit_columnar(rows, at, 1.0, spilling);
-            if full > 0 {
-                return (full, full_layout);
-            }
+        // **The first row does not fit the columnar region at this fill, or the leaf is one whose
+        // columnar region is mostly directory.** Two things can still hold the rows, tried in
+        // order: the same region at a full page, which is what a split already falls back to, and
+        // the delta area of an otherwise empty leaf (bug hunt 10).
+        let (columnar, columnar_layout) = match placed == 0 && fill < 1.0 {
+            true => self.fit_columnar(rows, at, 1.0, spilling),
+            false => (placed, layout.clone()),
+        };
+        if columnar > 0 && !self.may_prefer_delta(columnar) {
+            return (columnar, columnar_layout);
         }
-        if self.fits_in_delta_area_alone(rows, at) {
-            return (1, Layout::default());
+        let limit = rows.len().saturating_sub(at);
+        let limit = match columnar {
+            0 => limit,
+            _ => limit.min(DELTA_COMPARE_ROWS),
+        };
+        let kept = self.delta_run_len(rows, at, limit);
+        // A tie goes to the delta area: the page it leaves is mostly free, where the columnar
+        // page is mostly directory, so the next rows of an append have room to arrive.
+        match (kept > 0 && kept >= columnar, columnar > 0) {
+            (true, _) => (kept, Layout::default()),
+            (false, true) => (columnar, columnar_layout),
+            (false, false) => (0, layout),
         }
-        (0, layout)
+    }
+
+    /// Reports whether a leaf of this table that holds `placed` rows in its columnar region may
+    /// hold more in its delta area.
+    ///
+    /// **A table of 128 columns or more pays about 28 bytes a column in directory and class
+    /// arrays per leaf however few rows the leaf holds.** At 800 columns that is 22 KiB of a
+    /// 32 KiB page, so the columnar region held 8 rows of small integers or 1 to 2 of large ones,
+    /// where the delta area holds a row for its own tagged bytes and takes 20 or 5 (bug hunt 11).
+    /// Only a leaf that holds few rows is compared, and the delta side is tried for at most
+    /// `DELTA_COMPARE_ROWS` rows, so a narrow table pays nothing and a wide one pays a bounded
+    /// number of inserts a leaf.
+    ///
+    /// @param placed - how many rows the columnar region took
+    fn may_prefer_delta(&self, placed: usize) -> bool {
+        self.columns.len() >= DELTA_COMPARE_COLUMNS && placed < DELTA_COMPARE_ROWS
     }
 
     /// The sizing pass over the columnar region only, with no fallback for a row that does not
