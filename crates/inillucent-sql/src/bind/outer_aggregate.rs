@@ -58,6 +58,8 @@ use crate::diagnostic::ParseError;
 use crate::lexer::Span;
 use crate::rewrite::rewrite_select;
 
+use super::unused_columns::{forget_reserved_source, stand_in_reads};
+
 /// One aggregate an inner query asked an enclosing query to compute.
 struct Attached {
     /// The call, bound in the inner query's scope.
@@ -68,6 +70,10 @@ struct Attached {
     span: Span,
     /// The enclosing query's accumulator number, once it has one.
     slot: Option<usize>,
+    /// Whether no expression reads the value any more, so the enclosing query
+    /// does not compute the call and does not refuse it (see
+    /// [`super::unused_columns`]).
+    unused: bool,
 }
 
 /// What the subqueries of one enclosing query asked it to compute.
@@ -114,6 +120,14 @@ struct Lowering {
     target: usize,
     /// The values the derived table holds, one per column.
     leaves: Vec<BoundExpr>,
+}
+
+impl OuterAggregates {
+    /// Returns the FROM term numbers reserved for aggregates of enclosing
+    /// queries that are still open.
+    pub(super) fn reserved_sources(&self) -> Vec<usize> {
+        self.uses.iter().map(|held| held.source).collect()
+    }
 }
 
 impl Lowering {
@@ -289,7 +303,7 @@ fn stand_in(source: usize, index: usize, aggregate: &BoundAggregate) -> BoundExp
 ///
 /// @param expr - the expression
 /// @param into - the numbers read, with repeats
-fn terms_read(expr: &BoundExpr, into: &mut Vec<usize>) {
+pub(super) fn terms_read(expr: &BoundExpr, into: &mut Vec<usize>) {
     if let BoundExpr::Column { source, .. } | BoundExpr::Rowid { source } = expr {
         into.push(*source);
     }
@@ -467,7 +481,8 @@ impl Binder<'_> {
         let at = self.outer_use_at(level.saturating_add(1));
         let source = self.outer.uses.get(at).map_or(0, |held| held.source);
         let index = self.outer.uses.get_mut(at).map_or(0, |held| {
-            match held.attached.iter().position(|a| a.aggregate == candidate) {
+            let same = |a: &Attached| a.aggregate == candidate && !a.unused;
+            match held.attached.iter().position(same) {
                 Some(index) => index,
                 None => {
                     held.attached.push(Attached {
@@ -475,6 +490,7 @@ impl Binder<'_> {
                         written: written.to_vec(),
                         span,
                         slot: None,
+                        unused: false,
                     });
                     held.attached.len().saturating_sub(1)
                 }
@@ -537,8 +553,13 @@ impl Binder<'_> {
     /// the subquery was written. An aggregate in the owner's `WHERE`, or in an
     /// `ORDER BY` of a query that aggregates nothing else, is refused as SQLite
     /// refuses it.
-    pub(super) fn settle_outer_aggregates(&mut self) -> Result<(), ParseError> {
-        self.settle_outer_aggregates_after(false)
+    ///
+    /// @param block - the query that has just closed, with its sources set
+    pub(super) fn settle_outer_aggregates(
+        &mut self,
+        block: &BoundSelect,
+    ) -> Result<(), ParseError> {
+        self.settle_outer_aggregates_after(false, block)
     }
 
     /// Settles the aggregates a nested query attached, knowing whether it was
@@ -551,8 +572,18 @@ impl Binder<'_> {
     /// columns. Where the enclosing query does compute aggregates, in its own
     /// result list, the call still counts for it.
     ///
+    /// **A call that nothing reads is dropped, not refused.** The block's
+    /// derived tables have already lost their unread columns, so a call that
+    /// only such a column held is not in the tree. SQLite does not compute it
+    /// and does not raise `misuse of aggregate` for it.
+    ///
     /// @param exists - whether the query that has just closed was an `EXISTS`
-    pub(super) fn settle_outer_aggregates_after(&mut self, exists: bool) -> Result<(), ParseError> {
+    /// @param block - the query that has just closed, with its sources set
+    pub(super) fn settle_outer_aggregates_after(
+        &mut self,
+        exists: bool,
+        block: &BoundSelect,
+    ) -> Result<(), ParseError> {
         let depth = self.scopes.len();
         let Some(at) = self.outer.uses.iter().position(|held| held.depth == depth) else {
             return Ok(());
@@ -565,19 +596,39 @@ impl Binder<'_> {
                 held.attached
                     .iter()
                     .enumerate()
-                    .filter(|(_, attached)| attached.slot.is_none())
+                    .filter(|(_, attached)| attached.slot.is_none() && !attached.unused)
                     .map(|(index, a)| (index, a.aggregate.clone(), a.written.clone(), a.span))
                     .collect()
             })
             .unwrap_or_default();
+        let source = self.outer.uses.get(at).map_or(0, |held| held.source);
+        let (anywhere, outside_list) = if pending.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                stand_in_reads(block, source, false),
+                stand_in_reads(block, source, exists),
+            )
+        };
         for (index, aggregate, written, span) in pending {
-            if self.aggregate_is_misplaced() {
-                if exists {
-                    if let Some(held) = self.outer.uses.get_mut(at) {
-                        held.attached.retain(|attached| attached.slot.is_some());
-                    }
-                    return Ok(());
+            // Read nowhere (a derived table lost its column), or only in the
+            // result list of an `EXISTS`, which is never evaluated: where this
+            // query computes no aggregate the call is dropped, and where it
+            // does the call still makes it an aggregate query, as in SQLite.
+            let unread = !anywhere.contains(&index) || (exists && !outside_list.contains(&index));
+            let gone = unread && self.aggregate_is_misplaced();
+            if gone {
+                if let Some(attached) = self
+                    .outer
+                    .uses
+                    .get_mut(at)
+                    .and_then(|held| held.attached.get_mut(index))
+                {
+                    attached.unused = true;
                 }
+                continue;
+            }
+            if self.aggregate_is_misplaced() {
                 return Err(self.misplaced_outer_aggregate(&written, span));
             }
             let BoundExpr::Aggregate { slot, .. } = self.aggregate_slot(aggregate) else {
@@ -637,6 +688,13 @@ impl Binder<'_> {
         used: OuterUse,
     ) -> Result<BoundSelect, ParseError> {
         self.correlations.retain(|id| *id != used.source);
+        let mut bound = bound;
+        if used.attached.iter().all(|attached| attached.unused) {
+            // Every call was dropped, so nothing reads the reserved term and
+            // the query is not rewritten.
+            forget_reserved_source(&mut bound, used.source);
+            return Ok(bound);
+        }
         if !bound.values.is_empty() {
             return Err(unsupported(
                 "an aggregate of an enclosing query inside a subquery, with a VALUES list",
@@ -645,6 +703,10 @@ impl Binder<'_> {
         }
         let mut leaves = Vec::with_capacity(used.attached.len());
         for attached in &used.attached {
+            if attached.unused {
+                leaves.push(BoundExpr::Null);
+                continue;
+            }
             let Some(slot) = attached.slot else {
                 return Err(unsupported(
                     "an aggregate of an enclosing query",

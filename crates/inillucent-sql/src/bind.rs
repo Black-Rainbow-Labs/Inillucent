@@ -60,6 +60,7 @@ mod rowvalue;
 mod rowvalue_query;
 mod scratch;
 mod small;
+mod unused_columns;
 pub use small::block_over;
 use small::{
     denied, no_such_window, refuse_unanswerable_hints, short_circuit_constant, source_answers_to,
@@ -1658,11 +1659,12 @@ impl<'a> Binder<'a> {
         let used = self.take_outer_use(depth);
         let ids = self.leave_block(frame);
         outcome?;
-        self.settle_outer_aggregates_after(exists)?;
         bound.sources = ids
             .iter()
             .filter_map(|id| self.sources.get(*id).cloned())
             .collect();
+        self.drop_unread_derived_columns(&mut bound);
+        self.settle_outer_aggregates_after(exists, &bound)?;
         refuse_unanswerable_hints(&bound)?;
         match used {
             Some(used) => self.lower_outer_aggregates(bound, used),
@@ -2290,11 +2292,12 @@ impl<'a> Binder<'a> {
         let used = self.take_outer_use(depth);
         let ids = self.leave_block(frame);
         let mut bound = bound?;
-        self.settle_outer_aggregates()?;
         bound.sources = ids
             .iter()
             .filter_map(|id| self.sources.get(*id).cloned())
             .collect();
+        self.drop_unread_derived_columns(&mut bound);
+        self.settle_outer_aggregates(&bound)?;
         match used {
             Some(used) => self.lower_outer_aggregates(bound, used),
             None => Ok(bound),
