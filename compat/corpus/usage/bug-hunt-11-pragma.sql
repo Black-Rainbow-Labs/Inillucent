@@ -454,3 +454,25 @@ select a, t.b, a+1, a as z, 5 from t;
 select * from t;
 select va from v;
 select '--end';
+-- case: bug-hunt-11/pragma/D18-index-xinfo-collation-as-written
+create table t(a text collate NoCase, b collate rtrim, c);
+create index i on t(a, b collate Binary, c collate nocase);
+create index j on t(c);
+create unique index k on t(a collate RTRIM);
+create table u(x collate NOCASE unique, y);
+pragma index_xinfo(i);
+pragma index_xinfo(j);
+pragma index_xinfo(k);
+pragma index_xinfo(sqlite_autoindex_u_1);
+-- case: bug-hunt-11/pragma/D19-table-list-schema-table-by-either-name
+pragma table_list(sqlite_master);
+select 'a';
+pragma table_list(sqlite_temp_master);
+select 'b';
+pragma table_list(sqlite_schema);
+select 'c';
+pragma main.table_list(sqlite_master);
+select 'd';
+pragma temp.table_list(sqlite_master);
+select 'e';
+pragma temp.table_list(sqlite_temp_master);

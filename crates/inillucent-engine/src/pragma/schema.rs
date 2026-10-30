@@ -474,6 +474,11 @@ impl crate::ImportedDatabase {
             return Ok(empty);
         };
         let mut rows: Vec<Vec<OwnedDatum>> = Vec::new();
+        let spelled = if extended {
+            self.written_collations(table, index)
+        } else {
+            Vec::new()
+        };
         for (seq, key) in index.columns.iter().enumerate() {
             let mut row = vec![
                 OwnedDatum::Int(seq as i64),
@@ -485,7 +490,11 @@ impl crate::ImportedDatabase {
             ];
             if extended {
                 row.push(OwnedDatum::Int(i64::from(key.declared_descending)));
-                row.push(OwnedDatum::Text(collation_name(&key.collation)));
+                // SQLite prints the collation as it was written, `NoCase` and `nocase` included.
+                let written = spelled.get(seq).cloned().flatten();
+                row.push(OwnedDatum::Text(
+                    written.unwrap_or_else(|| collation_name(&key.collation)),
+                ));
                 row.push(OwnedDatum::Int(1));
             }
             rows.push(row);
@@ -541,6 +550,75 @@ impl crate::ImportedDatabase {
             changes: Default::default(),
         })
     }
+    /// Returns, for each key column of an index, the collation name as it was written.
+    ///
+    /// The key's own `COLLATE` in the `CREATE INDEX` text when it has one, otherwise the
+    /// `COLLATE` of the column's definition in the `CREATE TABLE` text. `None` where neither
+    /// names a collation, which `index_xinfo` prints as `BINARY`.
+    ///
+    /// @param table - the table the index is on
+    /// @param index - the index
+    fn written_collations(
+        &self,
+        table: &inillucent_sql::catalog_view::TableInfo,
+        index: &inillucent_sql::catalog_view::IndexInfo,
+    ) -> Vec<Option<Vec<u8>>> {
+        use inillucent_sql::ast::{ColumnConstraint, CreateTableBody, Statement as Parsed};
+        let limits = inillucent_base::limits::Limits::default();
+        let from_index: Vec<Option<Vec<u8>>> = self
+            .entries_of(table.database)
+            .iter()
+            .find(|held| {
+                held.entry.kind == inillucent_catalog::paged::ObjectKind::Index
+                    && held.entry.name.eq_ignore_ascii_case(&index.name)
+            })
+            .and_then(|held| {
+                inillucent_sql::parser::parse_next_statement(&held.entry.sql, 0, &limits).ok()
+            })
+            .and_then(|parsed| match &parsed.statement {
+                Parsed::CreateIndex { columns, .. } => Some(
+                    columns
+                        .iter()
+                        .map(|key| {
+                            let written = key.collation.or(match parsed.ast.expr(key.expr) {
+                                Some(inillucent_sql::ast::Expr::Collate { collation, .. }) => {
+                                    Some(*collation)
+                                }
+                                _ => None,
+                            });
+                            written.map(|name| parsed.ast.text(name).to_vec())
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let declared = inillucent_sql::parser::parse_next_statement(&table.create_sql, 0, &limits).ok();
+        index
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(seq, key)| {
+                if let Some(Some(name)) = from_index.get(seq) {
+                    return Some(name.clone());
+                }
+                let parsed = declared.as_ref()?;
+                let Parsed::CreateTable {
+                    body: CreateTableBody::Columns { columns, .. },
+                    ..
+                } = &parsed.statement
+                else {
+                    return None;
+                };
+                let column = columns.get(usize::from(key.column?))?;
+                column.constraints.iter().find_map(|(_, constraint)| match constraint {
+                    ColumnConstraint::Collate(name) => Some(parsed.ast.text(*name).to_vec()),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
     /// Lists every table in the schema, or one of them by name.
     ///
     /// **A view is reported as a view, and the schema tables are reported.**
@@ -628,7 +706,16 @@ impl crate::ImportedDatabase {
             } else {
                 b"sqlite_schema"
             };
-            if !matches(name) || at.is_some_and(|named| named != number) {
+            // **The schema tables are found by their old names.** SQLite lists them as
+            // `sqlite_schema` and `sqlite_temp_schema`, and its filter compares the argument with
+            // `sqlite_master` and `sqlite_temp_master`, so `table_list(sqlite_master)` finds the
+            // row and `table_list(sqlite_schema)` does not.
+            let internal: &[u8] = if number == crate::TEMP {
+                b"sqlite_temp_master"
+            } else {
+                b"sqlite_master"
+            };
+            if !matches(internal) || at.is_some_and(|named| named != number) {
                 continue;
             }
             rows.push(vec![
