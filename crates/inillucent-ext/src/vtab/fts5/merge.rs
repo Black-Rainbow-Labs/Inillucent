@@ -231,9 +231,16 @@ impl Fts5Table {
         context: &mut Context<'_>,
     ) -> DbResult<Vec<(i64, Vec<Value<'static>>)>> {
         let offsets = self.offsets(context);
+        let rowid_at = self.rowid_offset(context);
         let mut rows: Vec<(i64, Vec<Value<'static>>)> = Vec::new();
         let suffix = self.content.clone();
         self.shadows.scan(context, &suffix, |rowid, values| {
+            // A `content_rowid` that names an ordinary column gives the row its rowid.
+            let rowid = match rowid_at.and_then(|at| values.get(at)) {
+                Some(Value::Integer(named)) => *named,
+                Some(_) => return Ok(true),
+                None => rowid,
+            };
             rows.push((
                 rowid,
                 offsets
@@ -550,7 +557,12 @@ impl Fts5Table {
         }
         let offsets = self.offsets(context);
         let suffix = self.content.clone();
-        let Some(content) = self.shadows.read_row(context, &suffix, rowid)? else {
+        let content = match self.rowid_offset(context) {
+            Some(at) => super::content::rows_by_rowid_column(context, &self.shadows, &suffix, at)?
+                .remove(&rowid),
+            None => self.shadows.read_row(context, &suffix, rowid)?,
+        };
+        let Some(content) = content else {
             return Ok(());
         };
         let texts: Vec<Option<Vec<u8>>> = (0..self.options.columns.len())

@@ -60,6 +60,10 @@ pub(crate) struct Fts5Cursor {
     pub(crate) names: Vec<Vec<u8>>,
     /// The schema the table is in, which a refusal about its content table names.
     pub(crate) schema: Vec<u8>,
+    /// The `content_rowid` option, which names the column of the owner that is the rowid.
+    pub(crate) content_rowid: Vec<u8>,
+    /// The owner's rows by the value of an ordinary `content_rowid` column, read on first use.
+    pub(crate) by_rowid: Option<std::collections::HashMap<i64, Vec<Value<'static>>>>,
     pub(crate) match_column: i32,
     pub(crate) rank_column: i32,
     /// Which columns were declared UNINDEXED.
@@ -549,8 +553,7 @@ impl Fts5Cursor {
         if self.held.as_ref().map(|(rowid, _)| *rowid) != Some(row.rowid) {
             self.resolve_offsets(context);
             self.held = self
-                .shadows
-                .read_row(context, &self.content.clone(), row.rowid)?
+                .read_content_row(context, row.rowid)?
                 .map(|values| (row.rowid, values));
         }
         let Some((_, content)) = self.held.as_ref() else {
@@ -566,6 +569,53 @@ impl Fts5Cursor {
     }
 
     /// Returns every term the query asked for, across its phrases.
+    /// Returns where the `content_rowid` column sits in a stored row, when it is an ordinary column.
+    ///
+    /// @param context - the running statement
+    fn content_rowid_offset(&self, context: &Context<'_>) -> Option<usize> {
+        super::content::rowid_column_offset(
+            self.external.as_deref(),
+            &self.content_rowid,
+            context.catalog,
+        )
+    }
+
+    /// Reads the stored content of one row of the full-text table.
+    ///
+    /// A `content_rowid` that names an ordinary column of the owner makes that column's value
+    /// the rowid, so the row is found by it. The owner is read once for the cursor and kept.
+    ///
+    /// @param context - the running statement
+    /// @param rowid - the rowid of the row in the full-text table
+    fn read_content_row(
+        &mut self,
+        context: &mut Context<'_>,
+        rowid: i64,
+    ) -> DbResult<Option<Vec<Value<'static>>>> {
+        let named = super::content::rowid_column_offset(
+            self.external.as_deref(),
+            &self.content_rowid,
+            context.catalog,
+        );
+        let Some(at) = named else {
+            return self.shadows.read_row(context, &self.content.clone(), rowid);
+        };
+        if self.by_rowid.is_none() {
+            let rows = super::content::rows_by_rowid_column(
+                context,
+                &self.shadows,
+                &self.content.clone(),
+                at,
+            )?;
+            self.by_rowid = Some(rows);
+        }
+        Ok(self
+            .by_rowid
+            .as_ref()
+            .and_then(|rows| rows.get(&rowid))
+            .cloned())
+    }
+
     /// Answers for a row whose content the owner table no longer has.
     ///
     /// **An external content table's index can name a row the owner has lost.** SQLite reports
@@ -613,6 +663,24 @@ impl Fts5Cursor {
         } else {
             b"content"
         };
+        // A `content_rowid` that names an ordinary column gives each row of the owner that
+        // column's value as its rowid, in the order of those values.
+        let named = super::content::rowid_column_offset(
+            self.external.as_deref(),
+            &self.content_rowid,
+            context.catalog,
+        );
+        if let Some(at) = named {
+            let rows = super::content::rows_by_rowid_column(context, &self.shadows, suffix, at)?;
+            let mut rowids: Vec<i64> = rows.keys().copied().collect();
+            rowids.sort_unstable();
+            self.rows = rowids
+                .into_iter()
+                .map(|rowid| MatchedRow { rowid, score: None })
+                .collect();
+            self.by_rowid = Some(rows);
+            return Ok(());
+        }
         self.shadows.scan(context, suffix, |rowid, _| {
             self.rows.push(MatchedRow { rowid, score: None });
             Ok(true)
@@ -754,7 +822,12 @@ impl Fts5Cursor {
             true => b"docsize",
             false => &self.content.clone(),
         };
-        if self.shadows.read_row(context, suffix, rowid)?.is_some() {
+        // A `content_rowid` that names an ordinary column is looked up by its value.
+        let present = match self.content_rowid_offset(context) {
+            Some(_) => self.read_content_row(context, rowid)?.is_some(),
+            None => self.shadows.read_row(context, suffix, rowid)?.is_some(),
+        };
+        if present {
             self.rows.push(MatchedRow { rowid, score: None });
         }
         Ok(())
@@ -874,8 +947,7 @@ impl VirtualCursor for Fts5Cursor {
         if self.held.as_ref().map(|(rowid, _)| *rowid) != Some(row.rowid) {
             self.resolve_offsets(context);
             self.held = self
-                .shadows
-                .read_row(context, &self.content.clone(), row.rowid)?
+                .read_content_row(context, row.rowid)?
                 .map(|values| (row.rowid, values));
         }
         let Some((_, content)) = self.held.as_ref() else {

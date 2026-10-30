@@ -24,6 +24,7 @@ pub mod fts5;
 pub mod ivfflat;
 pub mod json_each;
 pub mod rtree;
+mod rtree_layout;
 pub mod series;
 pub mod zipfile;
 

@@ -846,3 +846,70 @@ fn the_release_script_builds_the_shipped_versions_fixture() {
          shipped:\n{calls}"
     );
 }
+
+/// An `rtree_i32` table that 2.8.1 wrote with float cells reads exactly and takes a write.
+///
+/// **Releases up to 2.8.1 stored the coordinates of an `rtree_i32` table as 32 bit floats**, as an
+/// `rtree` table does, and lost every integer above 16,777,216. SQLite stores integers, and this
+/// build does too. A table without the layout marker is read as floats until its first write
+/// converts every node, so the rows 2.8.1 wrote never come back as other numbers and a value that
+/// needs all 32 bits is stored whole afterwards. The fixture in `tests/interop/rtree-i32-float`
+/// was written by the 2.8.1 binary from its `build.sql`, with one row left only in the log.
+#[test]
+fn an_rtree_i32_table_that_2_8_1_wrote_with_float_cells_reads_and_writes() {
+    let area = scratch("rtree-i32-float");
+    let database = interop::stage("rtree-i32-float", &area);
+    let arm = default_arm();
+    let wanted = "1,1000,1500,-100,-50\n120,120000,120500,-12000,-11950\n\
+                  1001,16000000,16000100,-16000000,-15999900\n\
+                  1002,-2000000000,-1999999872,7,9\n9001,5,6,5,6";
+    let rows =
+        "SELECT id, x0, x1, y0, y1 FROM box WHERE id IN (1, 120, 1001, 1002, 9001) ORDER BY id";
+    {
+        let handle = open(&arm, &database);
+        let connection = handle.session();
+        assert_eq!(ask(&connection, "PRAGMA integrity_check"), "ok");
+        assert_eq!(
+            ask(&connection, rows),
+            wanted,
+            "the float cells 2.8.1 wrote come back as other numbers"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT count(*) FROM box WHERE x0 >= 50000 AND x1 <= 70000"
+            ),
+            "20",
+            "a bounded query over the tree 2.8.1 built does not answer"
+        );
+        run(
+            &connection,
+            "INSERT INTO box VALUES (2001, 16777217, 16777219, 0, 1), \
+             (2002, 2147483646, 2147483647, -2147483648, -2147483647)",
+        );
+        assert_eq!(
+            ask(&connection, rows),
+            wanted,
+            "a write changed rows it did not touch"
+        );
+        assert_eq!(
+            ask(&connection, "SELECT id FROM box WHERE x0 = 16777217"),
+            "2001",
+            "an integer that needs all 32 bits is not stored whole"
+        );
+        assert_eq!(
+            ask(&connection, "SELECT x1, y0 FROM box WHERE id = 2002"),
+            "2147483647,-2147483648"
+        );
+        assert_eq!(ask(&connection, "PRAGMA integrity_check"), "ok");
+    }
+    let handle = reopen_and_check(&arm, &database);
+    let connection = handle.session();
+    assert_eq!(ask(&connection, rows), wanted);
+    assert_eq!(ask(&connection, "SELECT count(*) FROM box"), "125");
+    assert_eq!(
+        ask(&connection, "SELECT id FROM box WHERE x0 = 16777217"),
+        "2001",
+        "the converted table does not keep its integers after a reopen"
+    );
+}

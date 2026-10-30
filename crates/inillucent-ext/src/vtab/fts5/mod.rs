@@ -474,6 +474,17 @@ impl Fts5Table {
         self.offsets.clone()
     }
 
+    /// Returns where the `content_rowid` column sits in a stored row, when it is an ordinary column.
+    ///
+    /// @param context - the running statement
+    fn rowid_offset(&self, context: &Context<'_>) -> Option<usize> {
+        content::rowid_column_offset(
+            self.external.as_deref(),
+            &self.options.content_rowid,
+            context.catalog,
+        )
+    }
+
     /// Returns whether the table stores no rows of its own at all.
     ///
     /// True for a contentless table and for an external content one: both are
@@ -707,6 +718,8 @@ impl VirtualTable for Fts5Table {
                 .map(|column| column.name.clone())
                 .collect(),
             schema: self.schema.clone(),
+            content_rowid: self.options.content_rowid.clone(),
+            by_rowid: None,
             match_column: self.match_column(),
             rank_column: self.rank_column(),
             unindexed: self

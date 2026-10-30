@@ -246,3 +246,19 @@ releases stored it, and `VACUUM` makes it again from its stored declaration. A n
 `fts5-contentless-delete/` was written by the 2.0.2 binary from `fts5-contentless-delete/build.sql`,
 checkpointed, and given one more row that only its log holds.
 `release_format.rs::a_table_that_2_0_2_declared_contentless_delete_reads_and_vacuums` reads it.
+
+## An `rtree_i32` table with float cells: `rtree-i32-float/`
+
+Releases from 0.1.1 to 2.8.1 wrote the coordinates of an `rtree_i32` table as 32 bit floats, as an
+`rtree` table does. SQLite writes them as 32 bit integers, and so does the current build, so an
+integer above 16,777,216 is stored whole instead of rounded. A table the current build makes holds
+a marker row in `<name>_node` with node number -1, which is never a node. A table without the
+marker was written by an older release. The current build reads its cells as floats, and the first
+write to it rewrites every node with integers and adds the marker. A value the older release had
+already rounded stays rounded, because the file no longer holds the number that was written.
+
+`rtree-i32-float/` was written by the 2.8.1 binary from `rtree-i32-float/build.sql`, checkpointed,
+and given one more row that only its log holds. It is not a release folder, so
+`interop::versions()` does not list it.
+`release_format.rs::an_rtree_i32_table_that_2_8_1_wrote_with_float_cells_reads_and_writes` reads
+the table, writes to it, and reads it again after a reopen.

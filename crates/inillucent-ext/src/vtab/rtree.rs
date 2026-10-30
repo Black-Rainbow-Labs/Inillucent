@@ -26,6 +26,7 @@
 use inillucent_base::{DbResult, PrimaryCode};
 use inillucent_value::Value;
 
+use super::rtree_layout::{self, Known, Layout};
 use super::{
     constraint, failure, Change, ConstraintOp, Context, Declaration, DeclaredColumn, FilterPlan,
     IndexQuery, Module, ModuleArguments, ShadowTable, VirtualCursor, VirtualTable, ROWID_COLUMN,
@@ -470,6 +471,7 @@ impl Module for RTreeModule {
             shape: self.shape,
             auxiliary: auxiliary.len(),
             coordinates: self.coordinates,
+            layout: Layout::default(),
             dimensions,
             shadows: ShadowTables::of(arguments, &[b"node", b"rowid", b"parent"])?,
             declaration: Declaration {
@@ -492,6 +494,8 @@ struct RTreeTable {
     /// How many `+name` columns follow the coordinates.
     auxiliary: usize,
     coordinates: Coordinates,
+    /// Which layout the cells of an `rtree_i32` table are written in, shared with its cursors.
+    layout: Layout,
     dimensions: usize,
     shadows: ShadowTables,
     declaration: Declaration,
@@ -539,6 +543,39 @@ impl RTreeTable {
         if let Ok(mut pending) = self.pending.lock() {
             pending.auxiliary.insert(rowid, extra);
         }
+    }
+
+    /// Returns how the cells of this table are encoded.
+    ///
+    /// An `rtree_i32` table an older release wrote holds floats, and is read as floats until its
+    /// first write converts it.
+    fn cell_kind(&self) -> Coordinates {
+        match (self.coordinates, self.layout.known()) {
+            (Coordinates::Integer, Known::Legacy) => Coordinates::Float,
+            (kind, _) => kind,
+        }
+    }
+
+    /// Finds out which layout an `rtree_i32` table is in, and converts a legacy one for a write.
+    ///
+    /// @param context - the running statement
+    /// @param writing - whether a write is about to change the table
+    fn settle_layout(&mut self, context: &mut Context<'_>, writing: bool) -> DbResult<()> {
+        if self.coordinates != Coordinates::Integer {
+            return Ok(());
+        }
+        let found = rtree_layout::look(context, &self.shadows, &self.layout)?;
+        if found == Known::Legacy && writing {
+            rtree_layout::convert_to_integers(context, &self.shadows, self.dimensions)?;
+            // The nodes the buffer read were floats, so none of them is kept.
+            if let Ok(mut held) = self.pending.lock() {
+                if held.dirty_nodes.is_empty() {
+                    held.nodes.clear();
+                }
+            }
+            self.layout.set(Known::Current);
+        }
+        Ok(())
     }
 
     /// Returns how many bytes one cell takes.
@@ -642,6 +679,7 @@ impl VirtualTable for RTreeTable {
         Ok(Box::new(RTreeCursor {
             shape: self.shape,
             coordinates: self.coordinates,
+            layout: self.layout.clone(),
             dimensions: self.dimensions,
             shadows: self.shadows.clone(),
             pending: Buffer::clone(&self.pending),
@@ -692,6 +730,11 @@ impl VirtualTable for RTreeTable {
             return Ok(());
         }
         self.creating = false;
+        // A table made now writes integer cells and says so.
+        if self.coordinates == Coordinates::Integer {
+            rtree_layout::write_marker(context, &self.shadows)?;
+            self.layout.set(Known::Current);
+        }
         let node_bytes = node_size(context, &self.shadows, &self.pending, self.cell_size());
         let mut root = vec![0u8; node_bytes];
         write_header(&mut root, 0, 0);
@@ -700,6 +743,7 @@ impl VirtualTable for RTreeTable {
 
     /// Applies one insert, update or delete.
     fn update(&mut self, context: &mut Context<'_>, change: &Change) -> DbResult<Option<i64>> {
+        self.settle_layout(context, true)?;
         match change {
             Change::Delete(rowid) => {
                 let Some(rowid) = rowid.as_integer() else {
@@ -761,6 +805,7 @@ impl VirtualTable for RTreeTable {
     /// what a delete and a split respectively depend on, and a tree where they
     /// are wrong is one where a delete silently does nothing.
     fn integrity(&mut self, context: &mut Context<'_>) -> DbResult<Option<String>> {
+        self.settle_layout(context, false)?;
         let mut problems = Vec::new();
         let mut stack = vec![ROOT];
         while let Some(number) = stack.pop() {
@@ -775,7 +820,7 @@ impl VirtualTable for RTreeTable {
                 continue;
             }
             for index in 0..count as usize {
-                let Some(cell) = read_cell(&node, index, self.dimensions, self.coordinates) else {
+                let Some(cell) = read_cell(&node, index, self.dimensions, self.cell_kind()) else {
                     continue;
                 };
                 if depth == 0 {
@@ -1118,7 +1163,7 @@ impl RTreeTable {
             if depth == 0 {
                 return Ok(number);
             }
-            let cells = read_cells(&node, self.dimensions, self.coordinates);
+            let cells = read_cells(&node, self.dimensions, self.cell_kind());
             let mut best: Option<(f64, i64)> = None;
             for child in &cells {
                 let growth = child.growth(cell);
@@ -1138,7 +1183,7 @@ impl RTreeTable {
                 }
             }
             let mut node = node;
-            write_cells(&mut node, depth, &cells, self.coordinates);
+            write_cells(&mut node, depth, &cells, self.cell_kind());
             put_node(context, &self.shadows, &self.pending, number, &node)?;
             number = chosen;
             let _ = node_bytes;
@@ -1159,7 +1204,7 @@ impl RTreeTable {
             return Err(failure(format!("rtree node {number} is missing")));
         };
         let (depth, _) = read_header(&node);
-        let mut cells = read_cells(&node, self.dimensions, self.coordinates);
+        let mut cells = read_cells(&node, self.dimensions, self.cell_kind());
         cells.push(cell.clone());
         if leaf {
             put_rowid(context, &self.shadows, &self.pending, cell.key, number)?;
@@ -1167,7 +1212,7 @@ impl RTreeTable {
             put_parent(context, &self.shadows, &self.pending, cell.key, number)?;
         }
         if cells.len() <= capacity {
-            write_cells(&mut node, depth, &cells, self.coordinates);
+            write_cells(&mut node, depth, &cells, self.cell_kind());
             return put_node(context, &self.shadows, &self.pending, number, &node);
         }
         // The node is full. Split it in half along the widest dimension, which
@@ -1176,10 +1221,10 @@ impl RTreeTable {
         let (left, right) = split(&cells, self.dimensions);
         let sibling = max_node(context, &self.shadows, &self.pending).saturating_add(1);
         let mut left_node = vec![0u8; node_bytes];
-        write_cells(&mut left_node, depth, &left, self.coordinates);
+        write_cells(&mut left_node, depth, &left, self.cell_kind());
         put_node(context, &self.shadows, &self.pending, number, &left_node)?;
         let mut right_node = vec![0u8; node_bytes];
-        write_cells(&mut right_node, depth, &right, self.coordinates);
+        write_cells(&mut right_node, depth, &right, self.cell_kind());
         put_node(context, &self.shadows, &self.pending, sibling, &right_node)?;
         for moved in &right {
             if depth == 0 {
@@ -1196,7 +1241,7 @@ impl RTreeTable {
             // children. Everything else grows the tree by one level.
             let first = max_node(context, &self.shadows, &self.pending).saturating_add(1);
             let mut moved = vec![0u8; node_bytes];
-            write_cells(&mut moved, depth, &left, self.coordinates);
+            write_cells(&mut moved, depth, &left, self.cell_kind());
             put_node(context, &self.shadows, &self.pending, first, &moved)?;
             for cell in &left {
                 if depth == 0 {
@@ -1219,7 +1264,7 @@ impl RTreeTable {
                         box_: right_box,
                     },
                 ],
-                self.coordinates,
+                self.cell_kind(),
             );
             put_node(context, &self.shadows, &self.pending, ROOT, &root)?;
             put_parent(context, &self.shadows, &self.pending, first, ROOT)?;
@@ -1253,13 +1298,13 @@ impl RTreeTable {
             return Ok(());
         };
         let (depth, _) = read_header(&node);
-        let mut cells = read_cells(&node, self.dimensions, self.coordinates);
+        let mut cells = read_cells(&node, self.dimensions, self.cell_kind());
         for cell in cells.iter_mut() {
             if cell.key == child {
                 cell.box_ = box_.clone();
             }
         }
-        write_cells(&mut node, depth, &cells, self.coordinates);
+        write_cells(&mut node, depth, &cells, self.cell_kind());
         put_node(context, &self.shadows, &self.pending, parent, &node)
     }
 
@@ -1276,14 +1321,14 @@ impl RTreeTable {
             return Ok(());
         };
         let (depth, _) = read_header(&node);
-        let mut cells = read_cells(&node, self.dimensions, self.coordinates);
+        let mut cells = read_cells(&node, self.dimensions, self.cell_kind());
         cells.retain(|cell| cell.key != rowid);
         // The blob is rewritten whole, so a cell that was removed leaves no
         // stale bytes behind for a reader that trusts the count.
         for byte in node.iter_mut().skip(HEADER) {
             *byte = 0;
         }
-        write_cells(&mut node, depth, &cells, self.coordinates);
+        write_cells(&mut node, depth, &cells, self.cell_kind());
         put_node(context, &self.shadows, &self.pending, leaf, &node)?;
         delete_rowid(context, &self.shadows, &self.pending, rowid)?;
         // The boxes above the leaf are now larger than they need to be, which
@@ -1444,6 +1489,8 @@ struct RTreeCursor {
     /// Whether the rows are polygons rather than boxes.
     shape: bool,
     coordinates: Coordinates,
+    /// The layout of the table's cells, which its table settles.
+    layout: Layout,
     dimensions: usize,
     shadows: ShadowTables,
     /// The table's write buffer, shared rather than copied.
@@ -1455,9 +1502,22 @@ struct RTreeCursor {
     at: usize,
 }
 
+impl RTreeCursor {
+    /// Returns how the cells of the table are encoded.
+    fn cell_kind(&self) -> Coordinates {
+        match (self.coordinates, self.layout.known()) {
+            (Coordinates::Integer, Known::Legacy) => Coordinates::Float,
+            (kind, _) => kind,
+        }
+    }
+}
+
 impl VirtualCursor for RTreeCursor {
     /// Walks the tree, keeping the leaves the query's box reaches.
     fn filter(&mut self, context: &mut Context<'_>, plan: &FilterPlan) -> DbResult<()> {
+        if self.coordinates == Coordinates::Integer {
+            rtree_layout::look(context, &self.shadows, &self.layout)?;
+        }
         self.rows.clear();
         self.at = 0;
         if plan.index_number == PLAN_ROWID {
@@ -1470,7 +1530,7 @@ impl VirtualCursor for RTreeCursor {
             let Some(node) = get_node(context, &self.shadows, &self.pending, leaf)? else {
                 return Ok(());
             };
-            for cell in read_cells(&node, self.dimensions, self.coordinates) {
+            for cell in read_cells(&node, self.dimensions, self.cell_kind()) {
                 if cell.key == rowid {
                     self.rows.push(cell);
                 }
@@ -1531,7 +1591,7 @@ impl VirtualCursor for RTreeCursor {
                 continue;
             };
             let (depth, _) = read_header(&node);
-            for cell in read_cells(&node, self.dimensions, self.coordinates) {
+            for cell in read_cells(&node, self.dimensions, self.cell_kind()) {
                 if plan.index_number == PLAN_BOX && !cell.overlaps(&query) {
                     continue;
                 }

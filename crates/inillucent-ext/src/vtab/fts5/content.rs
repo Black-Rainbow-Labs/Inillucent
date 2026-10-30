@@ -97,3 +97,61 @@ pub(super) fn content_offsets_named(
         })
         .collect()
 }
+
+/// Returns where the column `content_rowid` names sits in a stored row, when it is an ordinary
+/// column of the owner and not the owner's rowid.
+///
+/// **`content_rowid` may name any integer column**, and then the rowid of a row of the full-text
+/// table is that column's value and not the rowid of the row in the owner. The owner's rowid and
+/// its `INTEGER PRIMARY KEY` are the rowid itself and need no lookup, and a view's first column
+/// is already the rowid.
+///
+/// @param external - the owner's name, when the rows are not this table's
+/// @param content_rowid - the `content_rowid` option, `rowid` when none was written
+/// @param catalog - the schema the statement was compiled against
+pub(super) fn rowid_column_offset(
+    external: Option<&[u8]>,
+    content_rowid: &[u8],
+    catalog: Option<&inillucent_sql::catalog_view::StaticCatalog>,
+) -> Option<usize> {
+    let owner = external?;
+    let found = catalog?.table_named(&owner.to_ascii_lowercase())?;
+    if found.kind == inillucent_sql::catalog_view::TableKind::View {
+        return None;
+    }
+    let folded = content_rowid.to_ascii_lowercase();
+    let position = found
+        .columns
+        .iter()
+        .position(|held| held.name.to_ascii_lowercase() == folded)?;
+    let alias = found.rowid_alias.map(usize::from);
+    match alias {
+        Some(alias) if alias == position => None,
+        Some(alias) if alias < position => Some(position),
+        _ => Some(position.saturating_add(1)),
+    }
+}
+
+/// Reads every row of the owner that has an integer in the column `content_rowid` names, keyed
+/// by that integer.
+///
+/// @param context - the running statement
+/// @param shadows - the table's shadow tables
+/// @param suffix - the shadow the owner's rows are reached under
+/// @param offset - where the column sits in a stored row
+pub(super) fn rows_by_rowid_column(
+    context: &mut super::Context<'_>,
+    shadows: &crate::shadow::ShadowTables,
+    suffix: &[u8],
+    offset: usize,
+) -> inillucent_base::DbResult<std::collections::HashMap<i64, Vec<inillucent_value::Value<'static>>>>
+{
+    let mut rows = std::collections::HashMap::new();
+    shadows.scan(context, suffix, |_, values| {
+        if let Some(inillucent_value::Value::Integer(rowid)) = values.get(offset) {
+            rows.entry(*rowid).or_insert_with(|| values.to_vec());
+        }
+        Ok(true)
+    })?;
+    Ok(rows)
+}
