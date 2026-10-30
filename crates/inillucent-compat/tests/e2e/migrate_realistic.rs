@@ -754,7 +754,7 @@ fn an_external_content_index_is_rebuilt_from_its_content_table() {
     };
     let Some(source) = fixture("warehouse") else {
         inillucent_compat::differential::skipping(
-            "compat/fixtures/realistic/warehouse.db is not built; run              tools/build-realistic-fixtures.sh",
+            "compat/fixtures/realistic/warehouse.db is not built; run tools/build-realistic-fixtures.sh",
         );
         return;
     };

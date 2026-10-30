@@ -1549,6 +1549,9 @@ CREATE INDEX b_y ON b(y);\n\
 INSERT INTO b VALUES(2);\n";
     let Some((_shell, _source, destination)) = migrated_from_script("vacuum-integrity", script)
     else {
+        inillucent_compat::differential::skipping(
+            "the pinned SQLite shell could not build the source file",
+        );
         return;
     };
     let database =
