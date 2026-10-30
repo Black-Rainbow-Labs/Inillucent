@@ -379,6 +379,7 @@ These differences change how an application runs, and they do not show up in a p
 |---|---|---|
 | File format | `.rdb`, with its own log segments | SQLite's format |
 | Page size | 32 KiB | 4 KiB by default |
+| Space for many small tables | each table and each index takes at least one 32 KiB page, so 3,000 tables with one index each take 197 MB | each takes at least one 4 KiB page, and the same 3,000 tables take 25 MB |
 | Page cache | 4,096 frames of 32 KiB, 128 MiB, fixed when the file is opened. `PRAGMA cache_size` reports `-131072`. A frame's memory is allocated the first time the frame is used | `cache_size`, 2 MiB by default |
 | Journal modes | all six. `delete` is the default. `PRAGMA journal_mode = wal` selects the write ahead log, and the file reopens in WAL mode | all six, `delete` by default |
 | Writers | one at a time. A second writer waits up to `PRAGMA busy_timeout` (5000 ms by default) and then fails with `busy` | one at a time |
