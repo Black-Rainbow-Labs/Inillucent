@@ -108,13 +108,6 @@ kinds = ["outcome"]
 reason = "An UPDATE ... FROM with LIMIT cannot be rewritten into a rowid subquery, and the pinned build has no UPDATE ... LIMIT."
 
 [[rule]]
-name = "limited-returning"
-contains = ["LIMIT", "RETURNING"]
-detail = "syntax error"
-kinds = ["outcome"]
-reason = "A limited DELETE or UPDATE with RETURNING cannot be rewritten into a rowid subquery, and the pinned build has no DELETE ... LIMIT."
-
-[[rule]]
 name = "vacuum-into-moves-sqlite-last-insert-rowid"
 contains = ["VACUUM", "INTO"]
 detail = "last_insert_rowid()"

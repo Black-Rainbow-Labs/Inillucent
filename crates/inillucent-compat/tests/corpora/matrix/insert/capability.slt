@@ -19,7 +19,7 @@ CREATE TABLE cap_limited (a INTEGER)
 statement ok
 INSERT INTO cap_limited VALUES (1), (2), (3), (4), (5)
 
-statement error
+query I rowsort
 DELETE FROM cap_limited RETURNING a ORDER BY a DESC LIMIT 1
 
 case capability-on-conflict-partial-index

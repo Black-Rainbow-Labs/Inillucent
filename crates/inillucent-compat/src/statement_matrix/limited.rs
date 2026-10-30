@@ -10,9 +10,13 @@
 //! state after them are compared as for any other statement (section 6.2 of the
 //! design).
 //!
-//! A statement this cannot rewrite, because it has an `UPDATE ... FROM`, a
-//! `RETURNING`, or a `WITH` in front, is sent unchanged, and `deliberate.toml`
-//! names the difference.
+//! A `RETURNING` clause, written before the `ORDER BY` or after the `LIMIT`
+//! (this engine reads both, `docs/sql.md` lists the second as an extension), is
+//! moved to the end of the rewritten statement, the one place SQLite reads it.
+//!
+//! A statement this cannot rewrite, because it has an `UPDATE ... FROM` or a
+//! `WITH` in front, is sent unchanged, and `deliberate.toml` names the
+//! difference.
 
 use crate::statement_matrix::case::top_level_spans;
 
@@ -26,11 +30,46 @@ const TAIL: &[&str] = &["WHERE", "ORDER BY", "LIMIT"];
 /// @param sql - one statement
 pub fn rewrite(sql: &str) -> Option<String> {
     let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    let (without, returning) = split_returning(trimmed);
+    let rewritten = rewrite_without_returning(&without)?;
+    Some(format!("{rewritten}{returning}"))
+}
+
+/// Takes a top level `RETURNING` clause out of a statement.
+///
+/// SQLite reads `RETURNING` last in the `rowid IN` form the oracle is sent, and
+/// this engine reads it before `ORDER BY` or after `LIMIT`, so the clause is cut
+/// from where it was written, up to the next `ORDER BY` or `LIMIT` or the end,
+/// and handed back to be appended.
+///
+/// @param sql - one statement without its final semicolon
+fn split_returning(sql: &str) -> (String, String) {
+    let Some((start, _)) = top_level_spans(sql, "RETURNING").first().copied() else {
+        return (sql.to_string(), String::new());
+    };
+    let end = ["ORDER BY", "LIMIT"]
+        .iter()
+        .filter_map(|phrase| {
+            top_level_spans(sql, phrase)
+                .into_iter()
+                .map(|(at, _)| at)
+                .find(|at| *at > start)
+        })
+        .min()
+        .unwrap_or(sql.len());
+    let before = sql.get(..start).unwrap_or("").trim_end();
+    let after = sql.get(end..).unwrap_or("").trim_start();
+    let clause = sql.get(start..end).unwrap_or("").trim();
+    (format!("{before} {after}"), format!(" {clause}"))
+}
+
+/// Rewrites a limited statement that has no `RETURNING` clause.
+///
+/// @param trimmed - one statement without its final semicolon
+fn rewrite_without_returning(trimmed: &str) -> Option<String> {
+    let trimmed = trimmed.trim();
     let upper = trimmed.to_ascii_uppercase();
     let limit = top_level_spans(trimmed, "LIMIT").last().copied()?;
-    if !top_level_spans(trimmed, "RETURNING").is_empty() {
-        return None;
-    }
     let tail_start = TAIL
         .iter()
         .filter_map(|phrase| {
@@ -111,6 +150,22 @@ mod tests {
         assert!(rewrite("DELETE FROM t WHERE a IN (SELECT a FROM u LIMIT 1)").is_none());
         assert!(rewrite("SELECT a FROM t LIMIT 1").is_none());
         assert!(rewrite("UPDATE t SET a = 1 FROM u WHERE t.a = u.a LIMIT 1").is_none());
-        assert!(rewrite("DELETE FROM t LIMIT 1 RETURNING a").is_none());
+    }
+
+    /// A `RETURNING` clause moves to the end of the rewritten statement from
+    /// either place this engine reads it.
+    #[test]
+    fn returning_follows_the_rewritten_statement() {
+        let wanted =
+            "DELETE FROM t WHERE rowid IN (SELECT rowid FROM t ORDER BY a LIMIT 1) RETURNING a, b";
+        assert_eq!(
+            rewrite("DELETE FROM t ORDER BY a LIMIT 1 RETURNING a, b").as_deref(),
+            Some(wanted)
+        );
+        assert_eq!(
+            rewrite("DELETE FROM t RETURNING a, b ORDER BY a LIMIT 1").as_deref(),
+            Some(wanted)
+        );
+        assert!(rewrite("DELETE FROM t RETURNING a").is_none());
     }
 }
