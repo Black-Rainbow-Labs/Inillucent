@@ -222,7 +222,11 @@ written. `NULLS FIRST` and `NULLS LAST` on an index key are refused, as in SQLit
 
 **JSON and dates.** JSON5 input accepts Unicode whitespace, and an unpaired surrogate escape is read
 as SQLite reads it. A blob that is not JSONB is read as JSON text. `json_each` and `json_tree` give
-the same `id` values as SQLite when called with a path. A date function accepts a blob as the format or
+the same `id` values as SQLite when called with a path. `fullkey` and `path` quote a key unless it
+starts with a letter and holds only letters and digits, and print the key as it is stored, escapes
+included. Text that is not valid UTF-8 passes through the JSON functions as it does in SQLite.
+inillucent holds each such byte as one character from U+10FF80 to U+10FFFF, which is private use, so a
+real character in that range is written out as a byte. A date function accepts a blob as the format or
 as a modifier, `subsec` as the time value, and `timediff` works in both directions.
 
 **A correlated `IN` subquery.** inillucent answers `a IN (SELECT ...)` with a correlated subquery by

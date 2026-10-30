@@ -704,7 +704,8 @@ fn pragma_function_list(registry: &inillucent_ext::registry::Registry) -> Outcom
             true,
             entry.kind,
             entry.arity,
-            entry.flags,
+            // A JSON function is listed with the word SQLite reports for it.
+            inillucent_sql::function::json_function_flags(entry.name).unwrap_or(entry.flags),
         ));
     }
     for held in registry.functions() {

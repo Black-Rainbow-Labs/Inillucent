@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 27] = [
+const UNSAFE_ALLOWED: [&str; 28] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -295,6 +295,12 @@ const UNSAFE_ALLOWED: [&str; 27] = [
     // application receives, and what it is measuring is precisely a cost that
     // has no safe instrument.
     "crates/inillucent/tests/budget.rs",
+    // **The same counter, adding up bytes instead of allocations.** `json_budget.rs` guards the
+    // JSON functions against copying or rebuilding a large document, which is one allocation
+    // however big it is, so it adds up the bytes requested. It is the `budget.rs` allocator with
+    // one line changed: every method forwards to the system allocator, each carries its own
+    // SAFETY note, and the total is a `const` initialised `thread_local!`.
+    "crates/inillucent/tests/json_budget.rs",
 ];
 
 /// Returns every `.rs` file under a directory.
