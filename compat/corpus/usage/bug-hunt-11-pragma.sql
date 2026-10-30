@@ -392,3 +392,11 @@ pragma index_info(sqlite_autoindex_t_1);
 pragma index_info(sqlite_autoindex_t_2);
 pragma index_xinfo(sqlite_autoindex_t_1);
 pragma index_xinfo(sqlite_autoindex_t_2);
+-- case: bug-hunt-11/pragma/D14-ctas-cannot-select-from-itself
+create table n3 as select * from n3;
+select count(*) from sqlite_master;
+-- case: bug-hunt-11/pragma/D14-ctas-of-schema-keeps-types-and-counts
+create table t(a integer, b text);
+create table n4 as select name, type, sql from sqlite_master;
+select count(*), typeof(name) from n4;
+select sql from sqlite_master where name='n4';
