@@ -61,8 +61,7 @@ mod small;
 pub use small::block_over;
 use small::{
     denied, no_such_window, refuse_unanswerable_hints, short_circuit_constant, source_answers_to,
-    subquery_table,
-    window_aggregate, DISTRUSTED_SCHEMA_WORD,
+    subquery_table, window_aggregate, DISTRUSTED_SCHEMA_WORD,
 };
 mod set_rules;
 mod truth;

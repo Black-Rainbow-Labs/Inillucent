@@ -255,13 +255,7 @@ impl crate::ImportedDatabase {
         self.session_state
             .nesting
             .set(self.session_state.nesting.get().saturating_sub(1));
-        // An autocommit statement is its own transaction, so what it measured ends with it.
-        if outermost && self.writing.batch().is_none() {
-            self.clear_key_baselines();
-        }
-        if reads && self.writing.batch().is_none() {
-            self.clear_defer_foreign_keys();
-        }
+        self.end_statement_state(outermost, reads);
         if !lockless {
             self.leave()?;
         } else if ends_or_configures && self.writing.batch().is_none() {

@@ -187,9 +187,13 @@ fn under_affinity(value: &str, affinity: inillucent_value::Affinity) -> String {
         Affinity::Text => format!(
             "(CASE WHEN typeof({value}) IN ('integer', 'real') THEN CAST({value} AS TEXT) ELSE {value} END)"
         ),
-        _ => format!(
-            "(CASE WHEN typeof({value}) = 'text' AND trim({value}) <> '' AND {value} NOT GLOB '*[^0-9.eE+-]*'              AND CAST({value} AS NUMERIC) IS NOT NULL THEN CAST({value} AS NUMERIC) ELSE {value} END)"
-        ),
+        _ => [
+            "(CASE WHEN typeof(@) = 'text' AND trim(@) <> '' ",
+            "AND @ NOT GLOB '*[^0-9.eE+-]*' AND CAST(@ AS NUMERIC) IS NOT NULL ",
+            "THEN CAST(@ AS NUMERIC) ELSE @ END)",
+        ]
+        .concat()
+        .replace('@', value),
     }
 }
 

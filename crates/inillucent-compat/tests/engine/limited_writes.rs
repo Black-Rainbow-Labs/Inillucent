@@ -75,6 +75,18 @@ fn rows(database: &mut ImportedDatabase, sql: &str) -> Vec<Vec<OwnedDatum>> {
         .0
 }
 
+/// Returns the rows a write statement's `RETURNING` clause answers.
+///
+/// @param database - the connection
+/// @param sql - an `INSERT`, `UPDATE` or `DELETE` with `RETURNING`
+fn returned_rows(database: &mut ImportedDatabase, sql: &str) -> Vec<Vec<OwnedDatum>> {
+    database
+        .execute_any(sql, &Params::new())
+        .unwrap_or_else(|error| panic!("{sql}: {}", error.detail().unwrap_or_default()))
+        .rows
+        .clone()
+}
+
 /// Returns the ids left in `t`, in order, as one comma separated string.
 ///
 /// @param database - the connection
@@ -314,7 +326,7 @@ fn a_limited_delete_on_a_view_fires_its_trigger_for_the_kept_rows_only() {
 #[test]
 fn a_limited_delete_may_end_with_returning() {
     let mut database = five_rows("delete-returning");
-    let returned = rows(
+    let returned = returned_rows(
         &mut database,
         "DELETE FROM t ORDER BY a DESC, id LIMIT 2 RETURNING id",
     );
@@ -330,7 +342,7 @@ fn a_limited_delete_may_end_with_returning() {
 #[test]
 fn a_limited_update_may_end_with_returning() {
     let mut database = five_rows("update-returning");
-    let returned = rows(
+    let returned = returned_rows(
         &mut database,
         "UPDATE t SET a = 0 ORDER BY id LIMIT 1 RETURNING id, a",
     );

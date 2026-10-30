@@ -224,6 +224,25 @@ impl ImportedDatabase {
         self.apply_compiled(cached, params)
     }
 
+    /// Clears what an autocommit statement kept for its own transaction.
+    ///
+    /// The key baselines end with the statement, and so does `PRAGMA defer_foreign_keys` after
+    /// a statement that read a table.
+    ///
+    /// @param outermost - whether no other statement was running
+    /// @param reads - whether the statement opened a transaction by reading a table
+    pub(crate) fn end_statement_state(&self, outermost: bool, reads: bool) {
+        if self.writing.batch().is_some() {
+            return;
+        }
+        if outermost {
+            self.clear_key_baselines();
+        }
+        if reads {
+            self.clear_defer_foreign_keys();
+        }
+    }
+
     /// Forgets the baselines, when the transaction ends.
     pub(crate) fn clear_key_baselines(&self) {
         self.session_state.key_baselines.borrow_mut().clear();
