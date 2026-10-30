@@ -156,3 +156,58 @@ pub(super) fn needed_beyond_expressions(
     }
     Some(reduced)
 }
+
+/// Returns what a query reads of a term once every occurrence of an expression one of the term's
+/// indexes computes is left out.
+///
+/// **An index entry holds the value of the expression it indexes, so a query that reads `p` only
+/// inside `json_extract(p, '$.k')` does not need `p` when it reads that index.** The executor
+/// answers such an expression from the entry (`PreparedStage::computed`), so the list returned
+/// here is what the walk of that index has to hold for the statement to be covered by it. Every
+/// expression of the block is visited, because one missed occurrence is a read of a column the
+/// entry does not hold, which fails the statement instead of answering it.
+///
+/// @param select - the bound statement
+/// @param id - the statement wide number of the FROM term
+/// @param keys - the bound expressions the index computes
+pub(super) fn needed_beyond_computed(
+    select: &crate::bind::BoundSelect,
+    id: usize,
+    keys: &[BoundExpr],
+) -> ColumnUse {
+    let mut trimmed = select.clone();
+    let mut blank = |expr: &mut BoundExpr| blank_computed(expr, keys);
+    trimmed.filter.iter_mut().for_each(&mut blank);
+    trimmed.having.iter_mut().for_each(&mut blank);
+    trimmed.group_by.iter_mut().for_each(&mut blank);
+    trimmed.limit.iter_mut().for_each(&mut blank);
+    trimmed.offset.iter_mut().for_each(&mut blank);
+    for column in &mut trimmed.columns {
+        blank(&mut column.expr);
+    }
+    for term in &mut trimmed.order_by {
+        blank(&mut term.expr);
+    }
+    for call in &mut trimmed.aggregates {
+        call.arguments.iter_mut().for_each(&mut blank);
+        call.filter.iter_mut().for_each(&mut blank);
+        for term in &mut call.order_by {
+            blank(&mut term.expr);
+        }
+    }
+    trimmed.columns_read(id)
+}
+
+/// Replaces every occurrence of a computed key inside an expression with a constant.
+///
+/// @param expr - the expression being rewritten in place
+/// @param keys - the bound expressions the index computes
+fn blank_computed(expr: &mut BoundExpr, keys: &[BoundExpr]) {
+    if keys.iter().any(|key| key == expr) {
+        *expr = BoundExpr::Integer(0);
+        return;
+    }
+    for child in expr.children_mut() {
+        blank_computed(child, keys);
+    }
+}

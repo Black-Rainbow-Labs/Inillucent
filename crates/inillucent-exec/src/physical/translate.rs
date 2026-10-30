@@ -94,6 +94,13 @@ pub(crate) fn translate(
     if let Some(found) = resolve_in_frame(expr, frame)? {
         return Ok(found);
     }
+    // A value the stage's index already holds is read, not computed. Only in the scan's own frame:
+    // after an aggregate or a window the row is a different row.
+    if matches!(frame, Frame::Scan) {
+        if let Some(column) = space.computed(expr) {
+            return Ok(Expr::Column(column));
+        }
+    }
     if let Some(found) = translate_literal(expr, params)? {
         // `RAISE(ABORT, 'too big: ' || NEW.n)`: the node itself is a leaf, and
         // its message is an expression over the row, translated here where the

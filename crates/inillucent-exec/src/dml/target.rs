@@ -428,6 +428,7 @@ impl RowSpace {
         for (term, source) in sources.iter().enumerate() {
             stages.push(PreparedStage {
                 functions: Vec::new(),
+                computed: Vec::new(),
                 needed: None,
                 root: layout.tree_key,
                 // These stages read no tree: they are row images the caller

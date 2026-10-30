@@ -16,7 +16,7 @@
 use super::{
     cost, covering, covering_slots, estimated_rows, index_usable,
     join_cost::outer_order_survives_joins, ordering_provided, path_cost, AccessPath, BoundExpr,
-    BoundSelect, BoundSource, Levers,
+    BoundSelect, BoundSource, IndexInfo, Levers, TableInfo,
 };
 
 /// How many rows the walk is assumed to read for each row it keeps when a `WHERE` term is left
@@ -103,6 +103,11 @@ pub(super) fn cheapest(
     let limited = if sort > 0.0 { limit_rows(select) } else { None };
     if limited.is_some() && source.index_hint == crate::bind::IndexChoice::Any {
         for walk in ordered_walks(id, source, select, terms, levers) {
+            candidates.push((walk, consumed.to_vec()));
+        }
+    }
+    if source.index_hint == crate::bind::IndexChoice::Any {
+        for walk in super::group_walk::walks(id, source, select, terms, levers) {
             candidates.push((walk, consumed.to_vec()));
         }
     }
@@ -341,34 +346,47 @@ pub(super) fn ordered_walks(
             .has(Levers::COVERING_INDEX)
             .then(|| covering_slots(table, index, wanted, usable))
             .flatten();
-        let walk = AccessPath::IndexSeek {
-            table_root: table.root,
-            index_root: index.root,
-            index_name: index.name.clone(),
-            equalities: Vec::new(),
-            unconverted: Vec::new(),
-            low: None,
-            high: None,
-            collations: Vec::new(),
-            descending: Vec::new(),
-            columns: Vec::new(),
-            without_rowid: table.without_rowid,
-            key_entry_slots: if table.without_rowid && index.root != table.root {
-                let leading = index.columns.len();
-                (0..table.primary_key().len())
-                    .map(|offset| leading.saturating_add(offset))
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            covering,
-        };
+        let walk = unbounded_walk(table, index, covering);
         let ordered = ordering_provided(select, id, table, &source.index_exprs, &walk);
         if ordered.is_some_and(|_| !select.order_by.is_empty()) {
             walks.push(walk);
         }
     }
     walks
+}
+
+/// Returns a walk of every entry of one index, with no equality and no bound.
+///
+/// @param table - the table the index is on
+/// @param index - the index to walk
+/// @param covering - where the entry holds each column the statement reads, when it holds them all
+pub(super) fn unbounded_walk(
+    table: &TableInfo,
+    index: &IndexInfo,
+    covering: Option<Vec<(u16, usize)>>,
+) -> AccessPath {
+    AccessPath::IndexSeek {
+        table_root: table.root,
+        index_root: index.root,
+        index_name: index.name.clone(),
+        equalities: Vec::new(),
+        unconverted: Vec::new(),
+        low: None,
+        high: None,
+        collations: Vec::new(),
+        descending: Vec::new(),
+        columns: Vec::new(),
+        without_rowid: table.without_rowid,
+        key_entry_slots: if table.without_rowid && index.root != table.root {
+            let leading = index.columns.len();
+            (0..table.primary_key().len())
+                .map(|offset| leading.saturating_add(offset))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        covering,
+    }
 }
 
 #[cfg(test)]

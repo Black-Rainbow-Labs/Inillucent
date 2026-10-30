@@ -145,6 +145,21 @@ impl Space<'_> {
         None
     }
 
+    /// Returns the joined-row column that already holds the value of an expression.
+    ///
+    /// An index of an expression stores the expression's value in each entry, so a stage that reads
+    /// that index has the value as a column and the expression need not be evaluated, or the
+    /// columns it reads fetched.
+    ///
+    /// @param expr - the bound expression, as the binder wrote it
+    pub(crate) fn computed(&self, expr: &BoundExpr) -> Option<usize> {
+        self.stages
+            .iter()
+            .flat_map(|stage| stage.computed.iter())
+            .find(|(held, _)| held == expr)
+            .map(|(_, column)| *column)
+    }
+
     pub(crate) fn rowid(&self, source: usize) -> Option<usize> {
         for (index, stage) in self.stages.iter().enumerate() {
             if stage.source != source {
@@ -772,8 +787,22 @@ fn grouping_of(
         && !drives_from_a_value_list(plan, prepared)
         && (is_scan_prefix(&group_exprs, &group_collations, scan_order)
             || (is_reverse_scan(prepared) && plan.grouped_walk)
+            || (plan.grouped_walk && walks_one_index(plan))
             || (prepared.stages.len() > 1 && plan.grouped_walk));
     Ok((group_exprs, group_collations, grouped_walk))
+}
+
+/// Whether the statement's one term is read by walking an index, so the planner's claim that the
+/// walk keeps each group together describes the tree the stage reads.
+///
+/// A table scan is left out: the executor may read an index in its place, in that index's order.
+///
+/// @param plan - the planner's output
+fn walks_one_index(plan: &PhysicalPlan) -> bool {
+    matches!(
+        plan.sources.as_slice(),
+        [only] if matches!(only.path, AccessPath::IndexSeek { .. })
+    )
 }
 
 /// Whether the outermost stage seeks once per value of an `IN` list.
@@ -1221,6 +1250,42 @@ fn push_having(
     )))
 }
 
+/// Puts a filter for a NULL argument and a `LIMIT 1` in front of a `min()` or `max()`.
+///
+/// The planner chose a walk that reaches the extreme first, so the first row whose argument is not
+/// NULL is the answer and the walk can stop there. NULLs are dropped by the filter because
+/// `min()` and `max()` ignore them, and they sit at the start of an ascending walk.
+///
+/// @param aggregate - the aggregate the surviving row goes into
+/// @param operators - the description, collected sink first
+/// @param up - everything the operators are built from
+fn first_non_null_only(
+    aggregate: Box<dyn Sink>,
+    operators: &mut Listing,
+    up: &Upward<'_>,
+) -> DbResult<Box<dyn Sink>> {
+    let argument = up
+        .plan
+        .select
+        .aggregates
+        .first()
+        .and_then(|call| call.arguments.first());
+    let Some(argument) = argument else {
+        return Ok(aggregate);
+    };
+    let present = BoundExpr::IsNull {
+        negated: true,
+        operand: Box::new(argument.clone()),
+    };
+    let predicate = translate_scan(&present, up.space, up.params)?;
+    let limited = push_limit(aggregate, operators, 1, 0, 0);
+    operators.add(|| "FILTER ARGUMENT NOT NULL".to_string());
+    Ok(Box::new(Filter::new(
+        compile(&predicate, up.scan_types)?,
+        limited,
+    )))
+}
+
 /// Puts the aggregate on, if the statement aggregates.
 ///
 /// @param chain - what it will push into
@@ -1236,10 +1301,12 @@ fn push_aggregate(
         AggregationMode::None => Ok(chain),
         AggregationMode::Whole => {
             operators.add(|| "AGGREGATE".to_string());
-            Ok(Box::new(SimpleAggregate::new(
-                aggregate_specs(select, up.space, up.params, up.scan_types)?,
-                chain,
-            )))
+            let specs = aggregate_specs(select, up.space, up.params, up.scan_types)?;
+            let aggregate: Box<dyn Sink> = Box::new(SimpleAggregate::new(specs, chain));
+            if up.plan.first_entry_answers {
+                return first_non_null_only(aggregate, operators, up);
+            }
+            Ok(aggregate)
         }
         AggregationMode::Grouped => {
             let keys = up
@@ -2339,6 +2406,7 @@ pub(crate) fn push_materialised(
 ) {
     stages.push(PreparedStage {
         functions: Vec::new(),
+        computed: Vec::new(),
         needed: None,
         root: 0,
         kind: AccessKind::Materialised,

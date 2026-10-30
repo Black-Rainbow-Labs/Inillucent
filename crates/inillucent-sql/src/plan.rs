@@ -23,7 +23,9 @@ use crate::cost;
 mod adjacent;
 mod covering;
 mod describe;
+mod extreme;
 pub(crate) mod flatten;
+mod group_walk;
 mod hint;
 mod implied;
 mod join_cost;
@@ -676,6 +678,9 @@ pub struct PhysicalPlan {
     /// a vector per node. Asked once per compiled statement instead, it costs
     /// nothing a statement runs.
     pub subqueries: bool,
+    /// Whether the walk's first row whose `min()` or `max()` argument is not NULL is the answer, so
+    /// the executor stops there; see `extreme`.
+    pub first_entry_answers: bool,
 }
 
 impl PhysicalPlan {
@@ -867,7 +872,7 @@ impl Levers {
 /// @param levers - which optimizations are on
 pub fn plan_select_with(select: BoundSelect, levers: Levers) -> PhysicalPlan {
     let in_compound = !select.compounds.is_empty();
-    plan_block(select, levers, in_compound)
+    extreme::answered_from_one_entry(plan_block(select, levers, in_compound), levers)
 }
 
 /// Plans one block: a statement, or one arm of a compound.
@@ -1014,12 +1019,8 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         .into_iter()
         .map(|(op, arm)| (op, plan_block(arm, levers, true)))
         .collect();
-    let subqueries = holds_subquery(&select)
-        || residuals.iter().flatten().any(expression_holds_subquery)
-        || constant_filter
-            .as_ref()
-            .is_some_and(expression_holds_subquery)
-        || compounds.iter().any(|(_op, arm)| arm.subqueries);
+    let subqueries =
+        subquery_rows::plan_holds_subquery(&select, &residuals, &constant_filter, &compounds);
     PhysicalPlan {
         sources,
         residuals,
@@ -1035,6 +1036,7 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         distinct_walk,
         compounds,
         subqueries,
+        first_entry_answers: false,
         levers,
     }
 }

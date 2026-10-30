@@ -10,6 +10,27 @@
 
 use super::*;
 
+/// Returns whether a block, its residual filters or any compound arm holds a subquery used as a
+/// value.
+///
+/// @param select - the bound block
+/// @param residuals - the predicates the loops still evaluate, one per nesting level
+/// @param constant_filter - the predicate over no columns
+/// @param compounds - the planned later arms of a compound
+pub(super) fn plan_holds_subquery(
+    select: &BoundSelect,
+    residuals: &[Option<BoundExpr>],
+    constant_filter: &Option<BoundExpr>,
+    compounds: &[(CompoundOp, PhysicalPlan)],
+) -> bool {
+    holds_subquery(select)
+        || residuals.iter().flatten().any(expression_holds_subquery)
+        || constant_filter
+            .as_ref()
+            .is_some_and(expression_holds_subquery)
+        || compounds.iter().any(|(_op, arm)| arm.subqueries)
+}
+
 /// Returns whether the rows of a FROM term hold a subquery used as a value.
 ///
 /// A derived table holds one when its query does. A recursive CTE holds one when its own `LIMIT`

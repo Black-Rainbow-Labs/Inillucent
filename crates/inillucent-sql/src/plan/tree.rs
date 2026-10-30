@@ -181,7 +181,7 @@ fn min_or_max_search(plan: &PhysicalPlan) -> Option<String> {
     let name = loop_name(bound);
     let column = match argument {
         BoundExpr::Column { source, column, .. } if *source == only.id => *column,
-        _ => return Some(format!("SEARCH {name}")),
+        _ => return Some(computed_extreme_line(&name, only, select, argument)),
     };
     if only.table.rowid_alias == Some(column) {
         return Some(format!("SEARCH {name}"));
@@ -207,6 +207,60 @@ fn min_or_max_search(plan: &PhysicalPlan) -> Option<String> {
         "SEARCH {name} USING {kind} {}",
         String::from_utf8_lossy(&index.name)
     ))
+}
+
+/// Returns the loop line for a `min()` or `max()` whose argument is not a column.
+///
+/// SQLite reads one end of an index on the argument expression and calls it `SEARCH t USING
+/// COVERING INDEX i` when the entry holds everything the statement reads. Without such an index
+/// the line is `SEARCH t`.
+///
+/// @param name - the loop's name for the FROM term
+/// @param only - the planned FROM term
+/// @param select - the bound statement
+/// @param argument - the aggregate's argument
+fn computed_extreme_line(
+    name: &str,
+    only: &PlannedSource,
+    select: &BoundSelect,
+    argument: &BoundExpr,
+) -> String {
+    let plain = format!("SEARCH {name}");
+    let AccessPath::IndexSeek {
+        index_name,
+        covering,
+        ..
+    } = &only.path
+    else {
+        return plain;
+    };
+    let Some((at, index)) = only
+        .table
+        .indexes
+        .iter()
+        .enumerate()
+        .find(|(_, held)| held.name == *index_name)
+    else {
+        return plain;
+    };
+    let computed = select
+        .sources
+        .iter()
+        .find(|term| term.id == only.id)
+        .and_then(|term| term.index_exprs.iter().find(|held| held.position == at))
+        .is_some_and(|held| held.keys.first().and_then(Option::as_ref) == Some(argument));
+    if !computed {
+        return plain;
+    }
+    let kind = if covering.is_some() {
+        "COVERING INDEX"
+    } else {
+        "INDEX"
+    };
+    format!(
+        "{plain} USING {kind} {}",
+        String::from_utf8_lossy(&index.name)
+    )
 }
 
 /// Returns the name SQLite gives a FROM term in a node: the name of the CTE or

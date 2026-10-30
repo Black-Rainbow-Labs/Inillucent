@@ -102,6 +102,14 @@ pub struct PreparedStage {
     /// at a column the module filled rather than at an expression the pipeline
     /// has no way to evaluate.
     pub functions: Vec<(Vec<u8>, Vec<inillucent_sql::bind::BoundExpr>)>,
+    /// The expressions the index this stage reads computes, each with the tree column holding its
+    /// value in the entry.
+    ///
+    /// Empty for a stage that reads a table or anything but an index of an expression. An entry
+    /// holds the value of the expression it indexes, so a statement that mentions that expression
+    /// reads the value from the entry (`Space::computed`) and a covering walk of the index does not
+    /// need the column the expression reads.
+    pub computed: Vec<(inillucent_sql::bind::BoundExpr, usize)>,
     /// The tree this stage reads.
     pub root: u32,
     /// How it reads it.
@@ -596,7 +604,8 @@ pub fn prepare(
     // A statement whose `ORDER BY` the table walk already answers keeps the table: an index
     // tree holds the rows in the index's order, so swapping it in made the sorter run and read
     // every row, where a `LIMIT` would have stopped the walk after the first few.
-    let walk_answers_order = !plan.select.order_by.is_empty() && !plan.needs_sort;
+    let walk_answers_order =
+        (!plan.select.order_by.is_empty() && !plan.needs_sort) || plan.first_entry_answers;
     if single_scan && !forced.table_scan && !order_sensitive(&plan.select) && !walk_answers_order {
         let table_root = stages.first().map(|stage| stage.root).unwrap_or(0);
         for candidate in catalog.covering_candidates(table_root) {
@@ -940,9 +949,53 @@ fn plan_stages(
             override_root,
             sensitive,
         };
+        let first_new = stages.len();
         stage_for_term(&term, &mut stages, &mut offset)?;
+        for stage in stages.iter_mut().skip(first_new) {
+            stage.computed = computed_keys(plan, source, stage);
+        }
     }
     Ok(stages)
+}
+
+/// Returns the expressions the index a stage reads computes, with the stage's own column for each.
+///
+/// Only for the one term of a statement with one term: an inner term's row is not present until
+/// its loop has matched, and the value read from it would be read too early.
+///
+/// @param plan - the planner's output
+/// @param source - the planned FROM term the stage belongs to
+/// @param stage - the stage, whose tree may be an index of the term's table
+fn computed_keys(
+    plan: &PhysicalPlan,
+    source: &PlannedSource,
+    stage: &PreparedStage,
+) -> Vec<(BoundExpr, usize)> {
+    if plan.sources.len() != 1 || stage.is_lookup || stage.root == source.table.root {
+        return Vec::new();
+    }
+    let Some(at) = source
+        .table
+        .indexes
+        .iter()
+        .position(|index| index.root == stage.root)
+    else {
+        return Vec::new();
+    };
+    let held = plan
+        .select
+        .sources
+        .iter()
+        .find(|term| term.id == source.id)
+        .and_then(|term| term.index_exprs.iter().find(|held| held.position == at));
+    let Some(held) = held else {
+        return Vec::new();
+    };
+    held.keys
+        .iter()
+        .enumerate()
+        .filter_map(|(column, key)| Some((key.clone()?, stage.offset.saturating_add(column))))
+        .collect()
 }
 
 /// Builds the stages one FROM term becomes.
@@ -1291,6 +1344,7 @@ fn virtual_scan_stage(term: &Term<'_>, stages: &mut Vec<PreparedStage>, offset: 
         .saturating_add(functions.len());
     stages.push(PreparedStage {
         functions: functions.clone(),
+        computed: Vec::new(),
         needed: None,
         root: 0,
         kind: AccessKind::Materialised,
@@ -1377,6 +1431,7 @@ fn push_stage(
         .ok_or_else(|| misuse(format!("no layout imported for root page {}", request.root)))?;
     stages.push(PreparedStage {
         functions: Vec::new(),
+        computed: Vec::new(),
         root: request.root,
         kind: request.kind,
         source: request.source,

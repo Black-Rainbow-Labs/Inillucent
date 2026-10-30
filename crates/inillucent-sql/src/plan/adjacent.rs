@@ -63,16 +63,36 @@ pub(super) fn walk_keeps_rows_together(
 /// @param select - the bound statement
 /// @param outer - the planned outer term
 pub(super) fn grouped_by_walk(select: &BoundSelect, outer: &PlannedSource) -> bool {
+    let exprs = super::exprs_of(select, outer.id);
+    grouped_by_path(select, outer.id, &outer.table, exprs, &outer.path)
+}
+
+/// Returns whether one access path's walk brings the rows of each `GROUP BY` key together.
+///
+/// The same question as [`grouped_by_walk`], asked of a path that has not been given to a term
+/// yet, so a candidate walk can be checked before it is offered.
+///
+/// @param select - the bound statement
+/// @param id - the term's statement wide number
+/// @param table - the table the path reads
+/// @param exprs - the bound key expressions of the term's expression indexes
+/// @param path - the path being asked about
+pub(super) fn grouped_by_path(
+    select: &BoundSelect,
+    id: usize,
+    table: &crate::catalog_view::TableInfo,
+    exprs: &[crate::dml::BoundIndexExprs],
+    path: &super::AccessPath,
+) -> bool {
     if select.group_by.is_empty() {
         return false;
     }
-    let exprs = super::exprs_of(select, outer.id);
-    let Some(key) = path_ordering(&outer.table, exprs, &outer.path) else {
+    let Some(key) = path_ordering(table, exprs, path) else {
         return false;
     };
     let mut wanted: Vec<(OrderedBy, Collation)> = Vec::new();
     for expr in &select.group_by {
-        let Some(named) = walk_key_of(expr, outer.id, &outer.table, exprs) else {
+        let Some(named) = walk_key_of(expr, id, table, exprs) else {
             return false;
         };
         let collation = crate::bind::result_collation(expr);
