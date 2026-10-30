@@ -187,6 +187,19 @@ impl crate::ImportedDatabase {
         let bound;
         let columns: &[inillucent_sql::catalog_view::ColumnInfo] =
             if table.kind == inillucent_sql::catalog_view::TableKind::View {
+                // **A view that no longer binds is an error here**, as in SQLite: `table_info` and
+                // `table_xinfo` of a view over a dropped table answer `no such table: main.t`
+                // and no rows. `view_columns` itself still answers no columns, which the other
+                // callers rely on.
+                if let Some(Err(error)) = self.bind_view(table) {
+                    let said = error.message().to_string();
+                    let said = self
+                        .resolution_failure(table.database, said.clone())
+                        .unwrap_or(said);
+                    return Err(crate::engine::statements::refused(error)
+                        .with_message(said.clone())
+                        .with_detail(said));
+                }
                 bound = self.view_columns(table);
                 &bound
             } else {
@@ -895,21 +908,24 @@ fn view_column_type(
     let Some(first) = bound.columns.get(position) else {
         return (Vec::new(), Affinity::Blob);
     };
-    let arms: Vec<Option<&inillucent_sql::bind::BoundExpr>> = std::iter::once(bound)
+    let blocks: Vec<&inillucent_sql::bind::BoundSelect> = std::iter::once(bound)
         .chain(bound.compounds.iter().map(|(_, arm)| arm))
+        .collect();
+    let arms: Vec<Option<&inillucent_sql::bind::BoundExpr>> = blocks
+        .iter()
         .map(|arm| arm.columns.get(position).map(|column| &column.expr))
         .collect();
     let mut kinds = 0u8;
     let mut at = 0usize;
-    let mut affinity = first.expr.affinity();
+    let mut affinity = blocks
+        .first()
+        .and_then(|block| arm_affinity(block, position));
     while affinity.is_none() && at.saturating_add(1) < arms.len() {
         kinds |= arms.get(at).copied().flatten().map_or(0, value_kinds);
         at = at.saturating_add(1);
-        affinity = arms
+        affinity = blocks
             .get(at)
-            .copied()
-            .flatten()
-            .and_then(inillucent_sql::bind::BoundExpr::affinity);
+            .and_then(|block| arm_affinity(block, position));
     }
     // A view passes SQLite's "no affinity" through, and a column with none
     // has no declared type.
@@ -943,6 +959,43 @@ fn view_column_type(
         Affinity::Text => b"TEXT",
     };
     (named.to_vec(), affinity)
+}
+
+/// Returns the affinity of one result column of one arm of a view's `SELECT`, or `None` when it
+/// has none.
+///
+/// **A column read from a derived table, a CTE or a `VALUES` list has that column's affinity, and
+/// that column may have none.** The bound column carries an affinity and no way to say "none", so
+/// it reports BLOB for a literal, a sum or a function result, and the view's column was named
+/// `BLOB` where SQLite gives it no declared type. The block the column reads is asked instead.
+///
+/// @param block - the arm
+/// @param position - the result column
+fn arm_affinity(
+    block: &inillucent_sql::bind::BoundSelect,
+    position: usize,
+) -> Option<inillucent_value::affinity::Affinity> {
+    use inillucent_sql::bind::{BoundExpr, SourceRows};
+    let column = block.columns.get(position)?;
+    let BoundExpr::Column {
+        source,
+        column: inner,
+        ..
+    } = &column.expr
+    else {
+        return column.expr.affinity();
+    };
+    let held = block.sources.iter().find(|held| held.id == *source);
+    match held.map(|held| &held.rows) {
+        Some(SourceRows::Subquery(inside)) => {
+            inside.derived_column_affinity_if_any(usize::from(*inner))
+        }
+        Some(SourceRows::Recursive(body)) => body
+            .seeds
+            .first()
+            .and_then(|(_, seed)| seed.derived_column_affinity_if_any(usize::from(*inner))),
+        _ => column.expr.affinity(),
+    }
 }
 
 /// Returns whether an affinity is one of the four numeric ones.

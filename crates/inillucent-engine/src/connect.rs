@@ -609,6 +609,15 @@ impl Lane {
                 };
             }
         }
+        // **An index an older release wrote in the wrong order is rebuilt before the first
+        // statement of a connection that may write.** A connection that cannot write reads
+        // without it, and a failed rebuild fails the statement rather than letting a write
+        // skip an index it was meant to keep; see `engine::stale_index`.
+        if let Slot::Ready(engine) = &mut *slot {
+            if !engine.storage.read_only && engine.has_withdrawn_indexes() {
+                engine.repair_withdrawn_indexes()?;
+            }
+        }
         std::cell::RefMut::filter_map(slot, |slot| match slot {
             Slot::Ready(engine) => Some(engine.as_mut()),
             _ => None,

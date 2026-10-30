@@ -98,7 +98,7 @@ mod engine;
 // The six groups `ImportedDatabase`'s fields are made of, and the methods
 // that touch only one of them. See `engine::state` (task-1962, A1 step 2).
 pub(crate) use engine::state::{
-    Compiled, Counters, Pragmas, Schema, SessionState, Storage, Writing,
+    Compiled, Counters, Pragmas, Repairs, Schema, SessionState, Storage, Writing,
 };
 // **Re-exported at the root because that is where they were (task-1962, A1
 // step 1).** The split moved these two modules' free functions out of `lib.rs`;

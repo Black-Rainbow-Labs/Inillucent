@@ -71,6 +71,16 @@ pub(super) struct Options {
     /// chooses the option for: the source text is not supposed to be in the
     /// database at all, and it was, silently.
     pub(super) contentless: bool,
+    /// The value of `contentless_delete=` when it is not 0.
+    ///
+    /// **Refused when a table is created, and ignored when one is opened.** Releases 0.1.1 to
+    /// 2.3.3 accepted the option and ignored it: the table they stored is a plain contentless
+    /// table, a `DELETE` from it was refused, and its rows are in the layout a plain contentless
+    /// table uses. 2.3.4 to 2.8.1 refused every query of such a table and every `VACUUM` of its
+    /// file, which made data those releases wrote unreadable. A table found in a file is now read
+    /// as those releases stored it. A new `CREATE VIRTUAL TABLE` that asks for the option is
+    /// still refused, because this build does not delete from a contentless table.
+    pub(super) contentless_delete: Option<String>,
     /// What SQLite refuses in these arguments, when anything.
     ///
     /// **Read only when a table is being created.** SQLite refuses a reserved column name, a
@@ -93,6 +103,7 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut content_rowid: Vec<u8> = b"rowid".to_vec();
     let mut contentless = false;
     let mut unsupported: Option<String> = None;
+    let mut contentless_delete: Option<String> = None;
     let mut not_indexed: Vec<String> = Vec::new();
     let mut invalid: Option<String> = None;
     for argument in arguments {
@@ -142,7 +153,7 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
                 // been written. Refused until the index can find a row's
                 // postings without its text.
                 "contentless_delete" if unquote_option(&value).trim() != "0" => {
-                    unsupported = Some(format!(
+                    contentless_delete = Some(format!(
                         "fts5 contentless_delete={}",
                         unquote_option(&value)
                     ))
@@ -190,6 +201,7 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
         content,
         content_rowid,
         contentless,
+        contentless_delete,
         unsupported,
         invalid,
     })

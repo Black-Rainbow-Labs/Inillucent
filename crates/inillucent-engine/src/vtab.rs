@@ -242,7 +242,7 @@ impl ImportedDatabase {
                 limits: &self.pragmas.limits().borrow(),
                 catalog: Some(&self.schema.catalog),
             };
-            let mut table = found.connect(&connect, true)?;
+            let mut table = connect_new(found.as_ref(), &connect, &self.schema.repairs)?;
             table.begin(&mut context)?;
             table.sync(&mut context)?;
             table.commit(&mut context)?;
@@ -2180,6 +2180,26 @@ fn substitute_shadow_name(template: &str, name: &[u8]) -> String {
         previous = Some(character);
     }
     out
+}
+
+/// Connects a table the engine has just created.
+///
+/// **Which connect is asked for depends on who wrote the declaration.** A table a person wrote is
+/// connected as a new one and a module may refuse an option in it. A table `VACUUM` is making
+/// again from the stored text of the file it copies is connected as one the file already held.
+///
+/// @param found - the module
+/// @param connect - the declaration and its shadow tables
+/// @param repairs - what this connection is repairing; `rebuilding_copy` says `VACUUM` is making the table again
+fn connect_new(
+    found: &dyn inillucent_ext::vtab::Module,
+    connect: &ModuleArguments,
+    repairs: &crate::Repairs,
+) -> DbResult<Box<dyn VirtualTable>> {
+    match repairs.rebuilding_copy {
+        true => found.connect_when_rebuilding(connect),
+        false => found.connect(connect, true),
+    }
 }
 
 /// Returns the name one shadow table is created under.

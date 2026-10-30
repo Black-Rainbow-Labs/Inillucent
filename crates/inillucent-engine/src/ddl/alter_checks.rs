@@ -151,7 +151,7 @@ impl crate::ImportedDatabase {
     ///
     /// @param at - the schema the object is in
     /// @param message - what the binder said
-    fn resolution_failure(&self, at: usize, message: String) -> Option<String> {
+    pub(crate) fn resolution_failure(&self, at: usize, message: String) -> Option<String> {
         if !RESOLUTION_FAILURES
             .iter()
             .any(|prefix| message.starts_with(prefix))

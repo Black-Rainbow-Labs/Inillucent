@@ -222,6 +222,20 @@ pub trait Module: Send + Sync {
         arguments: &ModuleArguments,
         creating: bool,
     ) -> DbResult<Box<dyn VirtualTable>>;
+
+    /// Connects to a table that `VACUUM` is making again in a new file from its stored text.
+    ///
+    /// The table is created, as `connect` with `creating` set does, but the declaration is
+    /// one the file already held, so a module that refuses an option when a person writes a new
+    /// table must accept it here. The default is `connect` with `creating` set.
+    ///
+    /// @param arguments - the stored declaration
+    fn connect_when_rebuilding(
+        &self,
+        arguments: &ModuleArguments,
+    ) -> DbResult<Box<dyn VirtualTable>> {
+        self.connect(arguments, true)
+    }
 }
 
 /// One connected virtual table.

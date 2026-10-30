@@ -148,11 +148,22 @@ impl BoundSelect {
     ///
     /// @param index - which result column
     pub fn derived_column_affinity(&self, index: usize) -> Affinity {
+        self.derived_column_affinity_if_any(index)
+            .unwrap_or(Affinity::Blob)
+    }
+
+    /// [`BoundSelect::derived_column_affinity`], with "none" reported as `None`.
+    ///
+    /// A view column that reads a derived table's column has the derived column's affinity, and
+    /// SQLite names its declared type from it. A derived column with no affinity (a literal, an
+    /// arithmetic result, a function call) has no declared type, where a column with the affinity
+    /// BLOB is named `BLOB`. `PRAGMA table_xinfo` tells the two apart with this.
+    ///
+    /// @param index - which result column
+    pub fn derived_column_affinity_if_any(&self, index: usize) -> Option<Affinity> {
         let mut arms: Vec<&BoundExpr> = Vec::new();
         self.collect_arm_columns(index, &mut arms);
-        let Some(first) = arms.first().copied() else {
-            return Affinity::Blob;
-        };
+        let first = arms.first().copied()?;
         let mut at = 0usize;
         let mut mask = 0u8;
         let mut found = first.affinity();
@@ -161,9 +172,7 @@ impl BoundSelect {
             at = at.saturating_add(1);
             found = arms.get(at).and_then(|arm| arm.affinity());
         }
-        let Some(mut affinity) = found else {
-            return Affinity::Blob;
-        };
+        let mut affinity = found?;
         let later = at.saturating_add(1) < arms.len();
         if affinity != Affinity::Blob && (later || at != 0) {
             for arm in arms.iter().skip(at.saturating_add(1)) {
@@ -186,7 +195,7 @@ impl BoundSelect {
         if affinity == Affinity::Real && self.has_multi_row_values() {
             affinity = Affinity::Numeric;
         }
-        affinity
+        Some(affinity)
     }
 
     /// Reports whether this block or one of its compound arms is a `VALUES` list of several rows.

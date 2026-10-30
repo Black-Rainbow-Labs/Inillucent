@@ -259,6 +259,7 @@ impl crate::ImportedDatabase {
                 schema_info,
                 next_root: FIRST_CREATED_ROOT,
                 imposters: Vec::new(),
+                repairs: Repairs::default(),
                 catalog_generation: 0,
                 appended: None,
                 next_handle: FIRST_ATTACHED_HANDLE,
@@ -786,6 +787,7 @@ impl crate::ImportedDatabase {
                 next_handle: FIRST_ATTACHED_HANDLE,
                 ddl_schema: 0,
                 imposters: Vec::new(),
+                repairs: Repairs::default(),
                 catalog_generation: 0,
                 appended: None,
             },
@@ -826,6 +828,7 @@ impl crate::ImportedDatabase {
             opened.rebuild_tables()?;
             opened.refresh_catalog();
         }
+        opened.withdraw_indexes_written_without_their_collation()?;
         opened.finish_the_open(read_only)?;
         Ok(opened)
     }

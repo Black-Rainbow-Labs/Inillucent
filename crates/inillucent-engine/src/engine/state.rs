@@ -793,6 +793,22 @@ pub(crate) struct SessionState {
     pub(crate) owner: HashMap<u32, usize>,
 }
 
+/// What an open or a `VACUUM` has to repair or accept in a file an older release wrote.
+#[derive(Default)]
+pub(crate) struct Repairs {
+    /// Whether this file is the copy `VACUUM` is writing, which replays the stored text of every
+    /// object in the file it copies. A virtual table's module accepts an option there that it
+    /// refuses in a statement a person wrote; see `Module::connect_when_rebuilding`.
+    pub(crate) rebuilding_copy: bool,
+    /// The indexes withdrawn from `tables` because their entries lack values their table has, as
+    /// (schema, folded name). Empty for every file a current release wrote. See
+    /// `engine::stale_index`.
+    pub(crate) unusable_indexes: Vec<(usize, Vec<u8>)>,
+    /// Whether a `REINDEX` builds a `UNIQUE` index that holds two equal keys instead of
+    /// refusing. Set only while `repair_withdrawn_indexes` runs.
+    pub(crate) reindex_tolerates_duplicates: bool,
+}
+
 /// The catalog, the trees it names, and what was derived from both.
 ///
 /// **One of the six groups `ImportedDatabase`'s fields are made of (task-1962,
@@ -811,6 +827,8 @@ pub(crate) struct Schema {
     /// the TDD's "every plan cache is invalidated" made into two lines that
     /// cannot get out of step.
     pub(crate) catalog_generation: u64,
+    /// What an open or a `VACUUM` has to repair or accept in a file an older release wrote.
+    pub(crate) repairs: Repairs,
     /// The one table `define_table` appended since the last catalog refresh, when that is all
     /// that changed: its position in `tables`, how long `tables` was after the append, and the
     /// generation the catalog had. `refresh_catalog` adds that table to the catalog it holds

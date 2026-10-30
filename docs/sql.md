@@ -341,7 +341,7 @@ exit code 3.
 | an FTS5 tokenizer inillucent does not have | `tokenize='trigram'` | `ascii`, `unicode61` or `porter` |
 | FTS5 `detail='none'` or `detail='column'` | `fts5(body, detail='none')` | leave `detail` out. The index stores full positions |
 | FTS5 `columnsize=0` | `fts5(body, columnsize=0)` | leave `columnsize` out |
-| FTS5 `contentless_delete=1` | `fts5(body, content='', contentless_delete=1)` | a contentless table, removing rows with the `delete` command and the text they were indexed with |
+| FTS5 `contentless_delete=1` | `fts5(body, content='', contentless_delete=1)` | a contentless table, removing rows with the `delete` command and the text they were indexed with. A table that a release from 0.1.1 to 2.3.3 stored with the option opens as a contentless table that refuses `DELETE`, which is what those releases did with it |
 
 ### Refused by both engines
 

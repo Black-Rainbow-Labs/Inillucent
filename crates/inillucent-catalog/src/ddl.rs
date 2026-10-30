@@ -240,7 +240,13 @@ pub fn canonical_sql(keywords: &str, source: &[u8], name_offset: u32, end: u32) 
     // stored.** `CREATE TABLE t(a) -- note` is stored by SQLite as `CREATE TABLE
     // t(a)`, and an `ADD COLUMN` that appended to the stored text kept the
     // comment inside the rewritten statement.
-    if let Some(last) = end_of_last_token(&tail) {
+    // **A view is the exception when its statement ends with a semicolon.** SQLite takes a
+    // view's text up to that semicolon, so a comment written between the last token and the
+    // semicolon is stored (`CREATE VIEW v AS SELECT a FROM t -- note`), and a comment after the
+    // semicolon is not. The stored text of a view is the only one of the four that works this
+    // way: a table ends at its closing parenthesis, an index and a trigger at their last token.
+    let through_semicolon = keywords.ends_with("VIEW");
+    if let Some(last) = end_of_last_token(&tail, through_semicolon) {
         tail.truncate(last);
     }
     while matches!(
@@ -259,7 +265,9 @@ pub fn canonical_sql(keywords: &str, source: &[u8], name_offset: u32, end: u32) 
 /// trailing semicolon, or `None` when the text does not lex.
 ///
 /// @param text - the statement text
-fn end_of_last_token(text: &[u8]) -> Option<usize> {
+/// @param through_semicolon - whether a semicolon ends the text where it starts, which keeps a
+///   comment written before it
+fn end_of_last_token(text: &[u8], through_semicolon: bool) -> Option<usize> {
     use inillucent_sql::lexer::{Lexer, Punctuator, TokenKind};
     let mut lexer = Lexer::at(text, 0);
     let mut last = None;
@@ -267,7 +275,11 @@ fn end_of_last_token(text: &[u8]) -> Option<usize> {
         let token = lexer.next_token().ok()?;
         match token.kind {
             TokenKind::EndOfInput => return last,
-            TokenKind::Punctuator(Punctuator::Semicolon) => {}
+            TokenKind::Punctuator(Punctuator::Semicolon) => {
+                if through_semicolon && last.is_some() {
+                    return Some(token.span.start as usize);
+                }
+            }
             _ => last = Some(token.span.end as usize),
         }
     }

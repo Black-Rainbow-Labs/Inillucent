@@ -192,7 +192,7 @@ impl Module for Fts3Module {
         arguments: &ModuleArguments,
         creating: bool,
     ) -> DbResult<Box<dyn VirtualTable>> {
-        connect_with(arguments, creating, Dialect::Three)
+        connect_with(arguments, creating, Dialect::Three, false)
     }
 }
 
@@ -269,7 +269,15 @@ impl Module for Fts5Module {
         arguments: &ModuleArguments,
         creating: bool,
     ) -> DbResult<Box<dyn VirtualTable>> {
-        connect_with(arguments, creating, Dialect::Five)
+        connect_with(arguments, creating, Dialect::Five, false)
+    }
+
+    /// Connects a table `VACUUM` is making again, accepting options an older release stored.
+    fn connect_when_rebuilding(
+        &self,
+        arguments: &ModuleArguments,
+    ) -> DbResult<Box<dyn VirtualTable>> {
+        connect_with(arguments, true, Dialect::Five, true)
     }
 
     /// The query that reads an external content table's rows when they are a view's.
@@ -302,10 +310,13 @@ fn owner_query_of(arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
 /// @param arguments - the `CREATE VIRTUAL TABLE` arguments
 /// @param creating - whether the table is being made rather than reopened
 /// @param dialect - which surface to declare
+/// @param rebuilding - whether `VACUUM` is making the table again from its stored text, which
+///   accepts what an older release stored and a new `CREATE` is refused
 fn connect_with(
     arguments: &ModuleArguments,
     creating: bool,
     dialect: Dialect,
+    rebuilding: bool,
 ) -> DbResult<Box<dyn VirtualTable>> {
     {
         let options = parse_options(&arguments.arguments)?;
@@ -346,6 +357,9 @@ fn connect_with(
                 options::refuse_at_create(&options, &arguments.table)?;
             }
             if let Some(what) = &options.unsupported {
+                return Err(unsupported_option(what));
+            }
+            if let (Some(what), false) = (&options.contentless_delete, rebuilding) {
                 return Err(unsupported_option(what));
             }
         }

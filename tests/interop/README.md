@@ -206,3 +206,43 @@ checkpointed, and given one more row that only its log holds. It is not a releas
 `release_format.rs::a_table_that_2_0_2_altered_after_its_table_constraints_reads_and_writes`
 reads it, writes to it, renames a column, checks the stored text after a checkpoint, runs the
 foreign key cascade, and loads a dump of an untouched copy into a fresh database.
+
+## A COLLATE inside a table constraint: `collate-autoindex/`
+
+Releases from 0.1.1 to 2.0.9 did not read a `COLLATE` written inside a table level `UNIQUE` or
+`PRIMARY KEY`:
+
+```sql
+CREATE TABLE person (id INTEGER PRIMARY KEY, first TEXT, last TEXT, UNIQUE (first, last COLLATE NOCASE));
+```
+
+They made the automatic index `sqlite_autoindex_person_1` with NULL in every entry where `last`
+belongs. 2.8.1 read the declaration as a key on `last`, so a lookup by `first` and `last` found
+nothing, `integrity_check` reported `row 1 missing from index sqlite_autoindex_person_1`, and the
+constraint was not enforced. A column level `COLLATE`, `CREATE UNIQUE INDEX` and a `WITHOUT ROWID`
+table were written correctly by those releases.
+
+Nothing in the file says which release wrote an index. The current build compares each automatic
+index that has a collated key column with its table when the file opens: an index that holds more
+NULL keys in such a column than the table has NULL values there is withdrawn from the plans. A
+connection that may write rebuilds it before its first statement, as `REINDEX` does, and keeps
+`UNIQUE` enforced under the collation. A connection that cannot write answers from the table.
+Rows that are equal under the collation in a table the old release wrote stay in it, and
+`integrity_check` reports them as a duplicate.
+
+`collate-autoindex/` was written by the 2.0.2 binary from `collate-autoindex/build.sql`,
+checkpointed, and given two more rows that only its log holds. It is not a release folder, so
+`interop::versions()` does not list it. `release_format.rs::a_table_that_2_0_2_declared_a_collation_in_its_unique_constraint_answers_and_enforces_it`
+and `a_read_only_connection_answers_correctly_from_a_2_0_2_collated_constraint` read it.
+
+## An FTS5 table declared `contentless_delete=1`: `fts5-contentless-delete/`
+
+Releases from 0.1.1 to 2.3.3 accepted `contentless_delete=1` and ignored it. The table they stored
+is a plain contentless table, and a `DELETE` from it is refused. 2.3.4 to 2.8.1 refused every query
+of such a table and every `VACUUM` of its file. The current build reads the table as those
+releases stored it, and `VACUUM` makes it again from its stored declaration. A new
+`CREATE VIRTUAL TABLE` that asks for the option is still refused.
+
+`fts5-contentless-delete/` was written by the 2.0.2 binary from `fts5-contentless-delete/build.sql`,
+checkpointed, and given one more row that only its log holds.
+`release_format.rs::a_table_that_2_0_2_declared_contentless_delete_reads_and_vacuums` reads it.

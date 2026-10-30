@@ -343,7 +343,7 @@ impl ImportedDatabase {
     /// caller has set to `at`.
     ///
     /// @param at - the database
-    fn ensure_stat1(&mut self, at: usize) -> DbResult<()> {
+    pub(crate) fn ensure_stat1(&mut self, at: usize) -> DbResult<()> {
         if self.stat1_root(at).is_some() {
             return Ok(());
         }

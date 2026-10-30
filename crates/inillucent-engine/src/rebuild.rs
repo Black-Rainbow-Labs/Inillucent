@@ -106,14 +106,46 @@ pub(crate) fn rebuild_schema_into(
     frames: usize,
 ) -> DbResult<()> {
     let captured = capture_schema(source, schema);
-    let mut fresh = ImportedDatabase::create_on(vfs, destination.to_path_buf(), page_size, frames)
-        .map_err(|error| {
-            inillucent_base::error::misuse(format!(
-                "VACUUM could not create the file to rebuild into, {}: {}",
-                destination.display(),
-                error
-            ))
-        })?;
+    let mut fresh = ImportedDatabase::create_on(
+        std::sync::Arc::clone(&vfs),
+        destination.to_path_buf(),
+        page_size,
+        frames,
+    )
+    .map_err(|error| {
+        inillucent_base::error::misuse(format!(
+            "VACUUM could not create the file to rebuild into, {}: {}",
+            destination.display(),
+            error
+        ))
+    })?;
+    // **A rebuild that fails takes its half written file with it.** `create_on` made
+    // `destination` and its log segments, and a copy that stopped part way left
+    // `<db>.vacuum-<stamp>` files of 163 to 196 KB beside the database on every failed
+    // `VACUUM`, and an unusable file at the name `VACUUM INTO` was given. The file is dropped
+    // first so nothing holds it open, then removed.
+    let copied = copy_schema_into(source, schema, &mut fresh, &captured);
+    if copied.is_err() {
+        drop(fresh);
+        let gone = inillucent_vfs::DbPath::new(destination.to_string_lossy().as_ref());
+        let _ = vfs.delete(&gone, false);
+        remove_log_segments(&vfs, destination);
+    }
+    copied
+}
+
+/// Replays the schema into a fresh file and copies every row, inside one transaction.
+///
+/// @param source - the connection holding the schema
+/// @param schema - the schema to copy, as the binder numbers them
+/// @param fresh - the new file, empty
+/// @param captured - the schema as `capture_schema` read it
+fn copy_schema_into(
+    source: &ImportedDatabase,
+    schema: usize,
+    fresh: &mut ImportedDatabase,
+    captured: &[Captured],
+) -> DbResult<()> {
     // **One transaction for the whole copy.** Each row used to be its own
     // autocommit statement, so each was a commit with its log syncs: 20,000
     // rows took 72 seconds against SQLite's 48 milliseconds. Nothing reads the
@@ -130,25 +162,25 @@ pub(crate) fn rebuild_schema_into(
     if mode != 0 {
         fresh.apply_auto_vacuum_mode(crate::MAIN, mode, true)?;
     }
+    fresh.schema.repairs.rebuilding_copy = true;
     fresh.begin_batch();
-    replay_schema(&mut fresh, &captured, |entry| {
+    replay_schema(fresh, captured, |entry| {
         entry.kind == ObjectKind::Table && !entry.shadow
     })?;
-    for entry in &captured {
+    for entry in captured {
         if entry.kind != ObjectKind::Table || entry.owns_shadows {
             continue;
         }
-        copy_rows(source, schema, &mut fresh, &entry.name, entry.shadow)?;
+        copy_rows(source, schema, fresh, &entry.name, entry.shadow)?;
     }
-    carry_sequences(source, schema, &mut fresh)?;
-    replay_schema(&mut fresh, &captured, |entry| {
-        entry.kind == ObjectKind::Index
-    })?;
-    replay_schema(&mut fresh, &captured, |entry| {
+    carry_sequences(source, schema, fresh)?;
+    replay_schema(fresh, captured, |entry| entry.kind == ObjectKind::Index)?;
+    replay_schema(fresh, captured, |entry| {
         matches!(entry.kind, ObjectKind::View | ObjectKind::Trigger)
     })?;
+    carry_statistics(source, schema, fresh)?;
     fresh.commit_batch()?;
-    carry_header(source, schema, &mut fresh).map_err(|error| {
+    carry_header(source, schema, fresh).map_err(|error| {
         inillucent_base::error::misuse(format!("VACUUM could not carry the header: {error}"))
     })?;
     fresh.checkpoint().map_err(|error| {
@@ -157,6 +189,32 @@ pub(crate) fn rebuild_schema_into(
         ))
     })?;
     Ok(())
+}
+
+/// Copies `sqlite_stat1`, the measurements `ANALYZE` made, into the rebuilt file.
+///
+/// **`VACUUM` dropped the table.** `capture_schema` leaves out every `sqlite_` table because
+/// the rebuild cannot `CREATE` one, and `sqlite_stat1` went with them, so the plans a file had
+/// been measured for were lost and `SELECT * FROM sqlite_stat1` found no table. SQLite keeps it.
+/// The table is made the way `ANALYZE` makes it and its rows are copied as they are, not
+/// measured again, because a person may have written rows there on purpose.
+///
+/// @param source - the connection holding the schema
+/// @param schema - the schema being copied, as the binder numbers them
+/// @param fresh - the new file
+fn carry_statistics(
+    source: &ImportedDatabase,
+    schema: usize,
+    fresh: &mut ImportedDatabase,
+) -> DbResult<()> {
+    let held = source.entries_of(schema).iter().any(|row| {
+        row.entry.kind == ObjectKind::Table && row.entry.name.eq_ignore_ascii_case(b"sqlite_stat1")
+    });
+    if !held {
+        return Ok(());
+    }
+    fresh.ensure_stat1(crate::MAIN)?;
+    copy_rows(source, schema, fresh, b"sqlite_stat1", false)
 }
 
 /// Reads the schema of one database into something that outlives the source.
@@ -589,17 +647,15 @@ fn carry_header(
 /// identifier takes regardless of what it holds - a rebuild reads names out of a
 /// file it did not write, and a table called `select` or `a"b` is legal.
 ///
+/// **The bytes are read as UTF-8, which is what the SQL text a statement is parsed from is.**
+/// This used to push each byte as a character, which is Latin-1: the three bytes of `日本語`
+/// became six characters, so the rebuild asked for a table no file held and every `VACUUM` of a
+/// file with a non ASCII table or column name failed.
+///
 /// @param name - the identifier's bytes
 fn quoted(name: &[u8]) -> String {
-    let mut out = String::from("\"");
-    for byte in name {
-        if *byte == b'"' {
-            out.push('"');
-        }
-        out.push(char::from(*byte));
-    }
-    out.push('"');
-    out
+    let text = String::from_utf8_lossy(name);
+    format!("\"{}\"", text.replace('"', "\"\""))
 }
 
 /// Returns a path beside `target` that nothing else is using.

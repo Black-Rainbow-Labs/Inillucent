@@ -198,7 +198,11 @@ impl ImportedDatabase {
             )?
         };
         let entries = collected.finish()?;
-        if entries.has_duplicate_or_long_key(index.unique, &columns, key_columns)? {
+        if entries.has_duplicate_or_long_key(
+            index.unique && !self.schema.repairs.reindex_tolerates_duplicates,
+            &columns,
+            key_columns,
+        )? {
             return Err(unique_violation(&owner, &index));
         }
         // **The catalog row names the new tree before the tree is filled

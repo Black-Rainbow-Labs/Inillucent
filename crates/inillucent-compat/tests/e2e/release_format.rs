@@ -564,6 +564,204 @@ fn a_table_that_2_0_2_altered_after_its_table_constraints_reads_and_writes() {
     );
 }
 
+/// A table that 2.0.2 declared with a collation inside a table level constraint answers
+/// correctly on the first read, enforces the constraint, and checks clean.
+///
+/// **Releases 0.1.1 to 2.0.9 wrote NULL where a `COLLATE` inside a table level `UNIQUE` or
+/// `PRIMARY KEY` named a column.** `UNIQUE (first, last COLLATE NOCASE)` made an automatic
+/// index whose every entry held NULL for `last`. 2.8.1 read the same declaration as a key on
+/// `last`, so `WHERE first = 'Ann' AND last = 'Bravo'` found nothing for a row that was there,
+/// `integrity_check` said `row 1 missing from index sqlite_autoindex_person_1`, and the
+/// constraint was not enforced. The fixture in `tests/interop/collate-autoindex` was written by
+/// the 2.0.2 binary from its `build.sql`, with two rows left only in the log.
+///
+/// The index is compared with its table when the file opens. This build withdraws it from the
+/// plans, rebuilds it before the first statement of a connection that may write, and checks the
+/// result with `integrity_check`.
+#[test]
+fn a_table_that_2_0_2_declared_a_collation_in_its_unique_constraint_answers_and_enforces_it() {
+    let area = scratch("collate-autoindex");
+    let database = interop::stage("collate-autoindex", &area);
+    let arm = default_arm();
+    {
+        let handle = open(&arm, &database);
+        let connection = handle.session();
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT count(*) FROM person WHERE first = 'Ann' AND last = 'Bravo'"
+            ),
+            "1",
+            "a row 2.0.2 wrote is not found through the index on the first read"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT name FROM tag WHERE name = 'alpha' COLLATE NOCASE"
+            ),
+            "alpha"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT name FROM tag ORDER BY name COLLATE NOCASE"
+            ),
+            "alpha\nBravo\ncharlie\nDelta\necho\nZulu",
+            "the rows, including the one only the log holds, do not come back in NOCASE order"
+        );
+        assert_eq!(ask(&connection, "PRAGMA integrity_check"), "ok");
+        let duplicate = connection.execute_batch("INSERT INTO tag VALUES ('ALPHA', 'dup')");
+        assert!(
+            duplicate.is_err(),
+            "PRIMARY KEY (name COLLATE NOCASE) does not refuse 'ALPHA' beside 'alpha'"
+        );
+        let second =
+            connection.execute_batch("INSERT INTO person (first, last) VALUES ('Ann', 'BRAVO')");
+        assert!(
+            second.is_err(),
+            "UNIQUE (first, last COLLATE NOCASE) does not refuse ('Ann', 'BRAVO') beside ('Ann', 'Bravo')"
+        );
+        run(
+            &connection,
+            "INSERT INTO person (first, last) VALUES ('Ann', 'Yankee')",
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT count(*) FROM person WHERE first = 'Ann' AND last = 'Yankee'"
+            ),
+            "1"
+        );
+    }
+    let handle = reopen_and_check(&arm, &database);
+    let connection = handle.session();
+    assert_eq!(ask(&connection, "SELECT count(*) FROM person"), "7");
+    assert_eq!(
+        ask(
+            &connection,
+            "SELECT count(*) FROM person INDEXED BY sqlite_autoindex_person_1 \
+             WHERE first = 'Bob' AND last = 'Delta'"
+        ),
+        "1",
+        "the rebuilt index does not answer for a row written before the rebuild"
+    );
+}
+
+/// The same file read through a connection that cannot write answers correctly.
+///
+/// A read only connection cannot rebuild the index, so it must not read it: the answers come from
+/// the table.
+#[test]
+fn a_read_only_connection_answers_correctly_from_a_2_0_2_collated_constraint() {
+    let area = scratch("collate-autoindex-read-only");
+    let database = interop::stage("collate-autoindex", &area);
+    let ask_read_only = |sql: &str| -> String {
+        let output = std::process::Command::new(inillucent_compat::cliproc::program("inillucent"))
+            .arg("--db")
+            .arg(&database)
+            .arg("--readonly")
+            .arg("query")
+            .arg(sql)
+            .output()
+            .expect("inillucent query starts");
+        assert!(
+            output.status.success(),
+            "{sql} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .skip(2)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        ask_read_only("SELECT count(*) FROM person WHERE first = 'Ann' AND last = 'Bravo'"),
+        "1"
+    );
+    assert_eq!(
+        ask_read_only("SELECT name FROM tag WHERE name = 'alpha' COLLATE NOCASE"),
+        "alpha"
+    );
+}
+
+/// A table that 2.0.2 declared `contentless_delete=1` reads, takes a `VACUUM` and is still
+/// refused a new declaration of the option.
+///
+/// **Releases 0.1.1 to 2.3.3 accepted the option and stored a plain contentless table.** A
+/// `DELETE` from it was refused, as it is from any contentless table. 2.3.4 to 2.8.1 answered
+/// every query of such a table with `fts5 contentless_delete=1 is not built` and refused every
+/// `VACUUM` of the file, so the rows 2.0.2 wrote could not be read at all. The fixture in
+/// `tests/interop/fts5-contentless-delete` was written by the 2.0.2 binary from its `build.sql`.
+#[test]
+fn a_table_that_2_0_2_declared_contentless_delete_reads_and_vacuums() {
+    let area = scratch("fts5-contentless-delete");
+    let database = interop::stage("fts5-contentless-delete", &area);
+    let arm = default_arm();
+    {
+        let handle = open(&arm, &database);
+        let connection = handle.session();
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT rowid FROM note_search WHERE note_search MATCH 'hello' ORDER BY rowid"
+            ),
+            "1\n3"
+        );
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT rowid FROM note_search WHERE note_search MATCH 'holds'"
+            ),
+            "4",
+            "the row only the log holds is not found"
+        );
+        assert!(
+            connection
+                .execute_batch("DELETE FROM note_search WHERE rowid = 1")
+                .is_err(),
+            "a DELETE from the contentless table was accepted, which 2.0.2 refused"
+        );
+        let new_table = connection.execute_batch(
+            "CREATE VIRTUAL TABLE fresh_search USING fts5(body, content='', contentless_delete=1)",
+        );
+        assert!(
+            new_table.is_err(),
+            "a new table that asks for contentless_delete=1 was accepted"
+        );
+        run(&connection, "VACUUM");
+        assert_eq!(
+            ask(
+                &connection,
+                "SELECT rowid FROM note_search WHERE note_search MATCH 'second'"
+            ),
+            "2",
+            "the index does not answer after VACUUM"
+        );
+        run(
+            &connection,
+            "INSERT INTO note_search (rowid, body) VALUES (5, 'written after the vacuum')",
+        );
+    }
+    let handle = reopen_and_check(&arm, &database);
+    let connection = handle.session();
+    assert_eq!(
+        ask(
+            &connection,
+            "SELECT rowid FROM note_search WHERE note_search MATCH 'vacuum'"
+        ),
+        "5"
+    );
+    assert_eq!(
+        ask(
+            &connection,
+            "SELECT sql FROM sqlite_schema WHERE name = 'note_search'"
+        ),
+        "CREATE VIRTUAL TABLE note_search USING fts5(body, content='', contentless_delete=1)",
+        "VACUUM changed the stored declaration"
+    );
+}
+
 /// The release script builds a fixture for the version it is shipping.
 ///
 /// Rule 1.5, and the thing it holds is a claim this file's own documentation

@@ -39,6 +39,7 @@
 //! | [`lockless`] | which statements read nothing from the file and take no lock |
 //! | [`write`] | where a statement's writes go, and what undoes them |
 //! | [`tables`] | questions asked about one table's declaration |
+//! | [`stale_index`] | automatic indexes an older release wrote in binary order |
 
 pub mod accessors;
 pub mod batch;
@@ -56,6 +57,7 @@ pub mod locks;
 pub mod open;
 pub mod pages;
 pub mod rowshape;
+pub mod stale_index;
 pub mod state;
 pub mod statements;
 pub mod tables;

@@ -2507,6 +2507,15 @@ module = "encryption_at_rest"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-vfs", "inillucent-base"]
 
+# A VACUUM or VACUUM INTO that fails leaves no file the rebuild made beside the database.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "vacuum_failure"
+tier = "engine"
+covers = ["inillucent-engine", "inillucent-vfs"]
+
 # A statement never moves the connection onto a different file system.
 [[target]]
 package = "inillucent-compat"

@@ -813,6 +813,21 @@ impl crate::ImportedDatabase {
                 arguments: connected.arguments.arguments.clone(),
             });
         }
+        // **An index withdrawn because an older release wrote it in the wrong order is not in
+        // the schema**, so no plan reads it and no write is asked to keep it; see
+        // `engine::stale_index`.
+        if !self.schema.repairs.unusable_indexes.is_empty() {
+            for table in &mut rebuilt {
+                table.indexes.retain(|index| {
+                    !self
+                        .schema
+                        .repairs
+                        .unusable_indexes
+                        .iter()
+                        .any(|(at, folded)| *at == table.database && *folded == index.folded)
+                });
+            }
+        }
         self.schema.tables = rebuilt;
         Ok(())
     }
