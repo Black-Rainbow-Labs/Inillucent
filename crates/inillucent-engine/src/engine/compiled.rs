@@ -1925,13 +1925,55 @@ fn opens_a_transaction(cached: &Cached) -> bool {
                 .next()
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            !matches!(
-                head.as_str(),
-                "pragma" | "begin" | "commit" | "end" | "rollback" | "savepoint" | "release"
-            )
+            match head.as_str() {
+                "pragma" => pragma_opens_a_transaction(sql),
+                "begin" | "commit" | "end" | "rollback" | "savepoint" | "release" => false,
+                _ => true,
+            }
         }
         _ => true,
     }
+}
+
+/// Reports whether a pragma reads or writes the database file, which is what opens a transaction
+/// in SQLite and so what ends `PRAGMA defer_foreign_keys`.
+///
+/// A pragma that only sets a flag on the connection, `foreign_keys` and `defer_foreign_keys`
+/// among them, opens none and leaves the setting where it was. The ones listed read the file's
+/// header or its schema.
+///
+/// @param sql - the text of the `PRAGMA` statement
+fn pragma_opens_a_transaction(sql: &str) -> bool {
+    let after = sql.trim_start().get("pragma".len()..).unwrap_or_default();
+    let word: String = after
+        .trim_start()
+        .chars()
+        .take_while(|held| held.is_alphanumeric() || *held == '_' || *held == '.')
+        .collect();
+    let name = word.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "user_version"
+            | "application_id"
+            | "schema_version"
+            | "page_count"
+            | "freelist_count"
+            | "max_page_count"
+            | "table_info"
+            | "table_xinfo"
+            | "table_list"
+            | "index_list"
+            | "index_info"
+            | "index_xinfo"
+            | "foreign_key_list"
+            | "integrity_check"
+            | "quick_check"
+            | "journal_mode"
+            | "auto_vacuum"
+            | "incremental_vacuum"
+            | "optimize"
+            | "wal_checkpoint"
+    )
 }
 
 /// Adds a virtual table `UPDATE`'s new values to the query that finds its

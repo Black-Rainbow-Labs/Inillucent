@@ -400,3 +400,16 @@ create table t(a integer, b text);
 create table n4 as select name, type, sql from sqlite_master;
 select count(*), typeof(name) from n4;
 select sql from sqlite_master where name='n4';
+-- case: bug-hunt-11/pragma/D16-defer-foreign-keys-ends-with-a-pragma-that-opens-a-transaction
+create table t(a);
+pragma defer_foreign_keys=on; pragma user_version; select 'uv-read', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma user_version=2; select 'uv-set', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma application_id=3; select 'app-set', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma table_info(t); select 'ti', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma integrity_check; select 'ic', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma schema_version; select 'sv', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma foreign_key_check; select 'fkc', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma journal_mode=truncate; select 'jm', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma optimize; select 'opt', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma wal_checkpoint; select 'wc', * from pragma_defer_foreign_keys;
+pragma defer_foreign_keys=on; pragma foreign_keys=on; select 'fk', * from pragma_defer_foreign_keys;
