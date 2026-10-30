@@ -217,7 +217,30 @@ pub(crate) fn table_text_problem(sql: &[u8]) -> Option<String> {
     if only_generated {
         return Some("must have at least one non-generated column".to_string());
     }
-    if let Some(missing) = unresolved_column(&parsed.ast, &names, None) {
+    // **Only a `DEFAULT "word"` may name no column.** A default has no column in scope, so the
+    // word is the string it spells. Anywhere else a double quoted word that no column answers to
+    // is refused, which is what SQLite does after a `DROP COLUMN` left it naming nothing.
+    let defaults: Vec<ExprId> = columns
+        .iter()
+        .flat_map(|column| column.constraints.iter())
+        .filter_map(|(_, constraint)| match constraint {
+            inillucent_sql::ast::ColumnConstraint::Default(expr) => Some(*expr),
+            _ => None,
+        })
+        .collect();
+    // A key column of a table level `PRIMARY KEY` or `UNIQUE` that names no column is read as an
+    // expression, which those constraints refuse, and SQLite says so instead of naming the column.
+    let key_columns: Vec<ExprId> = constraints
+        .iter()
+        .filter_map(|(_, constraint)| match constraint {
+            TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
+                Some(columns.iter().map(|key| key.expr))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    if let Some(missing) = unresolved_column(&parsed.ast, &names, None, &defaults, &key_columns) {
         return Some(missing);
     }
     for (_, constraint) in constraints {
@@ -247,7 +270,7 @@ pub(crate) fn table_text_problem(sql: &[u8]) -> Option<String> {
 /// @param table - the folded name the table has after the change
 pub(crate) fn index_text_problem(sql: &[u8], columns: &[Vec<u8>], table: &[u8]) -> Option<String> {
     let parsed = parse_next_statement(sql, 0, &inillucent_base::limits::Limits::default()).ok()?;
-    unresolved_column(&parsed.ast, columns, Some(table))
+    unresolved_column(&parsed.ast, columns, Some(table), &[], &[])
 }
 
 /// Returns the first column reference in a parse that no column answers to.
@@ -255,10 +278,14 @@ pub(crate) fn index_text_problem(sql: &[u8], columns: &[Vec<u8>], table: &[u8]) 
 /// @param ast - the parsed statement's arena
 /// @param columns - the folded names of the columns that exist
 /// @param table - the folded name a qualifier must match, when qualifiers are checked
+/// @param defaults - the `DEFAULT` expressions, where a double quoted word is a string
+/// @param key_columns - the key columns of the table's `PRIMARY KEY` and `UNIQUE` constraints
 fn unresolved_column(
     ast: &inillucent_sql::ast::Ast,
     columns: &[Vec<u8>],
     table_name: Option<&[u8]>,
+    defaults: &[ExprId],
+    key_columns: &[ExprId],
 ) -> Option<String> {
     for index in 0..ast.expr_count() {
         let id = ExprId(index as u32);
@@ -266,12 +293,12 @@ fn unresolved_column(
             continue;
         };
         let folded = ast.folded(*column);
-        // A double quoted word that names no column is a string literal, which
-        // is how a `DEFAULT "text"` is written.
+        // A double quoted word that names no column is a string literal in a
+        // `DEFAULT "text"` and nowhere else.
         let quoted = ast
             .name(*column)
             .is_some_and(|name| name.quote == inillucent_sql::lexer::QuoteForm::Double);
-        if quoted && table.is_none() {
+        if quoted && table.is_none() && defaults.contains(&id) {
             continue;
         }
         let rowid = matches!(folded, b"rowid" | b"oid" | b"_rowid_");
@@ -282,10 +309,17 @@ fn unresolved_column(
         if !wrong_qualifier && (rowid || columns.iter().any(|name| name.as_slice() == folded)) {
             continue;
         }
+        if key_columns.contains(&id) {
+            return Some("expressions prohibited in PRIMARY KEY and UNIQUE constraints".to_string());
+        }
         let written = match table {
             Some(qualifier) => format!(
                 "{}.{}",
                 String::from_utf8_lossy(ast.text(*qualifier)),
+                String::from_utf8_lossy(ast.text(*column))
+            ),
+            None if quoted => format!(
+                "\"{}\" - should this be a string literal in single-quotes?",
                 String::from_utf8_lossy(ast.text(*column))
             ),
             None => String::from_utf8_lossy(ast.text(*column)).into_owned(),

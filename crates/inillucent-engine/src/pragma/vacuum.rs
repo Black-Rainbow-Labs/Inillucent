@@ -166,6 +166,9 @@ impl crate::ImportedDatabase {
         argument: Option<&PragmaArgument>,
         at: Option<usize>,
     ) -> DbResult<Outcome> {
+        if self.pragmas.query_only() {
+            return Err(crate::ddl::query_only_refusal());
+        }
         let number = at.unwrap_or(MAIN);
         let file = self.file_of(at)?;
         if file.auto_vacuum() != 2 {

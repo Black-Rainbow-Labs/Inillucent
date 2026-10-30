@@ -99,6 +99,42 @@ fn schema_of(directive: &Directive) -> usize {
     }
 }
 
+/// Returns the error a connection under `PRAGMA query_only` gets for a write.
+///
+/// The text is SQLite's own, which is what an application's error handling is
+/// written against.
+pub(crate) fn query_only_refusal() -> inillucent_base::error::DbError {
+    inillucent_base::error::DbError::primary(inillucent_base::error::PrimaryCode::ReadOnly)
+        .with_message("attempt to write a readonly database")
+        .with_detail("attempt to write a readonly database")
+}
+
+/// Returns whether a directive writes to the database, for `PRAGMA query_only`.
+///
+/// Decided from the bound directive and not from the statement's first word,
+/// because `CREATE TABLE IF NOT EXISTS` on a table that exists and `DROP TABLE
+/// IF EXISTS` on one that does not are no ops that SQLite runs under
+/// `query_only`. `VACUUM`, `ANALYZE` and `REINDEX` always write. A `PRAGMA` is
+/// judged by the pragma itself, because most of them only read.
+///
+/// @param directive - the bound statement
+fn directive_writes(directive: &Directive) -> bool {
+    match directive {
+        Directive::CreateTable { if_not_exists, exists, .. }
+        | Directive::CreateTableAsSelect { if_not_exists, exists, .. }
+        | Directive::CreateVirtualTable { if_not_exists, exists, .. }
+        | Directive::CreateView { if_not_exists, exists, .. }
+        | Directive::CreateIndex { if_not_exists, exists, .. } => !(*if_not_exists && *exists),
+        Directive::CreateTrigger { .. }
+        | Directive::Alter { .. }
+        | Directive::Reindex { .. }
+        | Directive::Vacuum { .. }
+        | Directive::Analyze { .. } => true,
+        Directive::Drop { if_exists, exists, .. } => !(*if_exists && !*exists),
+        _ => false,
+    }
+}
+
 /// Returns whether a directive changes the schema the cookie describes.
 ///
 /// The `CREATE`s, the `DROP`s and `ALTER`. A pragma, a transaction control or
@@ -153,6 +189,12 @@ impl ImportedDatabase {
         let BoundStatement::Directive(directive) = self.bind(sql)? else {
             return Err(refusal(format!("{sql} is not a directive")));
         };
+        // **`PRAGMA query_only` is enforced on the bound directive**, after the
+        // binder has said whether an `IF [NOT] EXISTS` statement will do
+        // anything. A no op under `query_only` is allowed, as in SQLite.
+        if self.pragmas.query_only() && directive_writes(&directive) {
+            return Err(query_only_refusal());
+        }
         // **Which file the statement is about, from the statement's own
         // words.** `CREATE TABLE aux.t` and `CREATE TEMP TABLE t` each bind to a
         // schema, and the primitives underneath - `allocate_root`, `record`,

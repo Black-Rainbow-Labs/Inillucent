@@ -383,6 +383,9 @@ impl crate::ImportedDatabase {
     /// @param field - which field
     /// @param value - the new value
     fn set_meta_field(&mut self, at: Option<usize>, field: MetaField, value: i32) -> DbResult<()> {
+        if self.pragmas.query_only() {
+            return Err(crate::ddl::query_only_refusal());
+        }
         let file = self.file_of_mut(at)?;
         let before = match field {
             MetaField::UserVersion => file.user_version(),

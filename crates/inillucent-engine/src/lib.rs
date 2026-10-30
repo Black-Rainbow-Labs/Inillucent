@@ -1253,10 +1253,10 @@ fn modules() -> inillucent_ext::registry::Registry {
 
 /// Returns whether a compiled statement would change the database.
 ///
-/// Read by the `query_only` guard. A `Ddl` is judged by its text rather than by
-/// its bound form, because the compiled shape a directive keeps is the SQL: the
-/// statements it covers that change nothing - a pragma, `BEGIN`, `ANALYZE` -
-/// have to stay runnable under `query_only`, and SQLite lets them.
+/// Read by the `query_only` guard. A `Ddl` is not judged here: its compiled
+/// shape is the SQL, and whether it writes depends on what the binder finds
+/// (`CREATE TABLE IF NOT EXISTS` on an existing table writes nothing), so
+/// `execute_ddl_with` judges it after binding.
 ///
 /// @param cached - the compiled statement
 fn writes_something(cached: &Cached) -> bool {
@@ -1265,15 +1265,9 @@ fn writes_something(cached: &Cached) -> bool {
         | Cached::VirtualInsert(..)
         | Cached::SchemaInsert(_)
         | Cached::Update(..)
-        | Cached::Delete(..) => true,
-        Cached::Ddl(sql) => {
-            let head = sql
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            matches!(head.as_str(), "create" | "drop" | "alter" | "reindex")
-        }
+        | Cached::Delete(..)
+        | Cached::VirtualDelete(..)
+        | Cached::VirtualUpdate(..) => true,
         _ => false,
     }
 }
