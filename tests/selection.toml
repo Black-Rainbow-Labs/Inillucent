@@ -1634,6 +1634,13 @@ kind = "test"
 name = "short_leaves"
 tier = "engine"
 
+# Rows of several hundred integer columns appended one at a time share leaves.
+[[target]]
+package = "inillucent-tree"
+kind = "test"
+name = "wide_rows"
+tier = "engine"
+
 # Keys longer than the spill threshold, bulk built, written into and deleted
 # from, with separators long enough to be stored out of line.
 [[target]]

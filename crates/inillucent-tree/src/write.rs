@@ -249,6 +249,11 @@ fn underflows(leaf: &LeafRef<'_>) -> DbResult<bool> {
 /// ones that would pay for it.
 pub const COMPACT_FILL: f64 = 0.75;
 
+/// A row needing at least a page divided by this many bytes in the delta area is wide: after an
+/// append packs a full leaf it asks for room for one more row of its size, not for a third of the
+/// page; see `Tree::room_gap`.
+const WIDE_APPEND_ROW_DIVISOR: usize = 64;
+
 /// TEMPORARY counters for the extension profile: wide placements, room-makings,
 /// and the encoded size of every row an insert offered.
 /// How full each half of a split is packed.
@@ -2196,7 +2201,7 @@ impl PagedTree {
         if appending && self.append_splits_at_once() {
             return Ok(Fit::Split(leaf.bytes().to_vec(), true));
         }
-        let gap = self.room_gap(appending);
+        let gap = self.room_gap(appending, needed);
         let spliced = self.timed_splice(&leaf, &order)?;
         let splice_allowed = spliced.is_some();
         if let Some(mut image) = spliced {
@@ -2357,7 +2362,9 @@ impl PagedTree {
         // arriving row is therefore not a tighter compaction, it is a split.
         let mut compacted = self.timed_compact_image(&builder, &source)?;
         if let Some(image) = compacted.as_mut() {
-            if !LeafMut::new(image)?.room_for(needed.saturating_add(self.room_gap(appending)))? {
+            if !LeafMut::new(image)?
+                .room_for(needed.saturating_add(self.room_gap(appending, needed)))?
+            {
                 compacted = None;
             }
         }
@@ -3626,10 +3633,25 @@ impl PagedTree {
     /// narrow row's leaf twice before it splits, and leaves the pages it
     /// finally splits about 70% full. `choose_fit` has the measurements.
     ///
+    /// **A row that is itself a large part of the page asks for room for one more of itself, and
+    /// not for a third of the page.** A leaf of 600 integer columns costs 19 KiB of a 32 KiB page
+    /// in column directory and class arrays however few rows it holds, and each row waiting in
+    /// the delta area costs 5.4 KiB. The third asked for after a pack was 10.9 KiB on top of
+    /// the arriving row's 5.4 KiB, which a leaf of two packed rows (13.4 KiB free) never had, so
+    /// every full leaf split and the table settled at two rows to a leaf: 146 pages for 300 rows,
+    /// where a bulk build used 13, and scans, updates and `VACUUM` of the table were 10 to 70
+    /// times slower than SQLite's (bug hunt 11). A row of a sixty fourth of the page or more is
+    /// wide enough that a third of the page is room for a handful of them, so one more row of its
+    /// size is the room asked for. The rule is a function of the row, which the caller already
+    /// has, so a replayed compaction is unaffected.
+    ///
     /// @param appending - whether the rows are arriving in key order past the leaf
-    fn room_gap(&self, appending: bool) -> usize {
+    /// @param needed - how many bytes the arriving row needs
+    fn room_gap(&self, appending: bool, needed: usize) -> usize {
+        let third = self.page_size() / 3;
         match appending {
-            true => self.page_size() / 3,
+            true if needed >= self.page_size() / WIDE_APPEND_ROW_DIVISOR => needed.min(third),
+            true => third,
             false => self.gap_for_growth(),
         }
     }
