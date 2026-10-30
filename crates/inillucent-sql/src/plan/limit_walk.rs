@@ -14,8 +14,9 @@
 //! and the sort together. SQLite prices the walk by the rows the `LIMIT` lets it stop at.
 
 use super::{
-    cost, covering_slots, estimated_rows, index_usable, join_cost::outer_order_survives_joins,
-    ordering_provided, path_cost, AccessPath, BoundExpr, BoundSelect, BoundSource, Levers,
+    cost, covering, covering_slots, estimated_rows, index_usable,
+    join_cost::outer_order_survives_joins, ordering_provided, path_cost, AccessPath, BoundExpr,
+    BoundSelect, BoundSource, Levers,
 };
 
 /// How many rows the walk is assumed to read for each row it keeps when a `WHERE` term is left
@@ -109,7 +110,7 @@ pub(super) fn cheapest(
     for (path, trial) in candidates {
         let (mut cost, rows) = path_cost(source, &path);
         let ordered = levers.has(Levers::ORDERED_WALK)
-            && ordering_provided(select, id, table, &path).is_some();
+            && ordering_provided(select, id, table, &source.index_exprs, &path).is_some();
         match (ordered, limited) {
             (false, _) => cost += sort,
             // Every term a path does not enforce is tested on each row it walks, which is
@@ -130,10 +131,71 @@ pub(super) fn cheapest(
     match best {
         Some((_, path, trial)) => {
             consumed.copy_from_slice(&trial);
-            path
+            if sort > 0.0 {
+                covering_after_order(path, term)
+            } else {
+                path
+            }
         }
         None => AccessPath::TableScan { root: table.root },
     }
+}
+
+/// Gives a chosen index path the covering entry it would have had if the `ORDER BY` the walk
+/// answers read no columns.
+///
+/// **A seek on `a = 1` over an index on `(a, json_extract(p, '$.v'))` answers
+/// `ORDER BY json_extract(p, '$.v')` by its own order**, and the executor then never evaluates
+/// that term, so `SELECT id` does not need `p` from the table. The candidate that built the path
+/// could not know the order was provided, because that is decided against the whole statement.
+/// A path that already covers, or that does not use an index which computes the order, is
+/// returned unchanged.
+///
+/// @param path - the access path the term was given
+/// @param term - the term being planned and the statement it is in
+fn covering_after_order(mut path: AccessPath, term: &PathChoice<'_>) -> AccessPath {
+    let AccessPath::IndexSeek {
+        covering: None,
+        index_name,
+        ..
+    } = &path
+    else {
+        return path;
+    };
+    let index_name = index_name.clone();
+    let PathChoice {
+        id,
+        source,
+        select,
+        terms,
+        levers,
+        ..
+    } = *term;
+    let table = &source.table;
+    if !levers.has(Levers::COVERING_INDEX)
+        || select.order_by.is_empty()
+        || ordering_provided(select, id, table, &source.index_exprs, &path).is_none()
+    {
+        return path;
+    }
+    let Some(reduced) = covering::needed_beyond_order(select, id) else {
+        return path;
+    };
+    let Some((at, index)) = table
+        .indexes
+        .iter()
+        .enumerate()
+        .find(|(_, candidate)| candidate.name == index_name)
+    else {
+        return path;
+    };
+    let usable = index_usable(source, at, index, terms);
+    if let (AccessPath::IndexSeek { covering, .. }, Some(slots)) =
+        (&mut path, covering_slots(table, index, &reduced, usable))
+    {
+        *covering = Some(slots);
+    }
+    path
 }
 
 /// Returns what a sort would cost this term, or nothing when no path could
@@ -252,6 +314,9 @@ pub(super) fn ordered_walks(
         return Vec::new();
     }
     let needed = select.columns_read(id);
+    // A walk of an index that computes the `ORDER BY` replaces the sort, so what only the sort
+    // read need not be in the entry.
+    let beyond_order = covering::needed_beyond_order(select, id);
     let mut walks = Vec::new();
     for (at, index) in table.indexes.iter().enumerate() {
         if index.origin == crate::catalog_view::IndexOrigin::Module {
@@ -261,9 +326,20 @@ pub(super) fn ordered_walks(
         if index.partial_sql.is_some() && !usable {
             continue;
         }
+        let computes_order = beyond_order.is_some()
+            && source.index_exprs.iter().any(|held| {
+                table
+                    .indexes
+                    .get(held.position)
+                    .is_some_and(|candidate| candidate.name == index.name)
+            });
+        let wanted = match &beyond_order {
+            Some(reduced) if computes_order => reduced,
+            _ => &needed,
+        };
         let covering = levers
             .has(Levers::COVERING_INDEX)
-            .then(|| covering_slots(table, index, &needed, usable))
+            .then(|| covering_slots(table, index, wanted, usable))
             .flatten();
         let walk = AccessPath::IndexSeek {
             table_root: table.root,
@@ -287,8 +363,8 @@ pub(super) fn ordered_walks(
             },
             covering,
         };
-        if ordering_provided(select, id, table, &walk).is_some_and(|_| !select.order_by.is_empty())
-        {
+        let ordered = ordering_provided(select, id, table, &source.index_exprs, &walk);
+        if ordered.is_some_and(|_| !select.order_by.is_empty()) {
             walks.push(walk);
         }
     }

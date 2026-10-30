@@ -66,12 +66,13 @@ pub(super) fn grouped_by_walk(select: &BoundSelect, outer: &PlannedSource) -> bo
     if select.group_by.is_empty() {
         return false;
     }
-    let Some(key) = path_ordering(&outer.table, &outer.path) else {
+    let exprs = super::exprs_of(select, outer.id);
+    let Some(key) = path_ordering(&outer.table, exprs, &outer.path) else {
         return false;
     };
     let mut wanted: Vec<(OrderedBy, Collation)> = Vec::new();
     for expr in &select.group_by {
-        let Some(named) = walk_key_of(expr, outer.id, &outer.table) else {
+        let Some(named) = walk_key_of(expr, outer.id, &outer.table, exprs) else {
             return false;
         };
         let collation = crate::bind::result_collation(expr);
@@ -93,12 +94,13 @@ pub(super) fn distinct_by_walk(select: &BoundSelect, outer: &PlannedSource) -> b
     if !select.distinct || !select.group_by.is_empty() || !select.aggregates.is_empty() {
         return false;
     }
-    let Some(key) = path_ordering(&outer.table, &outer.path) else {
+    let exprs = super::exprs_of(select, outer.id);
+    let Some(key) = path_ordering(&outer.table, exprs, &outer.path) else {
         return false;
     };
     let mut wanted: Vec<(OrderedBy, Collation)> = Vec::new();
     for column in &select.columns {
-        let Some(named) = walk_key_of(&column.expr, outer.id, &outer.table) else {
+        let Some(named) = walk_key_of(&column.expr, outer.id, &outer.table, exprs) else {
             return false;
         };
         let collation = crate::bind::result_collation(&column.expr);

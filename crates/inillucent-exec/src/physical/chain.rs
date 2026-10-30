@@ -673,7 +673,12 @@ fn plan_outputs(plan: &PhysicalPlan, space: &Space<'_>, params: &Params) -> DbRe
     }
     let result_width = projected.len();
     let mut sort_keys: Vec<SortKey> = Vec::new();
-    for term in &select.order_by {
+    // **A walk of an index on an expression answers an `ORDER BY` on that expression without
+    // evaluating it.** The entry holds the value and the planner proved the order, so the term is
+    // neither a sort key nor a carried column, and a covering walk need not hold the columns the
+    // expression reads.
+    let walked = plan.order_by_computed_key && !plan.needs_sort;
+    for term in select.order_by.iter().filter(|_| !walked) {
         let translated = translate_post(&term.expr, select, space, params, group_width)?;
         let existing = projected
             .iter()

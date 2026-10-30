@@ -210,7 +210,7 @@ pub(super) fn comparison_against_rowid(
 }
 
 /// Returns the operator that means the same thing with its operands swapped.
-fn mirror(op: BinaryOp) -> BinaryOp {
+pub(super) fn mirror(op: BinaryOp) -> BinaryOp {
     match op {
         BinaryOp::Less => BinaryOp::Greater,
         BinaryOp::LessEqual => BinaryOp::GreaterEqual,
@@ -229,7 +229,7 @@ fn mirror(op: BinaryOp) -> BinaryOp {
 ///
 /// @param left - the comparison's left side
 /// @param right - its right side
-fn compares_with_null(left: &BoundExpr, right: &BoundExpr) -> bool {
+pub(super) fn compares_with_null(left: &BoundExpr, right: &BoundExpr) -> bool {
     matches!(left, BoundExpr::Null) || matches!(right, BoundExpr::Null)
 }
 

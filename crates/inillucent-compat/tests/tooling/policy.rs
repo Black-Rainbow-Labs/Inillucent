@@ -1438,7 +1438,7 @@ const CEILINGS: [(&str, usize); 17] = [
     // one `WHERE` term as a comparison against one column, which
     // `plan/pattern.rs` and `plan/seek_union.rs` were already reaching
     // back into `plan.rs` for.
-    ("crates/inillucent-sql/src/plan.rs", 2_851),
+    ("crates/inillucent-sql/src/plan.rs", 2_632),
     // 2,600 until task-1970's `cargo fmt --all` reflowed this crate, which took the file to 2,799
     // without changing what it does. Measured at the character level rather than assumed: with all
     // whitespace stripped, the only differences between `ef4b630` and the formatted file are 13

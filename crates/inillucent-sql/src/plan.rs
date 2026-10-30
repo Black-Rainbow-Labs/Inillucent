@@ -44,6 +44,7 @@ use describe::{index_seek_detail, range_detail};
 pub use hint::unanswerable_index_hint;
 use hint::{forced_path, index_usable, outer_terms};
 use join_cost::{joined_in_order, ordered_output_cost, residual_share};
+use ordering::{exprs_of, ordering_provided, path_ordering, walk_key_of, OrderedBy, PathOrdering};
 use outer_paths::{choose_term_path, derived_affinities, hold_terms_before_right_joins, TermPath};
 use partial::implies;
 pub use pushdown::{calls_a_volatile_function, is_repeatable_condition};
@@ -51,6 +52,7 @@ use terms::{
     collation_of, compares_unconverted, comparison_against_rowid, comparison_collation,
     constant_in_list, indexable_comparison, virtual_constraint,
 };
+mod ordering;
 mod queue;
 mod seek_union;
 mod subquery_rows;
@@ -623,6 +625,9 @@ pub struct PhysicalPlan {
     /// from outside the query, so the rows leave in scan order as SQLite
     /// returns them; see `order_constant`.
     pub order_constant: bool,
+    /// Whether the walk answers an `ORDER BY` term that names a key an index computes, so the
+    /// executor does not evaluate that term at all; see `ordering::orders_by_computed_key`.
+    pub order_by_computed_key: bool,
     /// Whether the outermost term is walked backwards.
     ///
     /// A B-tree read from its last entry to its first produces exactly the
@@ -998,13 +1003,8 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         && select.compounds.is_empty()
         && (aggregation == AggregationMode::None || streamed_in_order);
     let ordered_join = joined_in_order(&select, sources.len(), levers, aggregation);
-    let provided = if single || ordered_join {
-        sources
-            .first()
-            .and_then(|outer| ordering_provided(&select, outer.id, &outer.table, &outer.path))
-    } else {
-        None
-    };
+    let (provided, order_by_computed_key) =
+        ordering::provided_by_outer(&select, &sources, single || ordered_join);
     let needs_sort = !select.order_by.is_empty() && provided.is_none();
     let order_constant = single && order_constant::plan_skips_sort(&select, &sources, aggregation);
     let reverse_stream = reverse::reverses_the_row_stream(&select, &sources, levers);
@@ -1028,6 +1028,7 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
         aggregation,
         needs_sort,
         order_constant,
+        order_by_computed_key,
         reverse,
         reverse_stream,
         grouped_walk,
@@ -1110,231 +1111,6 @@ pub fn expression_holds_subquery(expr: &BoundExpr) -> bool {
             .children()
             .iter()
             .any(|child| expression_holds_subquery(child))
-}
-
-/// Returns which of the walk's keys an expression names, if it names one.
-/// @param expr - the expression to resolve
-/// @param id - the outer term's source id
-/// @param table - the table being walked
-fn walk_key_of(expr: &BoundExpr, id: usize, table: &TableInfo) -> Option<OrderedBy> {
-    let mut expr = expr;
-    while let BoundExpr::Collate { operand, .. } = expr {
-        expr = operand;
-    }
-    match expr {
-        BoundExpr::Column { source, column, .. } if *source == id => {
-            Some(named_key(table, OrderedBy::Column(*column)))
-        }
-        BoundExpr::Rowid { source } if *source == id => Some(OrderedBy::Rowid),
-        _ => None,
-    }
-}
-
-/// What a term of an `ORDER BY` names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OrderedBy {
-    /// A column of the table, by its declared position.
-    Column(u16),
-    /// The row's key.
-    Rowid,
-}
-
-/// The order one access path's own walk produces.
-struct PathOrdering {
-    /// What the walk is ordered by, in order, with each key's direction and the
-    /// collation the structure compares it with.
-    columns: Vec<(OrderedBy, bool, Collation)>,
-    /// What an equality has pinned to a single value, which therefore holds
-    /// still across the whole walk and cannot affect its order.
-    pinned: Vec<OrderedBy>,
-}
-
-/// Returns whether the outer term's path already produces the `ORDER BY`, and
-/// whether it has to be walked backwards to do it.
-///
-/// `None` means it does not and the rows have to go through a sorter.
-/// `Some(false)` means a forward walk answers it, `Some(true)` a backward one.
-///
-/// The rules are narrow on purpose, because getting this wrong returns rows in
-/// the wrong order and nothing about the result looks wrong:
-///
-/// - every `ORDER BY` term is a plain column of the outer term, or its rowid;
-/// - the path is one whose order is a key's - every rowid path, and an index
-///   seek over whatever columns the equalities did not pin;
-/// - the directions agree, all with the structure or all against it, because a
-///   B-tree can be read either way but not both at once;
-/// - the collation is the one the structure holds the column in;
-/// - the NULLs land where the structure puts them, which for the SQL defaults
-///   they already do: first ascending, last descending, exactly as an index
-///   holds them.
-///
-/// A column an equality pinned is skipped rather than matched: it holds one
-/// value for every row the path returns, so ordering by it changes nothing.
-/// @param select - the bound statement, for its ORDER BY
-/// @param outer - the planned outer term
-fn ordering_provided(
-    select: &BoundSelect,
-    id: usize,
-    table: &TableInfo,
-    path: &AccessPath,
-) -> Option<bool> {
-    if select.order_by.is_empty() {
-        return Some(false);
-    }
-    let key = path_ordering(table, path)?;
-    let mut reverse: Option<bool> = None;
-    let mut at = 0usize;
-    for term in &select.order_by {
-        // `ORDER BY name COLLATE NOCASE` binds to a `Collate` around the
-        // column, and the collation it names is already on the term - so the
-        // wrapper is unwrapped rather than refused, or the one case an index
-        // exists precisely to answer would be the one case that sorted.
-        let mut expr = &term.expr;
-        while let BoundExpr::Collate { operand, .. } = expr {
-            expr = operand;
-        }
-        if order_constant::equated_to_outside_value(select, id, expr, term.collation) {
-            continue;
-        }
-        let named = match expr {
-            BoundExpr::Column { source, column, .. } if *source == id => {
-                named_key(table, OrderedBy::Column(*column))
-            }
-            BoundExpr::Rowid { source } if *source == id => OrderedBy::Rowid,
-            _ => return None,
-        };
-        let descending = matches!(term.order, SortOrder::Descending);
-        // The binder has already defaulted this, so what is left is a written
-        // placement - and only the one the structure already produces can be
-        // answered by a walk: an index holds NULLs first, so a forward walk is
-        // NULLS FIRST and a backward one is NULLS LAST.
-        let natural = match term.nulls {
-            NullOrder::First => !descending,
-            NullOrder::Last => descending,
-        };
-        if !natural {
-            return None;
-        }
-        if key.pinned.contains(&named) {
-            continue;
-        }
-        let (held, held_descending, held_collation) = key.columns.get(at).copied()?;
-        if held != named || held_collation != term.collation {
-            return None;
-        }
-        let walk = descending != held_descending;
-        match reverse {
-            None => reverse = Some(walk),
-            Some(existing) if existing == walk => {}
-            Some(_) => return None,
-        }
-        at = at.saturating_add(1);
-    }
-    Some(reverse.unwrap_or(false))
-}
-
-/// Returns the order one access path's walk produces, if it produces one.
-/// @param table - the table being read
-/// @param path - the chosen path
-fn path_ordering(table: &TableInfo, path: &AccessPath) -> Option<PathOrdering> {
-    match path {
-        // A table B-tree is keyed by rowid, and a range over it is a slice of
-        // that same walk.
-        AccessPath::TableScan { .. } | AccessPath::RowidRange { .. } => Some(PathOrdering {
-            columns: rowid_key(table),
-            pinned: Vec::new(),
-        }),
-        // One row is in every order at once.
-        AccessPath::RowidSeek { .. } => Some(PathOrdering {
-            columns: Vec::new(),
-            pinned: Vec::new(),
-        }),
-        AccessPath::IndexSeek {
-            index_name,
-            equalities,
-            ..
-        } => {
-            let index = table
-                .indexes
-                .iter()
-                .find(|candidate| candidate.name == *index_name)?;
-            let mut columns: Vec<(OrderedBy, bool, Collation)> = Vec::new();
-            let mut pinned: Vec<OrderedBy> = Vec::new();
-            for (at, key_column) in index.columns.iter().enumerate() {
-                // An expression key orders by something no ORDER BY term here
-                // can name, so the walk stops describing itself at that point.
-                let Some(column) = key_column.plain_column() else {
-                    break;
-                };
-                let named = named_key(table, OrderedBy::Column(column));
-                let collation = collation_of(&key_column.collation);
-                if at < equalities.len() {
-                    pinned.push(named);
-                    continue;
-                }
-                columns.push((named, key_column.descending, collation));
-            }
-            // Every index entry ends with the row's key, so the walk is a total
-            // order even where the indexed columns tie.
-            columns.push((OrderedBy::Rowid, false, Collation::Binary));
-            Some(PathOrdering { columns, pinned })
-        }
-        // A branch that needs de-duplicating (an `IN` list) has no order:
-        // list values are probed in whatever order they were written, not
-        // index order. A branch that does not - the keyset-range shape,
-        // proven disjoint at plan time - runs each branch in the index's own
-        // order and the branches themselves in that same order, so the whole
-        // union reads exactly as an unconstrained walk of the index would: no
-        // column is pinned, because no column has one value across every
-        // branch.
-        AccessPath::IndexSeekUnion {
-            index_name,
-            dedup: false,
-            ..
-        } => {
-            let index = table
-                .indexes
-                .iter()
-                .find(|candidate| candidate.name == *index_name)?;
-            let mut columns: Vec<(OrderedBy, bool, Collation)> = Vec::new();
-            for key_column in &index.columns {
-                let Some(column) = key_column.plain_column() else {
-                    break;
-                };
-                let named = named_key(table, OrderedBy::Column(column));
-                let collation = collation_of(&key_column.collation);
-                columns.push((named, key_column.descending, collation));
-            }
-            columns.push((OrderedBy::Rowid, false, Collation::Binary));
-            Some(PathOrdering {
-                columns,
-                pinned: Vec::new(),
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Returns the ordering a rowid walk produces.
-/// @param table - the table being walked
-fn rowid_key(table: &TableInfo) -> Vec<(OrderedBy, bool, Collation)> {
-    let _ = table;
-    vec![(OrderedBy::Rowid, false, Collation::Binary)]
-}
-
-/// Returns the one name a key goes by.
-///
-/// `INTEGER PRIMARY KEY` is the rowid under another name, so a statement that
-/// ordered by the declared column and one that ordered by `rowid` asked for the
-/// same walk. Folding the two spellings into one here is what lets the rest of
-/// the comparison be an equality.
-/// @param table - the table the column belongs to
-/// @param named - the key as the statement or the index spelled it
-fn named_key(table: &TableInfo, named: OrderedBy) -> OrderedBy {
-    match named {
-        OrderedBy::Column(column) if table.rowid_alias == Some(column) => OrderedBy::Rowid,
-        other => other,
-    }
 }
 
 /// Returns the order the FROM terms are visited in.
@@ -1500,7 +1276,9 @@ fn order_cost(select: &BoundSelect, terms: &[BoundExpr], order: &[usize], levers
         };
         let path = choose_path(level, &ids, source, select, terms, &mut consumed, levers);
         if level == 0 {
-            first_provides = ordering_provided(select, source.id, &source.table, &path).is_some();
+            first_provides =
+                ordering_provided(select, source.id, &source.table, &source.index_exprs, &path)
+                    .is_some();
         }
         let (cost, rows) = subquery_rows::ordered_path_cost(select, source, &path);
         total += outer_rows * cost;
@@ -2445,7 +2223,9 @@ fn index_path(
         if let Some((path, used)) = index_candidate(&context, index, computed, usable) {
             consider_index_candidate(source, &mut best, path, used);
         }
-        if let Some((path, used)) = seek_union::in_list_union_path(&context, index, usable) {
+        if let Some((path, used)) =
+            seek_union::in_list_union_path(&context, index, computed, usable)
+        {
             consider_index_candidate(source, &mut best, path, used);
         }
         if let Some((path, used)) = seek_union::keyset_range_union_path(&context, index, usable) {
@@ -2591,15 +2371,13 @@ fn index_candidate(
     // `SELECT count(*) FROM s CROSS JOIN h WHERE h.b > 595` was refused with
     // exit code 3 on the release build, with no hint anywhere (task-2078).
     // Left unconsumed, the bound is a residual over the pair, which answers.
-    let range = match index.columns.get(key) {
-        Some(key_column) if position == 0 => range::key_range(context, key_column, &mut used),
-        _ => None,
-    };
+    let range = range::range_after_prefix(context, index, computed, key, &mut used);
     let (low, high) = match range {
         Some(found) => {
+            expression_terms.extend(found.answered.iter().copied());
             collations.push(found.collation);
             descending.push(found.descending);
-            columns.push(Some(found.column));
+            columns.push(found.column);
             (found.low, found.high)
         }
         None => (None, None),

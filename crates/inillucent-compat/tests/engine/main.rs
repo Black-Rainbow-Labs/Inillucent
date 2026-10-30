@@ -37,6 +37,7 @@ mod dml;
 mod embed_direct_only;
 mod encryption_at_rest;
 mod expression_index_covering;
+mod expression_index_shapes;
 mod format_refusal;
 mod fts5_bulk_edits;
 mod fts5_commit_cost;

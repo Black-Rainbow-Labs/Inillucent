@@ -1022,6 +1022,14 @@ covers = ["inillucent-exec", "inillucent-sql"]
 package = "inillucent-compat"
 kind = "test"
 name = "engine"
+module = "expression_index_shapes"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
 module = "scratch_memory_flat"
 tier = "engine"
 covers = ["inillucent-engine", "inillucent-tree"]

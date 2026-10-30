@@ -1,0 +1,57 @@
+-- case: bug-hunt-11/planner/expression-index-range-in-between-order
+CREATE TABLE ix(id INTEGER PRIMARY KEY, p TEXT, k INT, name TEXT);
+INSERT INTO ix(p, k, name) VALUES ('{"k":5,"s":"b"}', 5, 'b'), ('{"k":1,"s":"a"}', 1, 'a'), ('{"k":9,"s":"C"}', 9, 'C'), ('{"k":null,"s":"d"}', NULL, 'd'), ('{"s":"e"}', NULL, 'e'), ('{"k":5,"s":"f"}', 5, 'f'), ('{"k":"x","s":"g"}', 7, 'g'), ('{"k":2.5,"s":"h"}', 2, 'h');
+CREATE INDEX ixe ON ix(json_extract(p, '$.k'));
+EXPLAIN QUERY PLAN SELECT id FROM ix WHERE json_extract(p, '$.k') > 2;
+EXPLAIN QUERY PLAN SELECT id FROM ix WHERE json_extract(p, '$.k') BETWEEN 2 AND 6;
+EXPLAIN QUERY PLAN SELECT id FROM ix WHERE json_extract(p, '$.k') IN (1, 9);
+EXPLAIN QUERY PLAN SELECT id FROM ix ORDER BY json_extract(p, '$.k') LIMIT 3;
+SELECT id FROM ix WHERE json_extract(p, '$.k') > 2 ORDER BY id;
+SELECT id FROM ix WHERE json_extract(p, '$.k') >= 5 ORDER BY id;
+SELECT id FROM ix WHERE json_extract(p, '$.k') < 5 ORDER BY id;
+SELECT id FROM ix WHERE 5 <= json_extract(p, '$.k') ORDER BY id;
+SELECT id FROM ix WHERE json_extract(p, '$.k') BETWEEN 2 AND 6 ORDER BY id;
+SELECT id FROM ix WHERE json_extract(p, '$.k') NOT BETWEEN 2 AND 6 ORDER BY id;
+SELECT id FROM ix WHERE json_extract(p, '$.k') IN (1, 9, 'x') ORDER BY id;
+SELECT id FROM ix WHERE json_extract(p, '$.k') IN (9, 1, 9) ORDER BY id;
+SELECT id FROM ix WHERE json_extract(p, '$.k') > NULL;
+SELECT id FROM ix WHERE json_extract(p, '$.k') > 1 AND json_extract(p, '$.k') < 9 ORDER BY id;
+SELECT id FROM ix ORDER BY json_extract(p, '$.k'), id LIMIT 4;
+SELECT id FROM ix ORDER BY json_extract(p, '$.k') DESC, id DESC LIMIT 4;
+SELECT id, name FROM ix ORDER BY json_extract(p, '$.k') LIMIT 3 OFFSET 2;
+SELECT id FROM ix WHERE json_extract(p, '$.k') > 1 ORDER BY json_extract(p, '$.k') DESC, id LIMIT 3;
+SELECT count(*) FROM ix WHERE json_extract(p, '$.k') BETWEEN 1 AND 9;
+SELECT json_extract(p, '$.k') AS v FROM ix ORDER BY v LIMIT 3;
+-- case: bug-hunt-11/planner/expression-index-second-key-range
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, p TEXT);
+INSERT INTO t(a, p) VALUES (1, '{"v":3}'), (1, '{"v":8}'), (1, '{"v":12}'), (2, '{"v":4}'), (2, '{"v":9}'), (3, '{"v":1}');
+CREATE INDEX tae ON t(a, json_extract(p, '$.v'));
+EXPLAIN QUERY PLAN SELECT id FROM t WHERE a = 1 AND json_extract(p, '$.v') > 5;
+EXPLAIN QUERY PLAN SELECT id FROM t WHERE a = 1 ORDER BY json_extract(p, '$.v') LIMIT 2;
+SELECT id FROM t WHERE a = 1 AND json_extract(p, '$.v') > 5 ORDER BY id;
+SELECT id FROM t WHERE a = 2 AND json_extract(p, '$.v') BETWEEN 4 AND 8 ORDER BY id;
+SELECT id FROM t WHERE a = 1 ORDER BY json_extract(p, '$.v') DESC LIMIT 2;
+SELECT id FROM t WHERE a IN (1, 2) AND json_extract(p, '$.v') > 3 ORDER BY id;
+SELECT id FROM t WHERE a = 1 AND json_extract(p, '$.v') IN (3, 12) ORDER BY id;
+-- case: bug-hunt-11/planner/expression-index-lower-text-range
+CREATE TABLE u(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO u(name) VALUES ('Bob'), ('alice'), ('Carol'), ('dave'), ('ALICE'), (NULL), ('bob');
+CREATE INDEX ul ON u(lower(name));
+EXPLAIN QUERY PLAN SELECT id FROM u WHERE lower(name) >= 'b' AND lower(name) < 'd';
+SELECT id FROM u WHERE lower(name) >= 'b' AND lower(name) < 'd' ORDER BY id;
+SELECT id FROM u WHERE lower(name) BETWEEN 'alice' AND 'bob' ORDER BY id;
+SELECT id FROM u WHERE lower(name) IN ('alice', 'dave') ORDER BY id;
+SELECT id FROM u ORDER BY lower(name) LIMIT 4;
+SELECT id FROM u ORDER BY lower(name) DESC, id LIMIT 4;
+SELECT id, name FROM u ORDER BY lower(name), id LIMIT 3;
+SELECT id FROM u WHERE lower(name) > 'b' COLLATE NOCASE ORDER BY id;
+-- case: bug-hunt-11/planner/expression-index-covering-count
+CREATE TABLE e(id INTEGER PRIMARY KEY, payload TEXT);
+INSERT INTO e(payload) VALUES ('{"n":1}'), ('{"n":5}'), ('{"n":7}'), ('{"n":5}'), ('{"m":1}');
+CREATE INDEX en ON e(json_extract(payload, '$.n'));
+EXPLAIN QUERY PLAN SELECT count(*) FROM e WHERE json_extract(payload, '$.n') > 4;
+SELECT count(*) FROM e WHERE json_extract(payload, '$.n') > 4;
+SELECT count(*) FROM e WHERE json_extract(payload, '$.n') BETWEEN 1 AND 5;
+SELECT count(*) FROM e WHERE json_extract(payload, '$.n') IN (1, 7);
+SELECT id FROM e ORDER BY json_extract(payload, '$.n') LIMIT 3;
+SELECT payload FROM e WHERE json_extract(payload, '$.n') > 4 ORDER BY id;

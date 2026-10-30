@@ -95,6 +95,29 @@ fn declared_column(table: &TableInfo, slot: u16) -> Option<u16> {
     None
 }
 
+/// Returns what a query reads of a term once its `ORDER BY` is left out, when an index that
+/// computes an `ORDER BY` term as a key could answer that order by being walked.
+///
+/// **A walk of an index on `json_extract(p, '$.k')` produces rows in the order of that
+/// expression without reading `p`.** `SELECT id FROM t ORDER BY json_extract(p, '$.k') LIMIT 10`
+/// reads `p` only to sort, and the walk replaces the sort, so the entry holds everything the
+/// statement reads. `None` when no `ORDER BY` term is a computed key, so the caller keeps what
+/// the whole statement reads and a statement that cannot use one never pays for the copy.
+///
+/// @param select - the bound statement
+/// @param id - the statement wide number of the FROM term
+pub(super) fn needed_beyond_order(
+    select: &crate::bind::BoundSelect,
+    id: usize,
+) -> Option<ColumnUse> {
+    if !super::ordering::orders_by_computed_key(select, id) {
+        return None;
+    }
+    let mut trimmed = select.clone();
+    trimmed.order_by.clear();
+    Some(trimmed.columns_read(id))
+}
+
 /// Returns what a query reads of a term once the equalities a computed key enforces are left out.
 ///
 /// **An index on an expression covers a query whose only use of a column is inside that

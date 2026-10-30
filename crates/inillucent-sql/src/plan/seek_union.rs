@@ -98,6 +98,56 @@ pub(super) fn rowid_in_list_path(
     None
 }
 
+/// Returns the equality that pins one key column of an `IN` seek's prefix, as the term's position,
+/// the probe value and whether the seek compares the value without converting it.
+///
+/// A bare column is pinned by an equality on the column and a computed key by an equality on its
+/// own expression.
+///
+/// @param context - the term being planned and its statement
+/// @param key_column - the index key column to pin
+/// @param wanted - the bound expression the key computes, when it is not a bare column
+/// @param prefix_terms - the terms the earlier prefix columns used
+fn prefix_equality(
+    context: &super::CandidateContext<'_>,
+    key_column: &crate::catalog_view::IndexColumnInfo,
+    wanted: Option<&BoundExpr>,
+    prefix_terms: &[usize],
+) -> Option<(usize, BoundExpr, bool)> {
+    let super::CandidateContext {
+        id,
+        position,
+        ids,
+        terms,
+        consumed,
+        ..
+    } = *context;
+    let collation = collation_of(&key_column.collation);
+    let Some(column) = key_column.plain_column() else {
+        let (term_index, value) = find_expr_equality(
+            position,
+            ids,
+            wanted?,
+            collation,
+            terms,
+            consumed,
+            prefix_terms,
+        )?;
+        let unconverted = terms.get(term_index).is_some_and(compares_unconverted);
+        return Some((term_index, value, unconverted));
+    };
+    let (term_index, term) = terms.iter().enumerate().find(|(term_index, term)| {
+        !consumed.get(*term_index).copied().unwrap_or(false)
+            && !prefix_terms.contains(term_index)
+            && comparison_collation(term) == collation
+            && indexable_comparison(id, column, term).is_some_and(|(op, value)| {
+                op == BinaryOp::Equal && is_available(position, ids, &value)
+            })
+    })?;
+    let (_, value) = indexable_comparison(id, column, term)?;
+    Some((term_index, value, compares_unconverted(term)))
+}
+
 /// Returns a union of index seeks, when a term is `column IN (list)` on one
 /// index's leading column.
 ///
@@ -116,6 +166,7 @@ pub(super) fn rowid_in_list_path(
 pub(super) fn in_list_union_path(
     context: &super::CandidateContext<'_>,
     index: &IndexInfo,
+    computed: Option<&crate::dml::BoundIndexExprs>,
     usable: bool,
 ) -> Option<(AccessPath, Vec<usize>)> {
     let super::CandidateContext {
@@ -144,41 +195,37 @@ pub(super) fn in_list_union_path(
     let mut columns: Vec<Option<u16>> = Vec::new();
     let mut at = 0usize;
     while let Some(key_column) = index.columns.get(at) {
-        let Some(column) = key_column.plain_column() else {
-            break;
-        };
         let collation = collation_of(&key_column.collation);
-        let found = terms.iter().enumerate().find(|(term_index, term)| {
-            !consumed.get(*term_index).copied().unwrap_or(false)
-                && !prefix_terms.contains(term_index)
-                && comparison_collation(term) == collation
-                && indexable_comparison(id, column, term).is_some_and(|(op, value)| {
-                    op == BinaryOp::Equal && is_available(position, ids, &value)
-                })
-        });
-        let Some((term_index, term)) = found else {
+        let wanted = computed
+            .and_then(|held| held.keys.get(at))
+            .and_then(Option::as_ref);
+        let found = prefix_equality(context, key_column, wanted, &prefix_terms);
+        let Some((term_index, value, unconverted)) = found else {
             break;
         };
-        let Some((_, value)) = indexable_comparison(id, column, term) else {
-            break;
-        };
-        if compares_unconverted(term) {
+        if unconverted {
             prefix_unconverted.push(prefix.len());
         }
         prefix.push(value);
         prefix_terms.push(term_index);
         collations.push(collation);
         descending.push(key_column.descending);
-        columns.push(Some(column));
+        columns.push(key_column.column);
         at = at.saturating_add(1);
     }
 
     let key_column = index.columns.get(at)?;
-    let column = key_column.plain_column()?;
+    let column = key_column.plain_column();
+    // The expression the `IN` column computes, when it is not a bare column. An index whose
+    // schema text did not bind has none, which leaves the `IN` a residual.
+    let wanted = match column {
+        Some(_) => None,
+        None => Some(computed?.keys.get(at)?.as_ref()?),
+    };
     let collation = collation_of(&key_column.collation);
     collations.push(collation);
     descending.push(key_column.descending);
-    columns.push(Some(column));
+    columns.push(key_column.column);
     for (term_index, term) in terms.iter().enumerate() {
         if consumed.get(term_index).copied().unwrap_or(false) || prefix_terms.contains(&term_index)
         {
@@ -194,15 +241,16 @@ pub(super) fn in_list_union_path(
         else {
             continue;
         };
-        let BoundExpr::Column {
-            source: term_source,
-            column: candidate,
-            ..
-        } = operand.as_ref()
-        else {
-            continue;
+        let names_the_key = match (column, wanted) {
+            (Some(column), _) => matches!(
+                operand.as_ref(),
+                BoundExpr::Column { source, column: candidate, .. }
+                    if *source == id && *candidate == column
+            ),
+            (None, Some(wanted)) => operand.as_ref() == wanted,
+            (None, None) => false,
         };
-        if *term_source != id || *candidate != column || *in_collation != collation {
+        if !names_the_key || *in_collation != collation {
             continue;
         }
         if list.is_empty() || list.len() > MAX_SEEK_UNION_BRANCHES {
@@ -212,9 +260,28 @@ pub(super) fn in_list_union_path(
             continue;
         }
         let branches = in_list_branches(list, &prefix, &prefix_unconverted);
+        // The terms a computed key answers are not tested again, so the columns only they read
+        // do not have to be in the entry; see `covering::needed_beyond_expressions`.
+        let mut answered: Vec<usize> = Vec::new();
+        for (held_at, held) in index.columns.iter().enumerate().take(at.saturating_add(1)) {
+            if held.column.is_none() {
+                answered.extend(prefix_terms.get(held_at).copied());
+            }
+        }
+        if wanted.is_some() {
+            answered.push(term_index);
+        }
+        let reduced = covering::needed_beyond_expressions(id, context.needed, terms, &answered);
         let covering = levers
             .has(Levers::COVERING_INDEX)
-            .then(|| covering_slots(table, index, context.needed, usable))
+            .then(|| {
+                covering_slots(
+                    table,
+                    index,
+                    reduced.as_ref().unwrap_or(context.needed),
+                    usable,
+                )
+            })
             .flatten();
         return Some((
             AccessPath::IndexSeekUnion {
