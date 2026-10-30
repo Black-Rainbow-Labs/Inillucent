@@ -166,9 +166,11 @@ pragma table_list(sqlite_master);
 -- case: bug-hunt-11/pragma/D20-attached-memory-backup
 attach ':memory:' as aux;
 create table aux.x(a);
+insert into aux.x values(1),(2);
 .backup aux bk3.db
 .open bk3.db
-.tables
+select name from sqlite_master;
+select * from x;
 -- case: bug-hunt-11/pragma/D2-drop-column-quoted-expression-index
 create table t(d, e);
 create index i on t(d, "e" + 1);
@@ -476,3 +478,15 @@ select 'd';
 pragma temp.table_list(sqlite_master);
 select 'e';
 pragma temp.table_list(sqlite_temp_master);
+-- case: bug-hunt-11/pragma/D20-lint-fkey-indexes-and-fullschema
+create table p(a primary key, b);
+create table c(x, y references p);
+.lint fkey-indexes
+create table q(a, b, primary key(a,b));
+create table r(m, n, foreign key(m,n) references q);
+.lint fkey-indexes
+create index i on r(n);
+insert into p values(1,2);
+analyze;
+.fullschema
+select * from sqlite_stat1;

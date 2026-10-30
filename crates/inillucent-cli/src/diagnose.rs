@@ -422,7 +422,7 @@ pub fn lint(shell: &mut Shell, arguments: &[&str]) {
         };
         // One row per column of a key, so the columns are gathered per key id
         // before anything is decided about it.
-        let mut grouped: Vec<(i64, String, Vec<String>)> = Vec::new();
+        let mut grouped: Vec<(i64, String, Vec<String>, Vec<String>)> = Vec::new();
         for row in &keys {
             let id = match row.first() {
                 Some(Value::Integer(number)) => *number,
@@ -430,16 +430,26 @@ pub fn lint(shell: &mut Shell, arguments: &[&str]) {
             };
             let parent = text_of(row.get(2));
             let column = text_of(row.get(3));
+            let target = text_of(row.get(4));
             match grouped.last_mut() {
-                Some((held, _, columns)) if *held == id => columns.push(column),
-                _ => grouped.push((id, parent, vec![column])),
+                Some((held, _, columns, targets)) if *held == id => {
+                    columns.push(column);
+                    targets.push(target);
+                }
+                _ => grouped.push((id, parent, vec![column], vec![target])),
             }
         }
-        for (_, parent, columns) in grouped {
+        for (_, parent, columns, targets) in grouped {
             if child_is_indexed(shell, &child, &columns) {
                 continue;
             }
-            let parent_key = parent_key_columns(shell, &parent);
+            // The columns the key names in the parent, and the parent's primary key when it
+            // names none. Joined with a bare comma, as SQLite writes them.
+            let named: Vec<String> = targets.into_iter().filter(|name| !name.is_empty()).collect();
+            let parent_key = match named.is_empty() {
+                true => parent_key_columns(shell, &parent),
+                false => named.join(","),
+            };
             shell.say(&format!(
                 "CREATE INDEX '{}_{}' ON '{}'({}); --> {}({})",
                 child,
@@ -507,7 +517,7 @@ fn parent_key_columns(shell: &mut Shell, parent: &str) -> String {
         .iter()
         .map(|row| text_of(row.first()))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(",")
 }
 
 /// Returns a value as plain text.

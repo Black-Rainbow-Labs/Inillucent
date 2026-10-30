@@ -112,9 +112,7 @@ fn copy_schema(shell: &mut Shell, schema: &str, destination: &str) -> Result<(),
         if is_main {
             return export_memory_database(shell, destination);
         }
-        return Err(format!(
-            "cannot back up \"{schema}\": it is not held in a file"
-        ));
+        return export_attached_memory_database(shell, schema, destination);
     }
     let outcome = if is_main {
         shell.backup_to(destination)
@@ -122,6 +120,36 @@ fn copy_schema(shell: &mut Shell, schema: &str, destination: &str) -> Result<(),
         Shell::backup_file(file, destination)
     };
     outcome.map_err(|error| error.message().to_string())
+}
+
+/// Writes an attached or temporary database that is held in memory to a file, replacing a file
+/// already there.
+///
+/// **`VACUUM schema INTO` writes the copy**, to a scratch file beside the destination, and a
+/// rename puts it in place once it is whole, as for `main`.
+///
+/// @param shell - the shell
+/// @param schema - the name of the database
+/// @param destination - the file to write
+fn export_attached_memory_database(
+    shell: &mut Shell,
+    schema: &str,
+    destination: &str,
+) -> Result<(), String> {
+    let scratch = format!("{destination}.backup-{}", std::process::id());
+    remove_database_files(&scratch);
+    let statement = format!(
+        "VACUUM \"{}\" INTO '{}'",
+        schema.replace('"', "\"\""),
+        scratch.replace('\'', "''")
+    );
+    shell.collect(&statement).map_err(|failure| failure.message)?;
+    remove_log_segments(&scratch);
+    remove_database_files(destination);
+    std::fs::rename(&scratch, destination).map_err(|error| {
+        remove_database_files(&scratch);
+        format!("cannot write \"{destination}\": {error}")
+    })
 }
 
 /// Writes the database held in memory to a file, replacing a file already there.

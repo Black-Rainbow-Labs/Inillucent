@@ -785,6 +785,9 @@ struct SchemaOptions<'a> {
     nosys: bool,
     /// The `LIKE` pattern naming the objects to show, if one was given.
     pattern: Option<&'a str>,
+    /// `.fullschema`: write `ANALYZE sqlite_schema;` where `sqlite_stat1` would be created,
+    /// because its rows follow as `INSERT` statements.
+    stat_as_analyze: bool,
 }
 
 /// Reads the options and the pattern after `.schema`.
@@ -868,6 +871,10 @@ fn list_schemas(shell: &mut Shell, options: &SchemaOptions<'_>, schemas: &[Strin
             let kind = text_of(row.first());
             let name = text_of(row.get(1));
             let statement = qualified_statement(&text_of(row.get(2)), schema_name);
+            if options.stat_as_analyze && kind == "table" && name == "sqlite_stat1" {
+                shell.say("ANALYZE sqlite_schema;");
+                continue;
+            }
             if kind == "view" {
                 // A view's text does not say what columns it produces, so the
                 // columns go underneath in a comment - which is what makes
@@ -957,7 +964,11 @@ fn quote_identifier(name: &str) -> String {
 
 /// `.fullschema`: the schema, then whatever `ANALYZE` recorded.
 fn full_schema(shell: &mut Shell) {
-    list_schemas(shell, &SchemaOptions::default(), &["main".to_string()]);
+    let options = SchemaOptions {
+        stat_as_analyze: true,
+        ..SchemaOptions::default()
+    };
+    list_schemas(shell, &options, &["main".to_string()]);
     let exists = shell.scalar("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'");
     if exists.as_deref() == Some("0") || exists.is_none() {
         shell.say("/* No STAT tables available */");
@@ -973,6 +984,7 @@ fn full_schema(shell: &mut Shell) {
     );
     shell.run("SELECT * FROM sqlite_stat1");
     shell.layout = layout;
+    shell.say("ANALYZE sqlite_schema;");
 }
 
 /// Returns a string as an SQL literal.

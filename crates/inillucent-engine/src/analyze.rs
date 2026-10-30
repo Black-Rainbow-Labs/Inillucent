@@ -278,10 +278,13 @@ impl ImportedDatabase {
             .cloned()
             .collect();
         let mut rows: Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
-        for subject in &subjects {
+        // **Newest table first, and each table's newest index first**, which is the order
+        // SQLite walks its hash of tables and each table's list of indexes in. The rows are
+        // stored in that order, so `SELECT * FROM sqlite_stat1` with no `ORDER BY` agrees.
+        for subject in subjects.iter().rev() {
             let count = self.live_rows(subject.root)?;
             let mut needs_table_count = true;
-            for index in &subject.indexes {
+            for index in subject.indexes.iter().rev() {
                 if only_index
                     .as_ref()
                     .is_some_and(|only| *only != index.folded)
