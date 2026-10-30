@@ -292,7 +292,36 @@ impl crate::ImportedDatabase {
             self.writing.set_settling(false);
             settled?;
         }
-        Ok(outcome)
+        Ok(self.counted_changes(cached, outcome))
+    }
+
+    /// Answers an `INSERT`, `UPDATE` or `DELETE` with the number of rows it changed when
+    /// `PRAGMA count_changes` is on.
+    ///
+    /// SQLite returns one row, whose column is `rows inserted`, `rows updated` or `rows deleted`.
+    /// Only the outermost statement does so, a statement with `RETURNING` keeps its own rows, and
+    /// `CREATE TABLE ... AS SELECT` is not an `INSERT` here.
+    ///
+    /// @param cached - the statement that ran
+    /// @param outcome - what it answered
+    fn counted_changes(&self, cached: &std::rc::Rc<Cached>, mut outcome: Outcome) -> Outcome {
+        if self.pragmas.remembered("count_changes").unwrap_or(0) == 0
+            || self.session_state.nesting.get() != 0
+            || !outcome.names.is_empty()
+            || !outcome.rows.is_empty()
+        {
+            return outcome;
+        }
+        let word = match &**cached {
+            Cached::Insert(..) | Cached::VirtualInsert(..) => "rows inserted",
+            Cached::Update(..) | Cached::VirtualUpdate(..) => "rows updated",
+            Cached::Delete(..) | Cached::VirtualDelete(..) => "rows deleted",
+            _ => return outcome,
+        };
+        let changed = i64::try_from(outcome.changes.rows).unwrap_or(i64::MAX);
+        outcome.rows = vec![vec![OwnedDatum::Int(changed)]];
+        outcome.names = std::rc::Rc::new(vec![word.to_string()]);
+        outcome
     }
 
     /// Tells a module to remove each row a query found.
@@ -917,6 +946,10 @@ impl crate::ImportedDatabase {
             )
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.column_names_by(
+            self.pragmas.remembered("short_column_names").unwrap_or(1) != 0,
+            self.pragmas.remembered("full_column_names").unwrap_or(0) != 0,
+        );
         binder.writable_schema_if(self.pragmas.writable_schema());
         let outcome = binder.bind_statement(inner);
         self.compiled.recycle_binder(binder.into_scratch());

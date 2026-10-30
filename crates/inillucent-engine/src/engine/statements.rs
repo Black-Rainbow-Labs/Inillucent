@@ -215,6 +215,10 @@ impl crate::ImportedDatabase {
             )
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.column_names_by(
+            self.pragmas.remembered("short_column_names").unwrap_or(1) != 0,
+            self.pragmas.remembered("full_column_names").unwrap_or(0) != 0,
+        );
         binder.writable_schema_if(self.pragmas.writable_schema());
         let outcome = binder.bind_statement(&parsed.statement);
         self.compiled.recycle_binder(binder.into_scratch());
@@ -327,6 +331,10 @@ impl ImportedDatabase {
             )
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.column_names_by(
+            self.pragmas.remembered("short_column_names").unwrap_or(1) != 0,
+            self.pragmas.remembered("full_column_names").unwrap_or(0) != 0,
+        );
         binder.writable_schema_if(self.pragmas.writable_schema());
         let outcome = binder.bind_statement(&parsed.statement);
         // Before the `?`, so a statement that fails to bind still hands its
@@ -555,6 +563,10 @@ impl ImportedDatabase {
             .in_schema()
             .with_scratch(self.compiled.take_binder_scratch());
         binder.ignore_checks_if(self.pragmas.ignore_check_constraints());
+        binder.column_names_by(
+            self.pragmas.remembered("short_column_names").unwrap_or(1) != 0,
+            self.pragmas.remembered("full_column_names").unwrap_or(0) != 0,
+        );
         binder.writable_schema_if(self.pragmas.writable_schema());
         let bound = binder.bind_statement(&parsed.statement).map_err(refused);
         self.compiled.recycle_binder(binder.into_scratch());

@@ -1203,6 +1203,10 @@ pub struct Binder<'a> {
     pub(crate) foreign_keys: bool,
     /// Whether `PRAGMA ignore_check_constraints` turned `CHECK` off.
     pub(crate) ignore_checks: bool,
+    /// `PRAGMA short_column_names`, on unless it was turned off.
+    pub(crate) short_names: bool,
+    /// `PRAGMA full_column_names`, off unless it was turned on.
+    pub(crate) full_names: bool,
     /// Whether `PRAGMA writable_schema` is on, which lets a new object take a
     /// name that begins `sqlite_`, as SQLite's `sqlite3CheckObjectName` does.
     pub(crate) writable_schema: bool,
@@ -1454,6 +1458,8 @@ impl<'a> Binder<'a> {
             shared_anonymous: 0,
             foreign_keys: false,
             ignore_checks: false,
+            short_names: true,
+            full_names: false,
             writable_schema: false,
             expanding_views: Vec::new(),
             defer_foreign_keys: false,
@@ -1498,6 +1504,18 @@ impl<'a> Binder<'a> {
     /// @param ignored - whether the pragma is on
     pub fn ignore_checks_if(&mut self, ignored: bool) {
         self.ignore_checks = ignored;
+    }
+
+    /// Sets how result columns are named, for `PRAGMA short_column_names` and
+    /// `PRAGMA full_column_names`.
+    ///
+    /// A setter, for the reason [`Binder::ignore_checks_if`] gives.
+    ///
+    /// @param short - whether `short_column_names` is on
+    /// @param full - whether `full_column_names` is on
+    pub fn column_names_by(&mut self, short: bool, full: bool) {
+        self.short_names = short;
+        self.full_names = full;
     }
 
     /// Lets a new object take a reserved name, for `PRAGMA writable_schema`.
@@ -2667,7 +2685,7 @@ impl<'a> Binder<'a> {
                     let expr = self.bind_expr(value)?;
                     let name = match column.alias {
                         Some(alias) => self.ast.text(alias).to_vec(),
-                        None => self.default_column_name(column.expr, &expr, column.span),
+                        None => self.mode_column_name(column.expr, &expr, column.span),
                     };
                     let (origin, declared_type) = self.column_origin(&expr);
                     // Kept only when it differs from `name`, which is nearly
@@ -2925,9 +2943,15 @@ impl<'a> Binder<'a> {
                 // star is qualified, so `l.*` over `l FULL JOIN r USING (a)`
                 // shows `coalesce(l.a, r.a)`.
                 let expr = self.star_using_column(&scope_ids, id, position_u16, span)?;
+                // `full_column_names` without `short_column_names` writes `table.column`.
+                let name = if self.full_names && !self.short_names && !synthetic {
+                    [table_name.as_slice(), b".", column.name.as_slice()].concat()
+                } else {
+                    column.name.clone()
+                };
                 into.push(BoundResultColumn {
                     expr,
-                    name: column.name.clone(),
+                    name,
                     // A subquery's column has no table of origin: it came from
                     // an expression, and reporting the synthetic name as one
                     // would make `sqlite3_column_table_name` invent a table.
@@ -2942,6 +2966,56 @@ impl<'a> Binder<'a> {
             return Err(no_such_table(qualifier.unwrap_or(b"*"), span));
         }
         Ok(())
+    }
+
+    /// Returns the name an unaliased result column reports, under the two column name pragmas.
+    ///
+    /// **SQLite's `generateColumnNames`.** With `short_column_names` or `full_column_names` on, a
+    /// bare reference to a column of a table is named for the column, and for `table.column` when
+    /// `full_column_names` is on, using the table's own name and not the alias it was given. With
+    /// both off every column is named after the text it was written as. Anything that is not such
+    /// a reference is named as it always is.
+    ///
+    /// @param id - the expression as written
+    /// @param bound - the expression, bound
+    /// @param written - the result column's span
+    fn mode_column_name(&self, id: ExprId, bound: &BoundExpr, written: Span) -> Vec<u8> {
+        let plain = self.default_column_name(id, bound, written);
+        if self.short_names && !self.full_names {
+            return plain;
+        }
+        let Some(Expr::Column { .. }) = self.ast.expr(id) else {
+            return plain;
+        };
+        let table = match bound {
+            BoundExpr::Column { source, .. } | BoundExpr::Generated { source, .. } => self
+                .sources
+                .get(*source)
+                .map(|held| held.table.name.clone()),
+            _ => None,
+        };
+        let Some(table) = table else {
+            return plain;
+        };
+        match (self.short_names || self.full_names, self.full_names) {
+            (true, true) => [table.as_slice(), b".", plain.as_slice()].concat(),
+            (true, false) => plain,
+            (false, _) => self.written_text(id, written),
+        }
+    }
+
+    /// Returns the text an expression was written as, up to where the next token starts.
+    ///
+    /// @param id - the expression
+    /// @param written - the result column's span
+    fn written_text(&self, id: ExprId, written: Span) -> Vec<u8> {
+        let start = self.ast.expr_span(id).start;
+        let text = Span::new(start as usize, written.end as usize).slice(self.source);
+        let kept = text
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map_or(0, |last| last.saturating_add(1));
+        text.get(..kept).unwrap_or(text).to_vec()
     }
 
     /// Returns the name an unaliased result column reports.

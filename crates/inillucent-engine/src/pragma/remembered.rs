@@ -236,6 +236,12 @@ impl crate::ImportedDatabase {
         let held = match stored_value(setting, &text, current) {
             Some(value) => {
                 self.pragmas.remember(setting.name, value);
+                // The names a statement's columns have are decided when it is bound.
+                if matches!(setting.name, "short_column_names" | "full_column_names")
+                    && (value != 0) != (current != 0)
+                {
+                    self.forget_compiled_statements();
+                }
                 if setting.name == "reverse_unordered_selects" {
                     // A plan carries the levers it was built under, so the
                     // statements compiled before the change are dropped.
