@@ -8,6 +8,93 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## 2.9.0, 30 October 2026
+
+This release fixes the defects found by the eleventh bug hunt. Eight areas were compared with SQLite
+3.53.4 by about 1.2 million generated and hand written statements: applications written through the
+language packages, files that older releases and real SQLite wrote, JSON, window functions, dates
+and numbers, FTS5 and R*Tree, the bugs other projects found since mid October, and the pragmas. 403
+new cases in `compat/corpus/usage/bug-hunt-11-*.sql` compare each fix with SQLite.
+
+**A table that a release before 2.1.0 altered after a table constraint is read again.** Those
+releases wrote `ALTER TABLE ... ADD COLUMN` by appending the column after the table's constraints in
+the stored `CREATE TABLE`. Releases from 2.1.0 refuse that text, and the open skipped the table, so
+the table and its rows were missing with no message. The columns are now moved in front of the
+constraints when the stored text is read, `.dump` writes the reordered text, and the next checkpoint
+writes it back to the file. A table, index or trigger whose stored text still cannot be read now
+stops the open with a message that names it. The fixture `tests/interop/alter-after-constraint/` was
+written by 2.0.2.
+
+**`rtree_i32` stores 32 bit integers, and a table an earlier release wrote reads correctly.**
+Releases up to 2.8.1 stored `rtree_i32` cells as floats. A table made by this release records that
+it holds integers. A table without that record is read as floats and converted by its first write.
+A value an earlier release had already rounded, such as 16777217 stored as 16777216, stays rounded.
+
+**FTS5 matches SQLite's query language and scoring.** The query parser follows SQLite's grammar:
+`NOT` takes the phrases after it, nested column filters combine with the outer one, and the nesting
+limits and error messages are SQLite's. `bm25`, `highlight` and `snippet` count a phrase only in rows
+where its part of the query matched, and `NEAR` with three or more phrases is decided as SQLite
+decides it. `bm25` no longer reads the other rows to score one, so it went from 40.4 s to 0.1 s over
+20,000 rows in a debug build. The trigram tokenizer is built, with `case_sensitive` and
+`remove_diacritics`, and narrows `LIKE` and `GLOB`. FTS5, R*Tree and geopoly tables work in temp and
+attached databases. `unicode61` character classes, `categories`, `tokenchars` and `separators` follow
+SQLite's tables for every code point. External content tables read columns by name and honour a
+`content_rowid` that names an ordinary column. `INSERT OR ROLLBACK` on an FTS5 table no longer empties
+it.
+
+**Foreign keys.** A deferred foreign key fails a commit only when the transaction left more rows
+breaking it than there were before the transaction wrote a table the key involves, as in SQLite. A
+row that broke the key before, written while `foreign_keys` was off, no longer fails every later
+commit. Foreign key actions compare the child's stored value under the parent column's affinity,
+as SQLite's development version does (its `test/fkey8.test`), so a cascade no longer deletes a
+child whose value only matches after conversion. The pinned 3.53.4 still applies the child column's affinity.
+
+**Pragmas and lifecycle commands.** `PRAGMA query_only` refuses writes to virtual tables, `VACUUM`,
+`ANALYZE`, `REINDEX` and `user_version`. `ALTER TABLE ... DROP COLUMN` is refused while a quoted or
+non ASCII reference to the column remains. `PRAGMA data_version` counts other connections' commits,
+`schema_version` follows another connection's change and is kept per database, and `cache_size` and
+`synchronous` are per database. `integrity_check` reports rows that break a `CHECK` constraint.
+`VACUUM` keeps non ASCII names and `sqlite_stat1` and removes its temporary file when it fails. A
+collated index in a file an older release wrote is detected and rebuilt, in `main` and in attached
+files.
+
+**Speed.**
+- `CREATE INDEX`, `CREATE VIEW` and `CREATE TRIGGER` derive only the table they change: 800 tables
+  with an index, a view and a trigger each went from 6.0 s to 0.57 s.
+- Expression indexes answer ranges, `BETWEEN`, `IN`, `ORDER BY ... LIMIT`, `min()`, `max()` and
+  `GROUP BY`. Over 200,000 rows `min(json_extract(p,'$.k'))` went from 42 ms to 0.3 ms.
+- Sliding window aggregates are linear in the size of the frame.
+- Nested `json_each` over a column went from 14.5 s to 0.2 s.
+- A correlated subquery that is fed the same outer value again answers it once.
+- Rows of 800 or more integer columns share a leaf: 1,000 rows of 900 columns take 10.6 MiB, where
+  they took 31.4 MiB. SQLite takes 3.9 MiB.
+
+**Queries.** A `LIMIT` reaches a recursive CTE read through a view, a derived table or a chain of
+CTEs, so a view over an unbounded recursion read with `LIMIT 5` returns five rows. A CTE inside a
+view no longer collides with the query that reads the view. A sort above a window pass reads rows
+larger than its buffer. Constant `WHERE` terms stop at the first false one. A `FROM` list past 200
+terms and a join of more than 64 tables are refused with SQLite's messages. An aggregate of an outer
+query held only by an unread column of a `UNION ALL` subquery is dropped, as SQLite drops it.
+
+**Dates, numbers and text.** On Windows `localtime` and `utc` use the current rules of the time zone
+for years before 2007 and after 2037. `printf` flags, `subsec` rounding, date modifiers with two
+signs, `log()` of text and blobs, and `unistr_quote` of a NUL match SQLite. The shell prints
+`char(1114111)` as UTF-8.
+
+**Language packages.** A deeply nested statement is refused for want of stack where it overflowed
+the stack. The Node package refuses several statements in one call and accepts a script that holds
+its own `BEGIN`. A missing parameter value is refused with `Incorrect number of bindings supplied`.
+A closed Python connection ends its statements.
+
+**Migration.** `inillucent migrate` reads a short record's missing columns as their defaults, stores
+the full key of a `WITHOUT ROWID` index, keeps the order of triggers, rebuilds an external content
+FTS5 table from its owner, carries R*Tree tables, and accepts a zero byte file.
+
+**Known limits.** An FTS5 query with three levels of nested `AND`, `OR`, `NOT` and `NEAR` still gives a
+different `bm25` or highlight from SQLite in about 2 to 4 of 100 random queries. A table and an index
+each take at least one 32 KiB page, so 3,000 tables with one index each take 197 MB where SQLite
+takes 25 MB.
+
 ## 2.8.1, 17 October 2026
 
 **`UNION ALL` with `OFFSET` no longer evaluates the select list of the rows it skips.** SQLite hands
