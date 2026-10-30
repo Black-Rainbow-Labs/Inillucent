@@ -120,6 +120,11 @@ impl ImportedDatabase {
         // pragma_table_info('t')` are the same question; if they were two
         // implementations they would eventually be two answers, and the one
         // nobody tested would be the wrong one.
+        // **`optimize` writes, so it is answered here and not by the `&self` reader.** The
+        // `pragma_optimize` function form stays a reader and answers no rows.
+        if name == b"optimize" {
+            return self.pragma_optimize(argument, at);
+        }
         if let Some(outcome) = self.pragma_rows_of(name, argument, at)? {
             return Ok(outcome);
         }

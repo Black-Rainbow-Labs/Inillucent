@@ -260,3 +260,47 @@ select count(*) from pragma_table_info where arg='t' and name='a';
 select name from pragma_table_info where arg in ('t', 'x', 't');
 create table u(p,q);
 select arg, name from pragma_table_info where arg='u' or arg='t' order by arg, name;
+-- case: bug-hunt-11/pragma/D11-optimize-debug-default-and-all-tables
+create table t(a, b);
+create index i on t(a);
+create table n(x);
+create table w(a primary key, b) without rowid;
+insert into t select value, value from generate_series(1,2000);
+insert into n select value from generate_series(1,50);
+insert into w select value, 1 from generate_series(1,30);
+select 'dbg'; pragma optimize(0x10003);
+select 'default'; pragma optimize;
+select count(*) from sqlite_master where name='sqlite_stat1';
+select 'debug-default'; pragma optimize(1);
+select 'q'; select count(*) from t where a=5;
+select 'debug-after-use'; pragma optimize(3);
+select 'run-after-use'; pragma optimize;
+select * from sqlite_stat1 order by 1,2;
+select 'debug-again'; pragma optimize(0x10003);
+insert into t select value, value from generate_series(2001,60000);
+-- case: bug-hunt-11/pragma/D11-optimize-reanalyzes-a-table-that-grew-25-times
+create table t(a, b);
+create index i on t(a);
+insert into t select value, value from generate_series(1,100);
+pragma optimize;
+select * from sqlite_stat1;
+insert into t select value, value from generate_series(101,2000);
+pragma optimize(3);
+pragma optimize;
+select * from sqlite_stat1;
+-- case: bug-hunt-11/pragma/D11-optimize-mask-without-the-analyze-bit-does-nothing
+create table t(a, b);
+create index i on t(a);
+insert into t values(1,2);
+pragma optimize(1);
+pragma optimize(0);
+pragma optimize(0x10000);
+select count(*) from sqlite_master where name='sqlite_stat1';
+-- case: bug-hunt-11/pragma/D11-optimize-under-query-only
+create table t(a, b);
+create index i on t(a);
+insert into t values(1,2);
+pragma query_only=1;
+pragma optimize(3);
+pragma optimize;
+select count(*) from sqlite_master where name='sqlite_stat1';

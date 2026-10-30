@@ -31,7 +31,127 @@ use super::{ImportedDatabase, Outcome, WalLog};
 /// The name statistics live under, which is SQLite's.
 const STAT1: &[u8] = b"sqlite_stat1";
 
+/// The mask `PRAGMA optimize` uses when it is given none, which is SQLite's: every bit but the
+/// lowest.
+const DEFAULT_OPTIMIZE_MASK: i64 = 0xfffe;
+/// The bit that makes `PRAGMA optimize` report what it would do and do nothing.
+const OPTIMIZE_DEBUG: i64 = 0x01;
+/// The bit that lets `PRAGMA optimize` run `ANALYZE`.
+const OPTIMIZE_ANALYZE: i64 = 0x02;
+/// The bit that makes `PRAGMA optimize` look at every table and not only those SQLite expects to
+/// benefit.
+const OPTIMIZE_EVERY_TABLE: i64 = 0x10000;
+/// A table is analysed again when it has grown to this many times the rows its statistics counted.
+const REANALYZE_FACTOR: i64 = 25;
+
 impl ImportedDatabase {
+    /// Runs `PRAGMA optimize`: `ANALYZE` on the tables that need it.
+    ///
+    /// **The rules are SQLite's `PragTyp_OPTIMIZE`.** A table needs `ANALYZE` when one of its
+    /// indexes has no row in `sqlite_stat1`, or when it has grown to 25 times the rows the
+    /// statistics counted, and a table with no index needs it when it has no statistics at all.
+    /// Without the `0x10000` bit only a table with an index is looked at, which is what SQLite
+    /// does in practice because it looks at the tables a query could have used statistics for. An
+    /// empty table is left alone. Tables are visited newest first, and `temp` is skipped. The
+    /// `0x01` bit reports each `ANALYZE` as a row of text and runs none. The `0x02` bit is what
+    /// permits any of it, so `PRAGMA optimize(1)` does nothing.
+    ///
+    /// @param argument - the mask, when one was given
+    /// @param at - the database the pragma was qualified with, when it was
+    pub(crate) fn pragma_optimize(
+        &mut self,
+        argument: Option<&inillucent_sql::directive::PragmaArgument>,
+        at: Option<usize>,
+    ) -> DbResult<Outcome> {
+        let mask = argument.map_or(DEFAULT_OPTIMIZE_MASK, inillucent_sql::declare::argument_integer);
+        let mut targets: Vec<(usize, Vec<u8>)> = Vec::new();
+        if mask & OPTIMIZE_ANALYZE != 0 {
+            targets = self.tables_to_optimize(mask, at)?;
+        }
+        let mut rows: Vec<Vec<OwnedDatum>> = Vec::new();
+        if mask & OPTIMIZE_DEBUG != 0 {
+            for (database, name) in &targets {
+                let schema = inillucent_sql::catalog_view::CatalogView::database_name(
+                    &self.schema.catalog,
+                    *database,
+                );
+                let quote = |text: &[u8]| String::from_utf8_lossy(text).replace('"', "\"\"");
+                rows.push(vec![OwnedDatum::Text(
+                    format!("ANALYZE \"{}\".\"{}\"", quote(schema), quote(name)).into_bytes(),
+                )]);
+            }
+        } else if !targets.is_empty() {
+            if self.pragmas.query_only() {
+                return Err(crate::ddl::query_only_refusal());
+            }
+            for (database, name) in &targets {
+                let previous = self.schema.ddl_schema;
+                self.schema.ddl_schema = *database;
+                let analysed = self.analyze(Some(name), false);
+                self.schema.ddl_schema = previous;
+                analysed?;
+            }
+        }
+        Ok(Outcome {
+            rows,
+            names: std::rc::Rc::new(vec!["optimize".to_string()]),
+            changes: Default::default(),
+        })
+    }
+
+    /// Returns the tables `PRAGMA optimize` would run `ANALYZE` on, newest first.
+    ///
+    /// @param mask - the bits `PRAGMA optimize` was given
+    /// @param at - the database the pragma was qualified with, when it was
+    fn tables_to_optimize(&self, mask: i64, at: Option<usize>) -> DbResult<Vec<(usize, Vec<u8>)>> {
+        let databases: Vec<usize> = match at {
+            Some(database) => vec![database],
+            None => self
+                .schema_numbers()
+                .into_iter()
+                .filter(|database| *database != crate::TEMP)
+                .collect(),
+        };
+        let mut found = Vec::new();
+        for database in databases {
+            let tables: Vec<&TableInfo> = self
+                .schema
+                .tables
+                .iter()
+                .filter(|held| held.database == database)
+                .filter(|held| !held.folded.starts_with(b"sqlite_"))
+                .filter(|held| held.kind == inillucent_sql::catalog_view::TableKind::Table)
+                .filter(|held| held.module.is_none())
+                .collect();
+            for table in tables.into_iter().rev() {
+                if (mask & OPTIMIZE_EVERY_TABLE == 0 && table.indexes.is_empty())
+                    || !self.would_benefit_from_analyze(table)?
+                {
+                    continue;
+                }
+                found.push((database, table.name.clone()));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Reports whether a table is empty of statistics or has outgrown them.
+    ///
+    /// @param table - the table
+    fn would_benefit_from_analyze(&self, table: &TableInfo) -> DbResult<bool> {
+        let rows = self.live_rows(table.root)?;
+        if rows == 0 {
+            return Ok(false);
+        }
+        if table.indexes.iter().any(|index| index.prefix_rows.is_empty()) {
+            return Ok(true);
+        }
+        let Some(counted) = table.analysed_rows else {
+            return Ok(table.indexes.is_empty());
+        };
+        Ok(rows >= counted.max(1).saturating_mul(REANALYZE_FACTOR))
+    }
+
     /// Runs an `ANALYZE` directive.
     ///
     /// Its own function so `run_directive`'s arm stays one line.
