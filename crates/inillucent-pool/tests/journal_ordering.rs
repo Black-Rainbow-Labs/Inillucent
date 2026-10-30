@@ -586,6 +586,61 @@ fn a_fold_that_reached_only_the_shadow_slot_is_seen() {
     reader.end_access().expect("the reader lets it go");
 }
 
+/// A connection that read a fold's meta record sees the file change when a journal then undoes
+/// that fold.
+///
+/// **The fold that dies between writing its meta record and deleting its journal.** The journal
+/// holds the previous meta record, so a process that finds it puts back the old pages and the old
+/// record together. A process that started in the window between the two had already read the
+/// fold's record, before it took a lock, and it compares generations on its first statement. The
+/// restore announced the generation of the record it put back plus one, which is the generation
+/// the fold had written, so the comparison found nothing changed and the process kept the fold's
+/// checkpoint position over pages the restore had taken back. The process storm with a 64 page
+/// pool, with kills four times as often as the nightly run, failed this way in 3 of about 35 runs: a replay that started at the dead fold's checkpoint
+/// reached an insert into a page that was a blob extent again (`page is not a leaf`), and a
+/// reader saw a transfer in part.
+///
+/// The crash is armed on the first delete, which is the journal's, so the file holds the fold's
+/// pages, the fold's record and the hot journal, exactly as a writer killed there leaves it.
+#[test]
+fn a_connection_that_read_a_finished_fold_sees_the_journal_undo_it() {
+    let vfs = built(67);
+    let mut writer = opened(&vfs, true);
+    vfs.failpoints()
+        .set(Site::Delete, Policy::Nth(1, Failure::Crash));
+    for page in TARGETS {
+        writer
+            .install(page, &image(AFTER))
+            .expect("the page installs");
+    }
+    let _ = writer.checkpoint();
+    let snapshot = vfs.crash();
+    drop(writer);
+
+    let after = Arc::new(SimVfs::recovered(SimConfig::default(), &snapshot));
+    let mut reader = Database::open(after.as_ref(), &path(), 16).expect("the reader opens");
+    reader.end_access().expect("the reader lets the lock go");
+    let seen = reader.generation();
+
+    assert!(
+        inillucent_pool::journal::replay_hot_journal(after.as_ref(), &path())
+            .expect("the journal replays"),
+        "the dead fold left no hot journal, so the file this test needs was not made"
+    );
+    assert!(
+        reader
+            .begin_read()
+            .expect("the reader takes the lock after the restore"),
+        "a journal undid the fold the reader had read and the reader kept its generation {seen}"
+    );
+    assert!(
+        reader.generation() > seen,
+        "the reader saw the restore but kept generation {}, the one it had before it",
+        reader.generation()
+    );
+    reader.end_access().expect("the reader lets it go");
+}
+
 /// A checkpoint under a rollback journal writes the meta record into each slot,
 /// not the slot's whole page, and the file reopens on the record it wrote.
 ///

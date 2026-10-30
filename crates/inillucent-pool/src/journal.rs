@@ -1048,6 +1048,11 @@ pub fn replay_hot_journal_holding(
         return Ok(false);
     }
     let _held = hold(log_sequence_named_by(target.as_ref(), page_size))?;
+    // **Read before the first page goes back.** The journal's meta pre-images are about to
+    // replace whatever record the file holds now, and that record can be a newer one than
+    // theirs: a fold that wrote its record and died before it deleted this journal. See
+    // `announce_the_restore`.
+    let generation_before = generation_on_disk(target.as_ref(), page_size);
     let mut record = vec![0u8; page_size.saturating_add(RECORD_PREFIX)];
     let mut restored = 0usize;
     for index in 0..count {
@@ -1074,7 +1079,7 @@ pub fn replay_hot_journal_holding(
         .sync(SyncMode::Full)
         .map_err(|error| error.into_db_error())?;
     if restored > 0 {
-        announce_the_restore(target.as_ref(), page_size)?;
+        announce_the_restore(target.as_ref(), page_size, generation_before)?;
     }
     // Released before the journal goes, not after: a process waiting on this
     // same EXCLUSIVE request is waiting to do its own work, not to see this
@@ -1136,9 +1141,29 @@ fn log_sequence_named_by(target: &dyn VfsFile, page_size: usize) -> u64 {
 /// before the primary, the order a fold uses, so one slot holds a whole record
 /// at every moment and `Meta::choose` takes the newer of the two.
 ///
+/// **The new generation is above the one the file held before the restore, and
+/// not only above the one the restore put back.** A fold writes its meta record
+/// before it deletes its journal, and the journal holds the previous meta record,
+/// so a fold that died between the two leaves a finished fold and a journal that
+/// undoes it. The restore then puts back the previous record, whose generation is
+/// one below the fold's, and one added to that is the fold's own generation again.
+/// A connection that read the fold's record, which a process starting in that
+/// window does before it takes a lock, compares generations on its first
+/// statement, finds the same number and keeps the fold's checkpoint position over
+/// pages the restore has taken back. The process storm with a 64 page pool
+/// measured it: a replay that began at the dead fold's checkpoint reached an
+/// insert into a page the restore had put back as a blob extent, and failed with
+/// `page is not a leaf`; another run read a transfer in part.
+///
 /// @param target - the database file, held EXCLUSIVE by the caller
 /// @param page_size - the page size the journal was written at
-fn announce_the_restore(target: &dyn VfsFile, page_size: usize) -> DbResult<()> {
+/// @param generation_before - the generation the file's meta record held before any page
+///   was put back, or zero when none decoded
+fn announce_the_restore(
+    target: &dyn VfsFile,
+    page_size: usize,
+    generation_before: u64,
+) -> DbResult<()> {
     let mut primary = vec![0u8; page_size];
     let mut shadow = vec![0u8; page_size];
     target
@@ -1153,7 +1178,7 @@ fn announce_the_restore(target: &dyn VfsFile, page_size: usize) -> DbResult<()> 
     let Ok(mut meta) = crate::meta::Meta::choose(&primary, &shadow) else {
         return Ok(());
     };
-    meta.generation = meta.generation.saturating_add(1);
+    meta.generation = meta.generation.max(generation_before).saturating_add(1);
     let mut image = vec![0u8; page_size];
     meta.encode(&mut image)?;
     for slot in [crate::meta::SHADOW_PAGE, crate::meta::META_PAGE] {
@@ -1165,6 +1190,22 @@ fn announce_the_restore(target: &dyn VfsFile, page_size: usize) -> DbResult<()> 
             .map_err(|error| error.into_db_error())?;
     }
     Ok(())
+}
+
+/// Returns the generation of the meta record the file holds, or zero when neither slot
+/// decodes.
+///
+/// @param target - the database file, held EXCLUSIVE by the caller
+/// @param page_size - the page size the journal was written at
+fn generation_on_disk(target: &dyn VfsFile, page_size: usize) -> u64 {
+    let mut primary = vec![0u8; page_size];
+    let mut shadow = vec![0u8; page_size];
+    if target.read_exact_at(0, &mut primary).is_err()
+        || target.read_exact_at(page_size as u64, &mut shadow).is_err()
+    {
+        return 0;
+    }
+    crate::meta::Meta::choose(&primary, &shadow).map_or(0, |meta| meta.generation)
 }
 
 /// Reads a little-endian `u32`, answering zero for a slice that is too short.

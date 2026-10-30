@@ -90,6 +90,17 @@ A closed Python connection ends its statements.
 the full key of a `WITHOUT ROWID` index, keeps the order of triggers, rebuilds an external content
 FTS5 table from its owner, carries R*Tree tables, and accepts a zero byte file.
 
+**A process that starts while a killed fold's journal is on disk replays the log from the right place.**
+A fold writes its meta record and then deletes its rollback journal, and the journal holds the previous
+meta record. A writer killed between the two leaves a finished fold and a journal that undoes it. The next
+process to find the journal put back the old pages and the old meta record, and announced the old
+record's generation plus one, which is the generation the killed fold had written. A process that had
+already read the killed fold's record compared the two numbers, found them equal, and replayed the log
+from the killed fold's checkpoint over the old pages. It failed with `page is not a leaf`, or a reader saw
+half of a transfer. The restore now announces a generation above the one the file held before it began.
+The nightly storm on an encrypted file with a 64 page pool, with kills four times as often as the nightly
+run makes them, failed in 3 of about 35 runs before the change and in none of 72 after.
+
 **Known limits.** An FTS5 query with three levels of nested `AND`, `OR`, `NOT` and `NEAR` still gives a
 different `bm25` or highlight from SQLite in about 2 to 4 of 100 random queries. A table and an index
 each take at least one 32 KiB page, so 3,000 tables with one index each take 197 MB where SQLite
