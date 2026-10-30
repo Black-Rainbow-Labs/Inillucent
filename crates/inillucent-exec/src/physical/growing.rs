@@ -93,13 +93,36 @@ pub(crate) fn can_grow(plan: &PhysicalPlan) -> bool {
             .all(inillucent_sql::plan::is_repeatable_condition)
 }
 
-/// Reports whether a plan reads a recursive CTE, at any depth of derived tables.
+/// Reports whether a plan reads a recursive CTE, at any depth of derived tables, and every
+/// recursion it reads would produce the same rows if it were run again.
+///
+/// A recursion whose arms call `random()` or a registered function would give a second run
+/// different rows from the first, so the rows already sent would not be the first rows of the
+/// run that follows.
 ///
 /// @param plan - the plan
 fn reads_a_recursion(plan: &PhysicalPlan) -> bool {
     plan.sources.iter().any(|source| match &source.path {
-        AccessPath::Recursive { .. } => true,
+        AccessPath::Recursive { seeds, steps, .. } => seeds
+            .iter()
+            .chain(steps.iter())
+            .all(|(_op, arm)| arm_repeats(arm)),
         AccessPath::Subquery { plan, .. } => reads_a_recursion(plan),
         _ => false,
     })
+}
+
+/// Reports whether one arm of a recursion produces the same rows each time it is run.
+///
+/// @param arm - the arm's plan
+fn arm_repeats(arm: &PhysicalPlan) -> bool {
+    arm.select
+        .columns
+        .iter()
+        .all(|column| inillucent_sql::plan::is_repeatable_condition(&column.expr))
+        && arm
+            .select
+            .filter
+            .iter()
+            .all(inillucent_sql::plan::is_repeatable_condition)
 }
