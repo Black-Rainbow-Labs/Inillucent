@@ -5,7 +5,7 @@
 //! NULL rather than as another column's value.
 
 use super::options::parse_options;
-use super::ColumnSpec;
+use super::options::ColumnSpec;
 use inillucent_sql::vtab::ModuleArguments;
 
 /// Returns the owner of an external content table and the query that reads its rows.

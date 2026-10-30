@@ -99,26 +99,6 @@ pub(super) fn narrowed(
     Some(narrowing.map(|query| (format!("c{column}"), query.into_bytes())))
 }
 
-/// Reports whether every constraint of a plan is a `LIKE` or `GLOB` that has no piece to narrow
-/// by, so that every row of the table is a candidate.
-///
-/// @param plan - the plan `best_index` chose and the values it was given
-pub(super) fn narrows_nothing(plan: &super::super::FilterPlan) -> bool {
-    let roles: Vec<&str> = plan.index_string.split(',').collect();
-    let mut patterns = 0usize;
-    for (position, argument) in plan.arguments.iter().enumerate() {
-        let role = roles.get(position).copied().unwrap_or("t");
-        if role == "r" {
-            continue;
-        }
-        match narrowed(role, argument) {
-            Some(None) => patterns = patterns.saturating_add(1),
-            _ => return false,
-        }
-    }
-    patterns > 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

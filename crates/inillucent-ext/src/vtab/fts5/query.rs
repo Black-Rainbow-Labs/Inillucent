@@ -58,8 +58,6 @@ pub(crate) struct Fts5Cursor {
     pub(crate) external: Option<Vec<u8>>,
     /// The column names, for a `column:term` filter to resolve against.
     pub(crate) names: Vec<Vec<u8>>,
-    /// Which columns are `UNINDEXED`, whose text is stored and never searched or marked.
-    pub(crate) unindexed: Vec<bool>,
     /// The schema the table is in, which a refusal about its content table names.
     pub(crate) schema: Vec<u8>,
     pub(crate) match_column: i32,
@@ -606,7 +604,7 @@ impl Fts5Cursor {
     /// A contentless table has no owner, so `%_docsize` has the rows.
     ///
     /// @param context - the running statement
-    fn scan_every_row(&mut self, context: &mut Context<'_>) -> DbResult<()> {
+    pub(super) fn scan_every_row(&mut self, context: &mut Context<'_>) -> DbResult<()> {
         let reads_owner = self.external.is_some();
         let suffix: &[u8] = if reads_owner {
             b""

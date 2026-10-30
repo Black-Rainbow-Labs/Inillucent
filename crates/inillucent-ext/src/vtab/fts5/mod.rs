@@ -706,12 +706,6 @@ impl VirtualTable for Fts5Table {
                 .iter()
                 .map(|column| column.name.clone())
                 .collect(),
-            unindexed: self
-                .options
-                .columns
-                .iter()
-                .map(|column| column.unindexed)
-                .collect(),
             schema: self.schema.clone(),
             match_column: self.match_column(),
             rank_column: self.rank_column(),
