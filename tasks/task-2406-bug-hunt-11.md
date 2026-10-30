@@ -118,7 +118,7 @@ and code was moved to new modules (`bind/small.rs`, `ddl/helpers.rs`, `fts5/cont
 
 ### 4.4 Lanes after the first round
 
-Three more lanes ran after the first twelve were merged, for what the first round left open. The last two rows were found by CI and by the nightly tier after the merge to main.
+Three more lanes ran after the first twelve were merged, for what the first round left open. The last three rows were found by CI and by the nightly tier after the merge to main.
 
 | Lane | Defect | Cause and fix | Test |
 |---|---|---|---|
@@ -128,6 +128,7 @@ Three more lanes ran after the first twelve were merged, for what the first roun
 | widerows | a row of 800 or more integer columns took a 32 KiB leaf of its own | a leaf with several delta rows and no sorted rows is an ordinary leaf, so the builder now puts as many wide rows in one delta area as fit, and an append that splits a full leaf of a wide table keeps its rows on the left. No format change. 1,000 rows of 900 columns: 31.4 MiB to 10.6 MiB (SQLite 3.9 MiB) | `inillucent-tree::wide_rows`, `bug-hunt-11-widerows.sql`, the 63 durability suites |
 | CI | the C library's conformance program, built with the address sanitizer on Linux, had its first open refused with `too_big` | the stack guard from the bindings lane took the address of a local as the stack pointer, and the sanitizer keeps such a local on a fake stack in the heap. `stack::room` now reports no limit when that address is outside the thread's stack bounds | `inillucent-driver-capi::conformance` on Linux |
 | research | the nightly `research_corpus` found three new differences: `+c0` read NULL beside `c0` when an index on `(+c0, c0)` exists, a `UNIQUE` index on a virtual generated column took a duplicate after `REINDEX`, and `integrity_check` failed with `integer overflow` on an empty table whose `CHECK` overflows | a stage that reads an expression from an index entry did not decode that entry's column when the statement also read the plain column, so both the read and the duplicate check saw NULL; `integrity_check` now evaluates no `CHECK` on a table with no rows, as SQLite evaluates it once per row | `bug-hunt-11-research.sql`, 18 cases; `nightly::research_corpus` |
+| storm | in the nightly tier, one run of the encrypted storm with a 64 page pool had a reader fail at `BEGIN` with `page is not a leaf` while replaying an `InsertRows` record | older than this branch, and found on the baseline as well. A writer killed between a fold's meta record and the delete of its rollback journal leaves a journal that undoes the fold. The restore announced the old record's generation plus one, which equals the killed fold's generation, so a process that had read the fold's record did not reload and replayed the log from the dead fold's checkpoint over the restored pages. The restore now announces a generation above the one on disk before it began. With kills four times as often: 3 failures in about 35 storms before, none in 72 after; the baseline failed 2 in 42 | `inillucent-pool::journal_ordering::a_connection_that_read_a_finished_fold_sees_the_journal_undo_it` |
 
 ## 5. Found and not changed
 
