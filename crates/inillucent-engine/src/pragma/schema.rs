@@ -169,7 +169,11 @@ impl crate::ImportedDatabase {
         if extended {
             names.push("hidden".to_string());
         }
-        let Some(table) = self.named_table(argument, at) else {
+        let filling = self.pragmas.table_being_filled();
+        let Some(table) = self
+            .named_table(argument, at)
+            .filter(|table| filling.as_deref() != Some(table.folded.as_slice()))
+        else {
             return Ok(Outcome {
                 rows: Vec::new(),
                 names: std::rc::Rc::new(names),

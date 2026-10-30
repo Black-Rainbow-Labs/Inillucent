@@ -160,6 +160,12 @@ pub(crate) struct Pragmas {
     /// than an engine that refused the pragma outright.
     query_only: std::cell::Cell<bool>,
 
+    /// The folded name of the table a `CREATE TABLE ... AS SELECT` is filling, while it does.
+    ///
+    /// SQLite has not given that table its columns yet while the query runs, so
+    /// `pragma_table_info` of it answers nothing, and its row in `sqlite_schema` is there.
+    table_being_filled: std::cell::RefCell<Option<Vec<u8>>>,
+
     /// What `PRAGMA data_version` reports: one more every time this connection
     /// finds that another connection has committed to the file.
     data_version: std::cell::Cell<u64>,
@@ -385,6 +391,18 @@ impl Pragmas {
         self.query_only.set(value);
     }
 
+    /// Returns the folded name of the table a `CREATE TABLE ... AS SELECT` is filling.
+    pub(crate) fn table_being_filled(&self) -> Option<Vec<u8>> {
+        self.table_being_filled.borrow().clone()
+    }
+
+    /// Records which table a `CREATE TABLE ... AS SELECT` is filling, or that none is.
+    ///
+    /// @param folded - the table's folded name, or nothing when the fill is over
+    pub(crate) fn set_table_being_filled(&self, folded: Option<Vec<u8>>) {
+        *self.table_being_filled.borrow_mut() = folded;
+    }
+
     /// Returns what `PRAGMA data_version` reports.
     pub(crate) fn data_version(&self) -> u64 {
         self.data_version.get()
@@ -594,6 +612,7 @@ impl Pragmas {
             defensive: std::cell::Cell::new(false),
             query_only: std::cell::Cell::new(false),
             data_version: std::cell::Cell::new(1),
+            table_being_filled: std::cell::RefCell::new(None),
             recursive_triggers: std::cell::Cell::new(false),
             legacy_alter_table: std::cell::Cell::new(false),
             temp_store: std::cell::Cell::new(0),

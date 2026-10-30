@@ -235,16 +235,6 @@ impl crate::ImportedDatabase {
                 String::from_utf8_lossy(name)
             )));
         }
-        // **A query that reads the schema is run before the table exists.** The new table is in
-        // `sqlite_schema` and in `pragma_table_info` as soon as it is defined, so a copy of
-        // either read its own row and its own columns, which SQLite's does not. Such a query is
-        // small, so its rows are held and written afterwards; every other query is streamed into
-        // the table.
-        let select_text = String::from_utf8_lossy(select_sql).to_ascii_lowercase();
-        let held_rows = match select_text.contains("sqlite_") || select_text.contains("pragma_") {
-            true => Some(self.run(&String::from_utf8_lossy(select_sql))?.0),
-            false => None,
-        };
         self.define_table(name, create_sql)?;
         self.refresh_catalog();
         let schema = match database {
@@ -269,15 +259,15 @@ impl crate::ImportedDatabase {
         // before it. Running the fill as an `INSERT` set all three to the
         // copied rows.
         let held = self.counters.live();
-        if let Some(rows) = held_rows {
-            return self.fill_from_held_rows(&schema, name, rows, held);
-        }
         // **The values are stored as the query produced them.** SQLite does not
         // apply the new column's affinity on the way in, so a whole number
         // that is REAL stays REAL in a column whose derived type is NUM.
         let params = inillucent_exec::physical::Params::new();
         params.keep_supplied_types();
+        self.pragmas
+            .set_table_being_filled(Some(name.to_ascii_lowercase()));
         let filled = self.execute_any(&fill, &params);
+        self.pragmas.set_table_being_filled(None);
         self.counters.load(held);
         let outcome = filled?;
         self.seal()?;
@@ -287,47 +277,6 @@ impl crate::ImportedDatabase {
             changes: outcome.changes,
         })
     }
-    /// Writes rows a `CREATE TABLE ... AS SELECT` read before the table was made.
-    ///
-    /// @param schema - the database the table is in
-    /// @param name - the table's name
-    /// @param rows - the rows the query returned
-    /// @param counters - the connection's counters before the fill, put back afterwards
-    fn fill_from_held_rows(
-        &mut self,
-        schema: &[u8],
-        name: &[u8],
-        rows: Vec<Vec<inillucent_tree::datum::OwnedDatum>>,
-        counters: crate::session_changes::SessionCounters,
-    ) -> DbResult<Outcome> {
-        let mut written = Outcome::empty();
-        for row in rows {
-            let marks: Vec<String> = (1..=row.len()).map(|at| format!("?{at}")).collect();
-            let fill = format!(
-                "INSERT INTO \"{}\".\"{}\" VALUES ({})",
-                String::from_utf8_lossy(schema).replace('"', "\"\""),
-                String::from_utf8_lossy(name).replace('"', "\"\""),
-                marks.join(", ")
-            );
-            let params = inillucent_exec::physical::Params::from_values(row);
-            params.keep_supplied_types();
-            match self.execute_any(&fill, &params) {
-                Ok(outcome) => written = outcome,
-                Err(error) => {
-                    self.counters.load(counters);
-                    return Err(error);
-                }
-            }
-        }
-        self.counters.load(counters);
-        self.seal()?;
-        Ok(Outcome {
-            rows: Vec::new(),
-            names: std::rc::Rc::new(Vec::new()),
-            changes: written.changes,
-        })
-    }
-
     /// Builds a table's trees and records it, given its stored text.
     ///
     /// Shared by `CREATE TABLE` and by the `sqlite_stat1` that the first
