@@ -991,11 +991,16 @@ fn plan_block(select: BoundSelect, levers: Levers, in_compound: bool) -> Physica
     // is no longer the result's.
     let streamed_in_order = (grouped_walk && !select.distinct)
         || (distinct_walk && aggregation == AggregationMode::None);
+    // **A `DISTINCT` over a walk that already delivers the `ORDER BY` keeps the first row of each
+    // group in that order.** `SELECT DISTINCT active FROM u ORDER BY id DESC` reads the table
+    // backwards and drops repeats as they arrive, so the row that stands for a group is the one
+    // with the highest id. Sorting after the de-duplication kept the lowest id instead, and a
+    // group of `active` was ordered by a row SQLite did not pick.
     let single = levers.has(Levers::ORDERED_WALK)
         && sources.len() == 1
         && select.windows.is_empty()
         && select.compounds.is_empty()
-        && ((aggregation == AggregationMode::None && !select.distinct) || streamed_in_order);
+        && (aggregation == AggregationMode::None || streamed_in_order);
     let ordered_join = joined_in_order(&select, sources.len(), levers, aggregation);
     let provided = if single || ordered_join {
         sources

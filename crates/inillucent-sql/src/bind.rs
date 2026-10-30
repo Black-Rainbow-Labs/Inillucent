@@ -60,8 +60,8 @@ mod scratch;
 mod small;
 pub use small::block_over;
 use small::{
-    denied, no_such_window, short_circuit_constant, subquery_table, window_aggregate,
-    DISTRUSTED_SCHEMA_WORD,
+    denied, no_such_window, short_circuit_constant, source_answers_to, subquery_table,
+    window_aggregate, DISTRUSTED_SCHEMA_WORD,
 };
 mod set_rules;
 mod truth;
@@ -1402,6 +1402,20 @@ impl<'a> Binder<'a> {
     /// naming it.
     pub fn in_schema(mut self) -> Binder<'a> {
         self.call_site = function::CallSite::Schema;
+        self
+    }
+
+    /// Makes unqualified table names resolve in one schema, as a view's body does.
+    ///
+    /// **A view in `aux` reads the tables of `aux`**, even where `main` or `temp` has a table
+    /// of the same name. Reading a view through a statement sets this while the body is bound;
+    /// a caller that binds a view's body on its own, to check it or to list its columns, has to
+    /// say where the view lives. A temporary view looks in the usual order, so the caller passes
+    /// `None` for it.
+    ///
+    /// @param database - the schema's name, or none to search in the usual order
+    pub fn in_database(mut self, database: Option<&[u8]>) -> Binder<'a> {
+        self.view_database = database.map(|name| name.to_ascii_lowercase());
         self
     }
 
@@ -2897,7 +2911,7 @@ impl<'a> Binder<'a> {
                         only = Some(inner);
                     }
                     None => {
-                        if !source.alias.eq_ignore_ascii_case(qualifier) {
+                        if !source_answers_to(source, qualifier) {
                             continue;
                         }
                     }
@@ -3898,7 +3912,7 @@ impl<'a> Binder<'a> {
                     }
                 }
                 if let Some(qualifier) = table_folded.as_deref() {
-                    if !source.alias.eq_ignore_ascii_case(qualifier) {
+                    if !source_answers_to(source, qualifier) {
                         continue;
                     }
                 }

@@ -656,7 +656,7 @@ impl ImportedDatabase {
     ///
     /// @param sql - the statement text
     fn refuse_a_write_on_a_read_only_file(&self, sql: &str) -> DbResult<()> {
-        if !self.storage.read_only || !crate::readonly::writes_the_file(sql) {
+        if !self.storage.read_only || !crate::readonly::refused_before_binding(sql) {
             return Ok(());
         }
         Err(

@@ -178,12 +178,17 @@ impl Binder<'_> {
             Some(Expr::Collate { operand, .. }) => *operand,
             _ => key.expr,
         };
-        let Some(Expr::Column {
-            table: None,
-            column,
-            ..
-        }) = self.ast.expr(operand)
-        else {
+        // `true` and `false` are identifiers: with a column of that name they name the column.
+        let column_word = match self.ast.expr(operand) {
+            Some(Expr::Column {
+                table: None,
+                column,
+                ..
+            }) => Some(*column),
+            Some(Expr::Literal(crate::ast::Literal::Boolean(_, name))) => Some(*name),
+            _ => None,
+        };
+        let Some(column) = column_word.as_ref() else {
             return Err(refused(
                 "expressions prohibited in PRIMARY KEY and UNIQUE constraints",
                 Span::default(),

@@ -246,14 +246,26 @@ impl crate::ImportedDatabase {
                 return Err(schema_moved());
             }
         }
-        let reads = self.session_state.nesting.get() == 0 && opens_a_transaction(cached);
+        let outermost = self.session_state.nesting.get() == 0;
+        let reads = outermost && opens_a_transaction(cached);
         self.session_state
             .nesting
             .set(self.session_state.nesting.get().saturating_add(1));
-        let outcome = self.apply_compiled(cached, params);
+        // **Measured before the statement writes anything**, and inside the nesting count so
+        // the queries it runs are not taken for outermost statements. See `key_baselines`.
+        let outcome = match outermost {
+            true => self
+                .record_key_baselines(cached)
+                .and_then(|()| self.apply_compiled(cached, params)),
+            false => self.apply_compiled(cached, params),
+        };
         self.session_state
             .nesting
             .set(self.session_state.nesting.get().saturating_sub(1));
+        // An autocommit statement is its own transaction, so what it measured ends with it.
+        if outermost && self.writing.batch().is_none() {
+            self.clear_key_baselines();
+        }
         if reads && self.writing.batch().is_none() {
             self.clear_defer_foreign_keys();
         }
@@ -692,6 +704,7 @@ impl crate::ImportedDatabase {
             .with_message("attempt to write a readonly database")
             .with_detail("attempt to write a readonly database"));
         }
+        self.refuse_a_read_only_write(cached)?;
         match &**cached {
             // **Borrowed, not cloned.** `cached` is an `Rc` the caller already
             // holds, so the statement outlives anything this does to `self` -
@@ -820,6 +833,33 @@ impl crate::ImportedDatabase {
                     |target, params| dml::delete(statement, target, params, &keys),
                 )
             }
+        }
+    }
+
+    /// Refuses an `INSERT`, `UPDATE` or `DELETE` of a file on a connection that opened it read only.
+    ///
+    /// A table in the temporary schema may be written, as under `sqlite3 -readonly`. A write
+    /// to a table of `main` or of an attached file is refused with SQLite's message, before
+    /// any row is written.
+    ///
+    /// @param cached - the compiled statement
+    fn refuse_a_read_only_write(&self, cached: &Cached) -> DbResult<()> {
+        if !self.storage.read_only && !self.pragmas.files_read_only() {
+            return Ok(());
+        }
+        let database = match cached {
+            Cached::Insert(statement, ..) => statement.table.database,
+            Cached::Update(statement, ..) => statement.table.database,
+            Cached::Delete(statement, ..) => statement.table.database,
+            Cached::VirtualInsert(..)
+            | Cached::SchemaInsert(_)
+            | Cached::VirtualDelete(..)
+            | Cached::VirtualUpdate(..) => crate::MAIN,
+            _ => return Ok(()),
+        };
+        match database == crate::TEMP {
+            true => Ok(()),
+            false => Err(crate::ddl::query_only_refusal()),
         }
     }
 

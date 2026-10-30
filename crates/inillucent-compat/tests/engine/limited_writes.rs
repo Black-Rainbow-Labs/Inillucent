@@ -309,3 +309,30 @@ fn a_limited_delete_on_a_view_fires_its_trigger_for_the_kept_rows_only() {
     );
     assert_eq!(ids(&mut database), "1,2,4");
 }
+
+/// `RETURNING` written after `ORDER BY ... LIMIT` is read, and returns the rows that were deleted.
+#[test]
+fn a_limited_delete_may_end_with_returning() {
+    let mut database = five_rows("delete-returning");
+    let returned = rows(
+        &mut database,
+        "DELETE FROM t ORDER BY a DESC, id LIMIT 2 RETURNING id",
+    );
+    assert_eq!(
+        returned,
+        vec![vec![OwnedDatum::Int(5)], vec![OwnedDatum::Int(3)]],
+        "the two largest rows come back, in the order they were deleted"
+    );
+    assert_eq!(ids(&mut database), "1,2,4");
+}
+
+/// `RETURNING` after `ORDER BY ... LIMIT` works on an `UPDATE` too.
+#[test]
+fn a_limited_update_may_end_with_returning() {
+    let mut database = five_rows("update-returning");
+    let returned = rows(
+        &mut database,
+        "UPDATE t SET a = 0 ORDER BY id LIMIT 1 RETURNING id, a",
+    );
+    assert_eq!(returned, vec![vec![OwnedDatum::Int(1), OwnedDatum::Int(0)]]);
+}

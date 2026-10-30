@@ -38,7 +38,7 @@
 use inillucent_base::limits::Limits;
 use inillucent_base::{error, DbError, DbResult};
 use inillucent_sql::ast::{
-    ColumnConstraint, CreateTableBody, Expr, IndexedColumn, ReferentialAction, Statement,
+    ColumnConstraint, CreateTableBody, Expr, IndexedColumn, Literal, ReferentialAction, Statement,
     TableConstraint,
 };
 use inillucent_sql::catalog_view::{
@@ -918,6 +918,8 @@ fn declares_autoincrement(
 fn bare_column_name(ast: &Ast, key: &IndexedColumn) -> Option<Vec<u8>> {
     match key_expression(ast, key).0 {
         Some(Expr::Column { column, .. }) => Some(ast.folded(*column).to_vec()),
+        // `true` and `false` name a column of that name.
+        Some(Expr::Literal(Literal::Boolean(_, name))) => Some(ast.folded(*name).to_vec()),
         _ => None,
     }
 }
@@ -1354,6 +1356,9 @@ pub fn index_from_create_sql(sql: &[u8], table: &TableInfo, root: u32) -> DbResu
         };
         let column = match expr {
             Some(Expr::Column { column, .. }) => table.column_position(parsed.ast.folded(*column)),
+            Some(Expr::Literal(Literal::Boolean(_, name))) => {
+                table.column_position(parsed.ast.folded(*name))
+            }
             _ => None,
         };
         // **A `VIRTUAL` generated column is indexed as its expression.** It is

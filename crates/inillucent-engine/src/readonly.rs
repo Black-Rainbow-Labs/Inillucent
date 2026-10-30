@@ -189,6 +189,38 @@ pub fn writes_the_file(sql: &str) -> bool {
     }
 }
 
+/// Returns whether a read only connection can tell before binding that a statement is refused.
+///
+/// **A write to the temporary schema is allowed on a read only connection**, as SQLite does:
+/// `CREATE TEMP TABLE`, `INSERT INTO` a temporary table and `ATTACH ':memory:'` all run under
+/// `sqlite3 -readonly`. Whether an `INSERT` or a `CREATE INDEX` writes the file or only `temp`
+/// depends on the table it names, which the text does not say, so those statements are not
+/// refused here: the engine refuses them once they are bound, in
+/// `ImportedDatabase::refuse_a_read_only_directive` and `refuse_a_read_only_write`. This
+/// refuses the rest, which no binding can make acceptable: a pragma that sets a file field,
+/// and text that has no class.
+///
+/// @param sql - the statement, as the caller wrote it
+pub fn refused_before_binding(sql: &str) -> bool {
+    match classify_statement(sql.as_bytes()) {
+        StatementClass::Write | StatementClass::SchemaChange => false,
+        _ => writes_the_file(sql),
+    }
+}
+
+/// Returns whether the shell's read only filter refuses a statement before binding it.
+///
+/// The same as [`refused_before_binding`], except that a transaction statement is refused too,
+/// which is what [`admits`] does for the command surface.
+///
+/// @param sql - the statement, as the caller wrote it
+pub fn refused_before_binding_on_the_command_surface(sql: &str) -> bool {
+    match classify_statement(sql.as_bytes()) {
+        StatementClass::Write | StatementClass::SchemaChange => false,
+        _ => !admits(sql),
+    }
+}
+
 /// The pragmas that write even with no argument.
 ///
 /// **The three that are verbs rather than settings.** `PRAGMA optimize` runs

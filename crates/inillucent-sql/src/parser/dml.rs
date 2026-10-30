@@ -159,6 +159,7 @@ impl Parser<'_> {
             limited_at = Some((crate::ast::Limited::Limit, self.peek()?.span));
         }
         let (limit, offset) = self.parse_limit_clause()?;
+        let returning = self.parse_returning_after_limit(returning)?;
         Ok(Statement::Update(Box::new(Update {
             with,
             on_conflict,
@@ -199,6 +200,7 @@ impl Parser<'_> {
             limited_at = Some((crate::ast::Limited::Limit, self.peek()?.span));
         }
         let (limit, offset) = self.parse_limit_clause()?;
+        let returning = self.parse_returning_after_limit(returning)?;
         Ok(Statement::Delete(Box::new(Delete {
             with,
             target,
@@ -209,6 +211,24 @@ impl Parser<'_> {
             offset,
             limited_at,
         })))
+    }
+
+    /// Reads a `RETURNING` clause written after `ORDER BY ... LIMIT`, when none came before them.
+    ///
+    /// SQLite writes `RETURNING` before `ORDER BY` and `LIMIT`, and a build made with
+    /// `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` has no other place for it. This engine accepts
+    /// `ORDER BY ... LIMIT` on a `DELETE` or an `UPDATE` as an extension, so a statement that
+    /// ends with `RETURNING` after them is read as well rather than refused at the keyword.
+    ///
+    /// @param returning - the columns a `RETURNING` clause before `ORDER BY` named, if any
+    fn parse_returning_after_limit(
+        &mut self,
+        returning: Vec<crate::ast::ResultColumn>,
+    ) -> Result<Vec<crate::ast::ResultColumn>, ParseError> {
+        if !returning.is_empty() {
+            return Ok(returning);
+        }
+        self.parse_returning()
     }
 
     /// Parses a `SET` list, where a group of names is the row-value form.

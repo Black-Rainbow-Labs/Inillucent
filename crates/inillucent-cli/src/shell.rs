@@ -495,6 +495,12 @@ impl Shell {
         // A shell is a program that opens files it did not write, which is the
         // case the flag exists for.
         let _ = database.session_as(session).set_trusted_schema(false);
+        // The engine connection may be open for writing while the person asked for read only;
+        // see `open_one_following`. The engine then refuses writes to the files itself and
+        // lets the temporary schema be written, which a statement filter on the text cannot do.
+        if read_only {
+            let _ = database.session_as(session).set_files_read_only(true);
+        }
         Ok(Opened {
             database,
             session,
@@ -1792,7 +1798,7 @@ impl Shell {
     ///
     /// @param sql - the statement
     pub fn writes(&self, sql: &str) -> bool {
-        !inillucent_driver::readonly::admits(sql)
+        inillucent_driver::readonly::refused_before_binding_on_the_command_surface(sql)
     }
 
     /// Returns one column of one row, as text.

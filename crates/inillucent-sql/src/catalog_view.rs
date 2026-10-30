@@ -491,6 +491,11 @@ pub struct ForeignKeyTrigger {
     /// something writes, not when the schema is read, so that a schema can be
     /// loaded in any order. The message is kept here and reported then.
     pub fault: Vec<u8>,
+    /// The folded names of the columns of the written table that the key is made of.
+    ///
+    /// Read when `fault` is set: an `UPDATE` reports the fault only when it assigns one of
+    /// them, because SQLite looks for the key's index only when the key's columns change.
+    pub touched: Vec<Vec<u8>>,
     /// Whether the key's child table and its parent table are the same table.
     ///
     /// **Read by `DROP TABLE`'s implicit delete (task-1979, F6).** That delete

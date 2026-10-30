@@ -1895,6 +1895,18 @@ impl<'d> Connection<'d> {
         Ok(())
     }
 
+    /// Refuses writes to every file this connection has open, while the temporary schema stays
+    /// writable, as `sqlite3 -readonly` does.
+    ///
+    /// For a shell that opened the engine connection for writing so that it follows other
+    /// processes' commits, and was asked for read only.
+    ///
+    /// @param on - whether the files are read only
+    pub fn set_files_read_only(&self, on: bool) -> DbResult<()> {
+        self.engine_mut()?.pragmas.set_files_read_only(on);
+        Ok(())
+    }
+
     /// Sets whether a schema is trusted to call functions with side effects,
     /// as `PRAGMA trusted_schema` does, without compiling the pragma.
     ///

@@ -583,13 +583,24 @@ fn unknown_default_function(error: ParseError) -> ParseError {
 /// table: main.t1`, because it looks the parent up before it knows there is no
 /// row to remove (bug hunt 10). It was reported only for a delete from the
 /// parent's side.
+///
+/// **An `UPDATE` reports it only when it assigns a column of the key.** SQLite looks for the
+/// key's index when it compiles the part of the statement that checks the key, and leaves that
+/// out when no column of the key changes, so `UPDATE c SET w = 3` runs where a key on `c.x`
+/// has no unique index.
+///
+/// @param planned - the key's entry
+/// @param event - the kind of write
+/// @param changed - the folded names of the columns an `UPDATE` assigns
 fn fault_applies(
     planned: &crate::catalog_view::ForeignKeyTrigger,
     event: &TriggerEventInfo,
+    changed: &[Vec<u8>],
 ) -> bool {
     match event {
         TriggerEventInfo::Insert => planned.is_check,
-        TriggerEventInfo::Delete | TriggerEventInfo::Update(_) => true,
+        TriggerEventInfo::Delete => true,
+        TriggerEventInfo::Update(_) => planned.touched.iter().any(|name| changed.contains(name)),
     }
 }
 
@@ -839,7 +850,7 @@ impl<'a> Binder<'a> {
         let virtual_columns = self.bind_virtual_columns(&table)?;
         let index_exprs = self.bind_index_exprs(&table)?;
         let upsert = self.bind_upsert(&table, insert)?;
-        let returning = self.bind_returning(&insert.returning)?;
+        let returning = self.bind_returning(&insert.returning, target_source)?;
         let on_conflict = self.trigger_conflict.or(insert.on_conflict);
         let triggers = self.with_trigger_conflict(on_conflict, |binder| {
             binder.bind_triggers(&table, TriggerEventInfo::Insert, &[])
@@ -1060,7 +1071,7 @@ impl<'a> Binder<'a> {
         // let a `FROM` term take part in it, so an unqualified `k` that both
         // the target and a `FROM` term have is the target's.
         let saved_scopes = core::mem::replace(&mut self.scopes, vec![vec![source]]);
-        let returning = self.bind_returning(&update.returning);
+        let returning = self.bind_returning(&update.returning, source);
         self.scopes = saved_scopes;
         let returning = returning?;
         // Bound as expressions, the way an aggregate's own `ORDER BY` is: a
@@ -1156,7 +1167,7 @@ impl<'a> Binder<'a> {
             Some(expr) => Some(self.bind_plain_value(expr)?),
             None => None,
         };
-        let returning = self.bind_returning(&delete.returning)?;
+        let returning = self.bind_returning(&delete.returning, source)?;
         let order_by = self.bind_aggregate_order(&delete.order_by)?;
         let limit = match delete.limit {
             Some(expr) => Some(self.bind_expr(expr)?),
@@ -1359,7 +1370,7 @@ impl<'a> Binder<'a> {
             // table: main.t1`: what a deferred key waits for is the count of
             // violations, and there is no parent to count against (bug hunt 10).
             let Some(trigger) = planned.trigger.as_ref() else {
-                if fault_applies(planned, &event) {
+                if fault_applies(planned, &event, changed) {
                     return Err(crate::bind::schema_refused(
                         String::from_utf8_lossy(&planned.fault).into_owned(),
                         Span::default(),
@@ -2422,7 +2433,7 @@ impl<'a> Binder<'a> {
         // several apart.
         let several = insert.upserts.len() > 1;
         for (nth, upsert) in insert.upserts.iter().enumerate() {
-            match self.bind_upsert_body(table, upsert, several.then_some(nth)) {
+            match self.bind_upsert_body(table, upsert, several.then_some(nth), &insert.columns) {
                 Ok(Some(one)) => bound.push(one),
                 Ok(None) => {}
                 Err(error) => {
@@ -2433,6 +2444,31 @@ impl<'a> Binder<'a> {
         }
         self.excluded = None;
         Ok(bound)
+    }
+
+    /// Reports whether an insert can collide with a constraint of the table.
+    ///
+    /// It can when the table has a `UNIQUE` or `PRIMARY KEY` index, or when the statement
+    /// supplies the rowid: a column list names the rowid or its alias, or no column list is
+    /// written and so every column, the alias included, is supplied.
+    ///
+    /// @param table - the table being inserted into
+    /// @param insert_columns - the columns the statement lists, empty when it lists none
+    fn upsert_can_conflict(&self, table: &TableInfo, insert_columns: &[ast::NameId]) -> bool {
+        if table.indexes.iter().any(|index| index.unique) || table.without_rowid {
+            return true;
+        }
+        if insert_columns.is_empty() {
+            return true;
+        }
+        insert_columns.iter().any(|name| {
+            let folded = self.ast.folded(*name);
+            table.is_rowid_name(folded)
+                || table
+                    .rowid_alias
+                    .and_then(|alias| table.column(alias))
+                    .is_some_and(|column| column.folded == folded)
+        })
     }
 
     /// Binds an upsert's target, assignments and filter.
@@ -2446,13 +2482,29 @@ impl<'a> Binder<'a> {
         table: &TableInfo,
         upsert: &ast::Upsert,
         nth: Option<usize>,
+        insert_columns: &[ast::NameId],
     ) -> Result<Option<BoundUpsert>, ParseError> {
         let constraint = self.upsert_constraint(table, upsert, nth)?;
+        // **An arm that no row can reach is not bound.** SQLite looks at the `SET` list only
+        // when a constraint can collide, so `SET nosuch = 1` on an insert that supplies no key
+        // into a table with no `UNIQUE` index runs.
+        if upsert.target.is_empty() && !self.upsert_can_conflict(table, insert_columns) {
+            return Ok(None);
+        }
         let mut assignments = Vec::new();
         for (names, value) in &upsert.assignments {
             let values = self.assigned_values(names, *value)?;
             for (name, bound) in names.iter().zip(values) {
                 let folded = self.ast.folded(*name).to_vec();
+                if table.is_rowid_name(&folded) {
+                    assignments.retain(|held: &BoundAssignment| !held.rowid);
+                    assignments.push(BoundAssignment {
+                        column: 0,
+                        rowid: true,
+                        value: bound.clone(),
+                    });
+                    continue;
+                }
                 let Some(position) = table.column_position(&folded) else {
                     return Err(no_such_column(self.ast.text(*name), Span::default()));
                 };
@@ -2463,7 +2515,7 @@ impl<'a> Binder<'a> {
                 });
             }
         }
-        assignments.sort_by_key(|assignment| assignment.column);
+        assignments.sort_by_key(|assignment| (assignment.rowid, assignment.column));
         let filter = match upsert.filter {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
@@ -2498,6 +2550,7 @@ impl<'a> Binder<'a> {
     ) -> Result<Vec<BoundTrigger>, ParseError> {
         let changed: Vec<Vec<u8>> = assignments
             .iter()
+            .filter(|assignment| !assignment.rowid)
             .filter_map(|assignment| table.column(assignment.column))
             .map(|column| column.folded.clone())
             .collect();
@@ -2772,13 +2825,46 @@ impl<'a> Binder<'a> {
 
     /// Binds a `RETURNING` list, which is a result-column list over the row
     /// that was written.
+    ///
+    /// **The table is named by its own name here, whatever alias the statement gave it.**
+    /// `UPDATE t AS x ... RETURNING x.id` is `no such column: x.id` in SQLite and
+    /// `RETURNING t.id` works, so the target source answers to its real name while the list is
+    /// bound.
+    ///
+    /// @param columns - the `RETURNING` list
+    /// @param target - the statement-wide number of the source being written
     fn bind_returning(
         &mut self,
         columns: &[ast::ResultColumn],
+        target: usize,
     ) -> Result<Vec<BoundResultColumn>, ParseError> {
         if columns.is_empty() {
             return Ok(Vec::new());
         }
+        let real_name = self
+            .sources
+            .get(target)
+            .map(|source| source.table.name.clone());
+        let written = match (self.sources.get_mut(target), real_name) {
+            (Some(source), Some(real_name)) => {
+                Some(core::mem::replace(&mut source.alias, real_name))
+            }
+            _ => None,
+        };
+        let bound = self.bind_returning_columns(columns);
+        if let (Some(source), Some(alias)) = (self.sources.get_mut(target), written) {
+            source.alias = alias;
+        }
+        bound
+    }
+
+    /// Binds a `RETURNING` list once the target answers to its own name.
+    ///
+    /// @param columns - the `RETURNING` list
+    fn bind_returning_columns(
+        &mut self,
+        columns: &[ast::ResultColumn],
+    ) -> Result<Vec<BoundResultColumn>, ParseError> {
         // **`table.*` is refused, as SQLite refuses it.** A `RETURNING` list
         // may use a bare `*` and may not qualify it; SQLite answers
         // `RETURNING may not use "TABLE.*" wildcards` with code 1, and binding

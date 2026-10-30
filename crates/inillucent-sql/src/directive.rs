@@ -2397,6 +2397,15 @@ impl<'a> Binder<'a> {
                         .find_table(None, table)
                         .is_some_and(|found| found.database == *temp)
                 }),
+            // **`CREATE TRIGGER temp.tr1` is a temporary trigger without the word.** SQLite
+            // makes the schema `temp`, which lifts the rule that a trigger names only its own
+            // schema, so its body may write `main.log`.
+            None if parts
+                .database
+                .is_some_and(|id| self.ast.folded(id) == b"temp") =>
+            {
+                self.catalog.database_index(b"temp")
+            }
             other => other,
         };
         // `for_each_row` records whether the words were written, not whether
@@ -2875,6 +2884,19 @@ impl<'a> Binder<'a> {
     ) -> Result<Directive, ParseError> {
         let written = self.ast.text(name).to_vec();
         let folded = self.ast.folded(name).to_vec();
+        // **`DROP ... IF EXISTS nosuchdb.x` does nothing.** A schema that is not attached holds
+        // no object of that name, which is what `IF EXISTS` is for.
+        if if_exists && database.is_some() && self.resolve_database(database).is_err() {
+            return Ok(Directive::Drop {
+                kind,
+                if_exists,
+                database: 0,
+                name: written,
+                root: 0,
+                index_roots: Vec::new(),
+                exists: false,
+            });
+        }
         let (qualified, index) = self.resolve_drop_database(kind, database, &written, &folded)?;
         let database_name = self.catalog.database_name(index).to_vec();
         self.record_write_dependency(index);

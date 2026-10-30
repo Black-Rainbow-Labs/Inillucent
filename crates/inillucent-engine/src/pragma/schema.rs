@@ -270,7 +270,8 @@ impl crate::ImportedDatabase {
                 .with_collations(&self.session_state.collations)
                 .with_trusted_schema(self.session_state.registry.policy().trusted_schema)
                 .with_source(&table.create_sql)
-                .in_schema();
+                .in_schema()
+                .in_database(view_home(&self.schema.catalog, table.database).as_deref());
         Some(binder.bind_select(body.select))
     }
     /// Returns the columns a view's `SELECT` produces.
@@ -1004,4 +1005,19 @@ fn value_kinds(expr: &inillucent_sql::bind::BoundExpr) -> u8 {
         }
         _ => 0x01,
     }
+}
+
+/// Returns the name of the schema a view lives in, unless it is the temporary one.
+///
+/// A view in `temp` looks its tables up in the usual order; any other view reads the tables of
+/// its own schema.
+///
+/// @param catalog - the catalog the view is in
+/// @param database - the schema the view is in, by number
+fn view_home(
+    catalog: &dyn inillucent_sql::catalog_view::CatalogView,
+    database: usize,
+) -> Option<Vec<u8>> {
+    let name = catalog.database_name(database);
+    (!name.eq_ignore_ascii_case(b"temp")).then(|| name.to_vec())
 }

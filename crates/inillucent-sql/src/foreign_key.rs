@@ -138,6 +138,14 @@ fn parent_lookup(parent: &[Vec<u8>], child: &[Vec<u8>], row: &str) -> String {
 /// the child's. The row's values reach the generated body as literals, which
 /// carry no collation of their own, so the parent's is written out.
 ///
+/// **The child's value is compared as stored, under the parent column's affinity.** SQLite
+/// trunk (the change tested by `test/fkey8.test`) stopped applying the child column's affinity
+/// to the parent's value, which had a child holding the integer 5 cascade away with the
+/// parent row `'5'` while the parent row 5 still existed. The second term of each pair has
+/// the unary plus that removes the child column's affinity. The first term stays beside it
+/// because it is the one an index on the child column can answer, so finding the children of
+/// a parent row does not scan the child table.
+///
 /// @param child - the child's key column names
 /// @param parent - the parent's key column names
 /// @param collations - the collation of each parent column
@@ -146,18 +154,43 @@ fn children_matching(
     child: &[Vec<u8>],
     parent: &[Vec<u8>],
     collations: &[Vec<u8>],
+    affinities: &[inillucent_value::Affinity],
     row: &str,
 ) -> String {
     let mut parts = Vec::with_capacity(child.len());
-    for ((near, far), collation) in child.iter().zip(parent.iter()).zip(collations.iter()) {
+    let columns = child.iter().zip(parent.iter()).zip(collations.iter());
+    for (((near, far), collation), affinity) in columns.zip(affinities.iter()) {
+        let stored = under_affinity(&format!("+{}", quote(near)), *affinity);
         parts.push(format!(
-            "{} = {row}.{} COLLATE {}",
-            quote(near),
-            quote(far),
-            quote(collation)
+            "{near} = {row}.{far} COLLATE {collation} AND {stored} = {row}.{far} COLLATE {collation}",
+            near = quote(near),
+            far = quote(far),
+            collation = quote(collation)
         ));
     }
     conjunction(&parts)
+}
+
+/// Returns an expression for a child's value after the parent column's affinity is applied.
+///
+/// The values of `OLD` carry no affinity in a trigger body, so the conversion SQLite makes
+/// when it compares a parent key with a child value is written out. Text affinity turns a
+/// number into its text, and a numeric affinity turns text that spells a number into the
+/// number. A parent column with no affinity leaves the child value as it is.
+///
+/// @param value - the child's value, with its own affinity removed
+/// @param affinity - the affinity of the parent key column
+fn under_affinity(value: &str, affinity: inillucent_value::Affinity) -> String {
+    use inillucent_value::Affinity;
+    match affinity {
+        Affinity::Blob => value.to_string(),
+        Affinity::Text => format!(
+            "(CASE WHEN typeof({value}) IN ('integer', 'real') THEN CAST({value} AS TEXT) ELSE {value} END)"
+        ),
+        _ => format!(
+            "(CASE WHEN typeof({value}) = 'text' AND trim({value}) <> '' AND {value} NOT GLOB '*[^0-9.eE+-]*'              AND CAST({value} AS NUMERIC) IS NOT NULL THEN CAST({value} AS NUMERIC) ELSE {value} END)"
+        ),
+    }
 }
 
 /// Returns the collation of one column of a table, `binary` when it has none.
@@ -344,7 +377,16 @@ fn parent_action(
         _ => key.on_update,
     };
     let collations: Vec<Vec<u8>> = far.iter().map(|name| collation_of(parent, name)).collect();
-    let matching = children_matching(near, far, &collations, "OLD");
+    let affinities: Vec<inillucent_value::Affinity> = far
+        .iter()
+        .map(|name| {
+            parent
+                .column_position(&name.to_ascii_lowercase())
+                .and_then(|position| parent.column(position))
+                .map_or(inillucent_value::Affinity::Blob, |held| held.affinity)
+        })
+        .collect();
+    let matching = children_matching(near, far, &collations, &affinities, "OLD");
     let target = qualified(database, &child.name);
     let body = match action {
         ReferentialAction::NoAction | ReferentialAction::Restrict => {
@@ -645,6 +687,7 @@ fn plan_table(
             .iter()
             .find(|candidate| candidate.folded == key.parent_folded);
         let Some(parent) = parent else {
+            let touched = child_columns(key, table).unwrap_or_default();
             planned.push(unusable(
                 key,
                 format!(
@@ -653,16 +696,17 @@ fn plan_table(
                     String::from_utf8_lossy(&key.parent)
                 ),
                 true,
-                key.parent_folded == table.folded,
+                (key.parent_folded == table.folded, touched),
             ));
             continue;
         };
         if !parent_key_is_unique(parent, key) {
+            let touched = child_columns(key, table).unwrap_or_default();
             planned.push(unusable(
                 key,
                 mismatch(table, parent),
                 true,
-                parent.folded == table.folded,
+                (parent.folded == table.folded, touched),
             ));
             continue;
         }
@@ -673,6 +717,7 @@ fn plan_table(
                     deferred: key.is_deferred(),
                     trigger: Some(trigger),
                     fault: Vec::new(),
+                    touched: Vec::new(),
                     self_referencing: parent.folded == table.folded,
                 });
             }
@@ -687,11 +732,12 @@ fn plan_table(
                 continue;
             }
             if !parent_key_is_unique(table, key) {
+                let touched = parent_columns(key, table).unwrap_or_default();
                 planned.push(unusable(
                     key,
                     mismatch(child, table),
                     false,
-                    child.folded == table.folded,
+                    (child.folded == table.folded, touched),
                 ));
                 continue;
             }
@@ -712,6 +758,7 @@ fn plan_table(
                     deferred: key.is_deferred(),
                     trigger: Some(trigger),
                     fault: Vec::new(),
+                    touched: Vec::new(),
                     self_referencing: child.folded == table.folded,
                 });
             }
@@ -734,18 +781,24 @@ fn mismatch(child: &TableInfo, parent: &TableInfo) -> String {
 /// @param key - the key that cannot be enforced
 /// @param message - what to report when something writes
 /// @param is_check - whether it would have refused rather than repaired
-/// @param self_referencing - whether the key's child and parent are one table
+/// @param written - whether the key's child and parent are one table, and the key's columns in
+///   the table the entry is for
 fn unusable(
     key: &ForeignKeyInfo,
     message: String,
     is_check: bool,
-    self_referencing: bool,
+    written: (bool, Vec<Vec<u8>>),
 ) -> ForeignKeyTrigger {
+    let (self_referencing, columns) = written;
     ForeignKeyTrigger {
         is_check,
         deferred: key.is_deferred(),
         trigger: None,
         fault: message.into_bytes(),
+        touched: columns
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect(),
         self_referencing,
     }
 }

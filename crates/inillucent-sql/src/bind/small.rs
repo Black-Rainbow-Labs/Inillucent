@@ -99,3 +99,26 @@ pub(super) fn short_circuit_constant(
         _ => None,
     }
 }
+
+/// Reports whether a qualifier names a source.
+///
+/// **`sqlite_master` and `sqlite_schema` are one table, and either name qualifies a column of
+/// it.** `SELECT sqlite_master.name FROM sqlite_schema` is a valid statement; so are the two
+/// names for the temporary catalog.
+///
+/// @param source - the FROM term
+/// @param qualifier - the table name written before a column
+pub(super) fn source_answers_to(source: &BoundSource, qualifier: &[u8]) -> bool {
+    if source.alias.eq_ignore_ascii_case(qualifier) {
+        return true;
+    }
+    let catalog_name = |name: &[u8]| {
+        let folded = name.to_ascii_lowercase();
+        matches!(
+            folded.as_slice(),
+            b"sqlite_master" | b"sqlite_schema" | b"sqlite_temp_master" | b"sqlite_temp_schema"
+        )
+    };
+    let stem = |name: &[u8]| name.to_ascii_lowercase().starts_with(b"sqlite_temp_");
+    catalog_name(&source.alias) && catalog_name(qualifier) && stem(&source.alias) == stem(qualifier)
+}

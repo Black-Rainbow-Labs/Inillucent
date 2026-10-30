@@ -95,3 +95,13 @@ reason = "Plan text only. A join on a.k = b.k + 1 is keyed on the expression ove
 case = "bug-hunt-11/window/d11-group-concat-window-empty-string-sqlite-quirk"
 kind = "deviation"
 reason = "SQLite is wrong and this engine is right. A sliding window frame over group_concat takes the value that left the frame out of SQLite's text by its length, and after an empty string it removes the wrong characters: over '', 'x', 'y', '', 'ABC', '' with ROWS 1 PRECEDING, the fifth row is the frame '' and 'ABC', whose group_concat is ',ABC', and SQLite answers 'ABC'. The sixth row is 'ABC,' and SQLite answers 'BC,'. This engine answers the frame's own values joined by the separator. Described in docs/sql.md under smaller differences"
+
+[[known]]
+case = "bug-hunt-11/appsengine/fk-cascade-compares-parent-and-child-without-child-affinity"
+kind = "deviation"
+reason = "Foreign key actions follow SQLite trunk (test/fkey8.test, https://sqlite.org/src/info/e8eff0e979 and https://sqlite.org/src/info/dd8f6a7422), which compares a parent key with the child's value as stored, under the parent column's affinity. The pinned 3.53.4 still applies the child column's affinity, so DELETE FROM p3 WHERE code='5' fails with FOREIGN KEY constraint failed there while inillucent deletes the parent row and keeps the child holding the integer 5, which still has the parent row 5"
+
+[[known]]
+case = "bug-hunt-11/appsengine/distinct-order-by-indexed-column-not-selected"
+kind = "deviation"
+reason = "SELECT DISTINCT x ... ORDER BY y with y not selected keeps the first row of each group in scan order, so the row that stands for a group depends on the plan. SQLite reads a non covering index on y backwards, and reads the table by rowid backwards for ORDER BY id DESC, name. inillucent does the second only when the ORDER BY is the rowid alone, and never walks a non covering index for an ORDER BY, so with an index on y the groups come out in a different order"

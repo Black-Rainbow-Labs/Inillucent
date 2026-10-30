@@ -40,6 +40,12 @@ impl crate::ImportedDatabase {
     /// @param when - the words SQLite puts after the object's name, such as
     ///   ` after rename`, or an empty string for the check made before the change
     pub(crate) fn schema_still_binds(&self, at: usize, when: &str) -> DbResult<()> {
+        // **`PRAGMA legacy_alter_table` skips this check.** SQLite parses the views and
+        // triggers it re-reads and does not resolve their names, so a column a view or a
+        // trigger still names does not refuse the statement.
+        if self.pragmas.legacy_alter_table() {
+            return Ok(());
+        }
         self.schema_objects_bind(at, when)?;
         match at == crate::TEMP {
             true => Ok(()),

@@ -1240,7 +1240,7 @@ impl Connection<'_> {
     ///
     /// @param sql - the statement
     fn refuse_if_it_writes(&self, sql: &str) -> Result<()> {
-        match inillucent_engine::readonly::admits(sql) {
+        match !inillucent_engine::readonly::refused_before_binding_on_the_command_surface(sql) {
             true => Ok(()),
             false => Err(Error::said(
                 Status::ReadOnly,

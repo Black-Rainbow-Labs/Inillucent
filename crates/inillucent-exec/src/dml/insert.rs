@@ -514,8 +514,20 @@ fn meet_declarations(
     if declared == Resolution::Replace && plan.has_stored_generated() {
         plan.convert(declarations, space, image)?;
     }
-    declarations.types_are_met(table, space, image)?;
-    Ok(true)
+    match declarations.types_are_met(table, space, image) {
+        Ok(()) => Ok(true),
+        Err(error) if declared == Resolution::Skip && is_datatype_failure(&error) => {
+            // **`INSERT OR IGNORE` resolves a key collision before the type check.** A row that
+            // collides is skipped, wrong type or not, as SQLite does for a `STRICT` table.
+            let indexes = request.indexes;
+            let clash = conflicting_row(table, request.layout, target, image, None, indexes, &[])?;
+            match clash {
+                Some(_) => Ok(false),
+                None => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Returns the row to hold on to while `OR REPLACE` may fill in defaults, empty when it cannot.

@@ -155,6 +155,23 @@ fn directive_writes(directive: &Directive) -> bool {
     }
 }
 
+/// Returns whether a directive may run on a connection that opened the file read only.
+///
+/// **Only the temporary schema may be written, and `:memory:` attached.** `CREATE TEMP TABLE`
+/// and the statements that change a temporary object are allowed, as they are under
+/// `sqlite3 -readonly`. A change to `main` or to an attached file is refused, and so is the
+/// attach of a file, which would open it for writing.
+///
+/// @param directive - the bound statement
+fn read_only_allows(directive: &Directive) -> bool {
+    match directive {
+        Directive::Attach { file, file_sql, .. } => {
+            file_sql.is_none() && (file.is_empty() || file.as_slice() == b":memory:")
+        }
+        other => !directive_writes(other) || schema_of(other) == super::TEMP,
+    }
+}
+
 /// Returns whether a directive changes the schema the cookie describes.
 ///
 /// The `CREATE`s, the `DROP`s and `ALTER`. A pragma, a transaction control or
@@ -187,6 +204,18 @@ pub(crate) type CatalogWrite = (
 );
 
 impl ImportedDatabase {
+    /// Refuses a statement that would change a file on a connection that opened it read only.
+    ///
+    /// @param directive - the bound statement
+    fn refuse_a_read_only_directive(&self, directive: &Directive) -> DbResult<()> {
+        match (self.storage.read_only || self.pragmas.files_read_only())
+            && !read_only_allows(directive)
+        {
+            true => Err(query_only_refusal()),
+            false => Ok(()),
+        }
+    }
+
     /// Runs one statement the session carries out itself.
     ///
     /// @param sql - the statement text, which is also the source the stored
@@ -215,6 +244,7 @@ impl ImportedDatabase {
         if self.pragmas.query_only() && directive_writes(&directive) {
             return Err(query_only_refusal());
         }
+        self.refuse_a_read_only_directive(&directive)?;
         // **Which file the statement is about, from the statement's own
         // words.** `CREATE TABLE aux.t` and `CREATE TEMP TABLE t` each bind to a
         // schema, and the primitives underneath - `allocate_root`, `record`,

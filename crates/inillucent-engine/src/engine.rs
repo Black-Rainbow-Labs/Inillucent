@@ -34,6 +34,7 @@
 //! | [`rowshape`] | what a table's rows look like on disk, and reading a schema back |
 //! | [`state`] | the six groups `ImportedDatabase`'s fields are made of |
 //! | [`keys`] | settling the foreign keys a statement left outstanding |
+//! | [`key_baselines`] | the violations a deferred key had before the transaction wrote its tables |
 //! | [`locks`] | taking the file lock, and choosing the journal |
 //! | [`lockless`] | which statements read nothing from the file and take no lock |
 //! | [`write`] | where a statement's writes go, and what undoes them |
@@ -48,6 +49,7 @@ pub mod explain;
 pub mod fills;
 pub mod functions;
 pub mod integrity;
+pub mod key_baselines;
 pub mod keys;
 pub mod lockless;
 pub mod locks;

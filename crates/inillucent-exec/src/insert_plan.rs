@@ -302,12 +302,15 @@ impl InsertPlan {
             let mut filter = None;
             if clause.do_update {
                 for assignment in &clause.assignments {
-                    if let Some(slot) = layout
-                        .slots
-                        .get(usize::from(assignment.column))
-                        .copied()
-                        .flatten()
-                    {
+                    let slot = match assignment.rowid {
+                        true => layout.rowid,
+                        false => layout
+                            .slots
+                            .get(usize::from(assignment.column))
+                            .copied()
+                            .flatten(),
+                    };
+                    if let Some(slot) = slot {
                         assignments
                             .push((slot, space.compile(&assignment.value, params, catalog)?));
                     }

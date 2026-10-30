@@ -649,6 +649,7 @@ impl crate::ImportedDatabase {
         // was always put back correctly, and the module's own buffer was not.
         self.session_state.modules_begun.set(false);
         self.forget_dropped_parents();
+        self.clear_key_baselines();
         let told = self.rollback_modules(None);
         let txn = self.current_txn();
         // Before the undo is committed, which settles space: a page count the
@@ -770,6 +771,7 @@ impl crate::ImportedDatabase {
         }
         self.session_state.modules_begun.set(false);
         self.forget_dropped_parents();
+        self.clear_key_baselines();
         // Nothing to abandon once it is committed, and holding the before-images
         // would hold every row a long transaction touched.
         self.writing.undo().borrow_mut().clear();

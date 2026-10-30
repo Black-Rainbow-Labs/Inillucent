@@ -103,6 +103,10 @@ impl ImportedDatabase {
         }
         // `PRAGMA defer_foreign_keys` defers every key, so every key is the
         // commit's to check while it is on.
+        // A key the transaction never wrote a table of has no baseline and is not asked.
+        if self.session_state.key_baselines.borrow().is_empty() {
+            return Ok(());
+        }
         let every_key = self.pragmas.defer_foreign_keys();
         let name_of = |database: usize| self.schema_label(database);
         let queries = self.schema.violation_queries(None, &name_of)?;
@@ -110,7 +114,17 @@ impl ImportedDatabase {
             if !query.deferred && !every_key {
                 continue;
             }
-            if self.query_internally(&query.sql)?.is_empty() {
+            let id = (query.database, query.child.to_ascii_lowercase(), query.key);
+            let Some(before) = self.session_state.key_baselines.borrow().get(&id).copied() else {
+                continue;
+            };
+            // SQLite counts the violations this transaction made, so a key that was already
+            // broken before it wrote the key's tables does not fail the commit.
+            let broken = match before {
+                0 => !self.query_internally(&query.sql)?.is_empty(),
+                _ => self.count_violations(&query.sql)? > before,
+            };
+            if !broken {
                 continue;
             }
             return Err(DbError::new(inillucent_base::ExtendedCode(
@@ -208,6 +222,8 @@ pub(crate) struct ViolationQuery {
     pub(crate) parent: Vec<u8>,
     /// The key's position in its table, which the pragma reports as `fkid`.
     pub(crate) key: u16,
+    /// The schema the child table is in, by number.
+    pub(crate) database: usize,
     /// Whether the key is `DEFERRABLE INITIALLY DEFERRED`.
     ///
     /// Only such a key can be broken when a transaction commits: an immediate
