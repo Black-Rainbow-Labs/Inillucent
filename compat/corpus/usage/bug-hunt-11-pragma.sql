@@ -185,3 +185,23 @@ select sql from sqlite_master;
 create table t(d, e, primary key("d", "e"));
 alter table t drop column e;
 select sql from sqlite_master;
+-- case: bug-hunt-11/pragma/D6-trigger-on-temp-table-fires
+create temp table x(a);
+create temp table log(m);
+create trigger tr after insert on x begin insert into log values('fired ' || new.a); end;
+insert into x values(1),(2);
+select * from log order by 1;
+select name, tbl_name from sqlite_temp_master where type='trigger';
+select count(*) from sqlite_master where type='trigger';
+-- case: bug-hunt-11/pragma/D6-trigger-on-table-in-both-main-and-temp
+create table x(a);
+create temp table x(a);
+create table log(m);
+create trigger tr after insert on x begin insert into log values('t'); end;
+select count(*) from sqlite_temp_master where type='trigger';
+select count(*) from sqlite_master where type='trigger';
+-- case: bug-hunt-11/pragma/D6-trigger-on-main-table-stays-in-main
+create table x(a);
+create trigger tr after insert on x begin select 1; end;
+select count(*) from sqlite_master where type='trigger';
+select count(*) from sqlite_temp_master where type='trigger';

@@ -1288,7 +1288,12 @@ pub fn export(context: &mut Context, arguments: &Arguments) -> Result<Outcome, F
         return Err(failed);
     }
     let Some(path) = destination else {
-        return Ok(Outcome::said("export", printed.trim_end()));
+        // **Only the final newline is removed**, because the report adds its own when it
+        // is printed. Trimming every trailing space character cut a trailing tab (a last
+        // row whose last column is empty) and the carriage return of a CSV row off the
+        // text, so it no longer matched the file `out` writes.
+        let text = printed.strip_suffix('\n').unwrap_or(&printed);
+        return Ok(Outcome::said("export", text));
     };
     wrote_a_file(&path, rows)
 }
@@ -2477,6 +2482,20 @@ mod source_tests {
         let said = format!("{error:?}");
         assert!(said.contains("--root"), "{said}");
         assert!(said.contains(SOURCE_URL_VARIABLE), "{said}");
+    }
+
+    /// The text an export returns when it has no file ends exactly as the file would.
+    #[test]
+    fn export_text_keeps_a_trailing_tab_and_the_carriage_return() {
+        let mut tabs = Arguments::default();
+        tabs.set("sql", crate::json::text("SELECT 1 AS a, 2 AS b, NULL AS c"));
+        tabs.set("format", crate::json::text("tabs"));
+        let report = export(&mut context(None), &tabs).expect("the export runs");
+        assert_eq!(report.text, "a\tb\tc\n1\t2\t");
+        let mut csv = Arguments::default();
+        csv.set("sql", crate::json::text("SELECT 1 AS a, 2 AS b"));
+        let report = export(&mut context(None), &csv).expect("the export runs");
+        assert_eq!(report.text, "a,b\r\n1,2\r");
     }
 
     /// Export refuses an ambiguous request before reading either data source.

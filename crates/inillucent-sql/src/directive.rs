@@ -2382,6 +2382,23 @@ impl<'a> Binder<'a> {
         parts: CreateTriggerParts<'_>,
     ) -> Result<Directive, ParseError> {
         let temp = self.temporary_database(parts.temporary, parts.database, true)?;
+        // **A trigger with no qualifier on a table in `temp` is made in `temp`**, as in
+        // SQLite's `sqlite3BeginTrigger`: the table is looked for in every database, and
+        // finding it in the temporary one moves the trigger there. Looked for in `main`
+        // only, it said `no such table: main.x` for a table that exists.
+        let temp = match temp {
+            None if parts.database.is_none() && parts.table_database.is_none() => self
+                .temporary_database(true, None, true)
+                .ok()
+                .flatten()
+                .filter(|temp| {
+                    let table = self.ast.folded(parts.table);
+                    self.catalog
+                        .find_table(None, table)
+                        .is_some_and(|found| found.database == *temp)
+                }),
+            other => other,
+        };
         // `for_each_row` records whether the words were written, not whether
         // the trigger is one: SQLite has only row triggers, an omitted clause
         // means FOR EACH ROW, and FOR EACH STATEMENT is a syntax error in the
