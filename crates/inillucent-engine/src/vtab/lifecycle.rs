@@ -569,7 +569,7 @@ impl crate::ImportedDatabase {
         // and the log commits here; inside one, `commit_batch` does both.
         if self.writing.batch().is_none() {
             self.sync_modules()?;
-            self.seal()?;
+            self.seal_module_write()?;
         }
         // **A module's insert changed rows exactly as much as an ordinary
         // one.** `changes()`/`total_changes()` read `last_changes`/
@@ -980,6 +980,19 @@ impl crate::ImportedDatabase {
             .or(told.err())
             .or(sealed.err())
             .unwrap_or(error))
+    }
+
+    /// Commits a module write that was its own transaction.
+    ///
+    /// **The before-images of the statement end here.** A virtual table's write passes through
+    /// this commit and nothing else clears them, so the next `INSERT OR ROLLBACK` that failed
+    /// undid every earlier autocommit write to the module's shadow tables as well, and the table
+    /// read as empty.
+    pub(crate) fn seal_module_write(&mut self) -> DbResult<()> {
+        if self.writing.batch().is_none() {
+            self.writing.undo().borrow_mut().clear();
+        }
+        self.seal()
     }
 
     /// Flushes every connected module before the engine commits.

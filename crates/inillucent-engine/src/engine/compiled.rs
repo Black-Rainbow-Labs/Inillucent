@@ -351,7 +351,7 @@ impl crate::ImportedDatabase {
         }
         if self.writing.batch().is_none() {
             self.sync_modules()?;
-            self.seal()?;
+            self.seal_module_write()?;
         }
         // See the matching comment in `vtab::insert_into_module`.
         self.record_changes(changed as i64, changed as i64);
@@ -776,7 +776,7 @@ impl crate::ImportedDatabase {
                 let changed = self.update_module_statement(statement, &keys, params)?;
                 if self.writing.batch().is_none() {
                     self.sync_modules()?;
-                    self.seal()?;
+                    self.seal_module_write()?;
                 }
                 // See the matching comment in `vtab::insert_into_module`: a
                 // module's own write has to reach `changes()`/`total_changes()`

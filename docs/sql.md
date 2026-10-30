@@ -125,6 +125,10 @@ generated column, an index expression, the `WHERE` of a partial index, a view or
 comes when the statement that reads the schema is bound. For an index expression the refusal comes
 at `CREATE INDEX`, because that is when inillucent evaluates the expression.
 
+The `MATCH` operator of a virtual table follows the same rule, as it does in SQLite. A view, a trigger
+body or a `CHECK` that uses `MATCH` fails with `unsafe use of MATCH()` while `PRAGMA trusted_schema` is
+off, and a table valued call such as `SELECT * FROM f('query')` does not.
+
 `embed(TEXT)` is `direct_only`. `embed(TEXT)` loads a 275 MB model, so a `CHECK` that named it would
 load the model on every insert.
 

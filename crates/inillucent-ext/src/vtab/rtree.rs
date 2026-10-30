@@ -1812,6 +1812,26 @@ mod tests {
         assert_eq!(read_cells(&node, 2, Coordinates::Float), cells);
     }
 
+    /// An integer cell keeps every bit of a 32 bit coordinate, which a float cell cannot.
+    #[test]
+    fn an_integer_cell_keeps_every_bit_of_a_coordinate() {
+        let mut node = vec![0u8; HEADER + 2 * (CELL_KEY + 2 * COORDINATE)];
+        let cells = vec![
+            Cell {
+                key: 1,
+                box_: vec![16_777_217.0, 16_777_219.0],
+            },
+            Cell {
+                key: 2,
+                box_: vec![-2_147_483_648.0, 2_147_483_647.0],
+            },
+        ];
+        write_cells(&mut node, 0, &cells, Coordinates::Integer);
+        assert_eq!(read_cells(&node, 1, Coordinates::Integer), cells);
+        // Read as floats the same bytes are other numbers, so the kind of table matters.
+        assert_ne!(read_cells(&node, 1, Coordinates::Float), cells);
+    }
+
     /// The header carries the depth in the two bytes before the count.
     #[test]
     fn the_header_carries_the_depth() {

@@ -358,3 +358,43 @@ pub(super) fn decoded(code: u32) -> u32 {
         code
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Private use is category 31 and a code point the table does not list is category 0, both
+    /// of which the default settings treat as token characters.
+    #[test]
+    fn unlisted_and_private_use_code_points_have_their_own_categories() {
+        assert_eq!(category(0xE000), 31);
+        assert_eq!(category(0x378), 0);
+        assert_eq!(category(u32::from(b'a')), 5);
+        assert_eq!(category(u32::from(b'A')), 9);
+        assert_eq!(category(u32::from(b'7')), 13);
+        assert_eq!(category(0x10_0000), 0);
+    }
+
+    /// A noncharacter is read as the replacement character, which is a symbol.
+    #[test]
+    fn a_noncharacter_is_read_as_the_replacement_character() {
+        assert_eq!(decoded(0xFFFE), 0xFFFD);
+        assert_eq!(decoded(0xFFFF), 0xFFFD);
+        assert_eq!(decoded(0x41), 0x41);
+        assert_eq!(category(0xFFFD), 26);
+    }
+
+    /// A category name turns on the numbers SQLite gives it, and a name it does not know fails.
+    #[test]
+    fn a_category_name_turns_on_its_numbers() {
+        let mut flags = [false; 32];
+        assert!(!parse_category(b"Lu", &mut flags));
+        assert_eq!(flags.get(9), Some(&true));
+        assert_eq!(flags.get(5), Some(&false));
+        assert!(parse_category(b"Lx", &mut flags));
+        assert!(parse_category(b"L", &mut flags));
+        let mut all = [false; 32];
+        assert!(!parse_category(b"N*", &mut all));
+        assert_eq!(all.get(14), Some(&true));
+    }
+}
