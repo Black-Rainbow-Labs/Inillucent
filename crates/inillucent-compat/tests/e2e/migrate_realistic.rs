@@ -49,14 +49,15 @@ use inillucent_tree::datum::OwnedDatum;
 
 /// What a fixture's migration is expected to do.
 ///
-/// **One of the three is refused, and the refusal is the answer rather than a
-/// gap in this file.** Rule 1.1: a case the tool is allowed to decline asserts
+/// **All three publish now.** `Refused` stays for the next fixture the tool
+/// declines: rule 1.1 says a case the tool is allowed to decline asserts
 /// *which* refusal it declines with, so a change in either direction is a
 /// failure here.
 enum Expect {
     /// It migrates, and every column of every row is compared to the source.
     Publishes,
     /// It is refused, nothing is published, and the refusal contains this text.
+    #[allow(dead_code)]
     Refused(&'static str),
 }
 

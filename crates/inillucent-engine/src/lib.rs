@@ -1261,14 +1261,14 @@ fn modules() -> inillucent_ext::registry::Registry {
 ///
 /// @param cached - the compiled statement
 fn writes_something(cached: &Cached) -> bool {
-    match cached {
+    matches!(
+        cached,
         Cached::Insert(..)
-        | Cached::VirtualInsert(..)
-        | Cached::SchemaInsert(_)
-        | Cached::Update(..)
-        | Cached::Delete(..)
-        | Cached::VirtualDelete(..)
-        | Cached::VirtualUpdate(..) => true,
-        _ => false,
-    }
+            | Cached::VirtualInsert(..)
+            | Cached::SchemaInsert(_)
+            | Cached::Update(..)
+            | Cached::Delete(..)
+            | Cached::VirtualDelete(..)
+            | Cached::VirtualUpdate(..)
+    )
 }

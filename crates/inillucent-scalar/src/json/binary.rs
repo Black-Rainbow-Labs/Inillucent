@@ -399,7 +399,7 @@ fn children_are_valid(blob: &[u8], from: usize, end: usize, depth: usize, object
         if next > end {
             return false;
         }
-        if object && count % 2 == 0 {
+        if object && count.is_multiple_of(2) {
             let kind = blob.get(cursor).map_or(255, |first| first & 0x0f);
             if !(TYPE_TEXT..=TYPE_TEXTRAW).contains(&kind) {
                 return false;

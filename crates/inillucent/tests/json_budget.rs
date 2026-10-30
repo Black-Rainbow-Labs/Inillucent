@@ -131,7 +131,7 @@ const BYTES_PER_CALL: u64 = 48 * 1024;
 fn a_nested_json_each_does_not_copy_the_document_for_every_row() {
     const ELEMENTS: u64 = 2000;
     let directory = scratch("nested");
-    let database = Database::open(&directory.join("j.rdb")).expect("the database opens");
+    let database = Database::open(directory.join("j.rdb")).expect("the database opens");
     let connection = database.session();
     connection
         .execute_batch(&format!(
@@ -194,7 +194,7 @@ fn build_documents(connection: &Connection<'_>, rows: u64) {
 #[test]
 fn several_json_calls_over_one_document_parse_it_once() {
     let directory = scratch("calls");
-    let database = Database::open(&directory.join("j.rdb")).expect("the database opens");
+    let database = Database::open(directory.join("j.rdb")).expect("the database opens");
     let connection = database.session();
     build_documents(&connection, 200);
     let one = "SELECT sum(j->>'$.meta.a') FROM d";

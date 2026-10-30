@@ -86,7 +86,7 @@ pub(super) fn directive_writes(directive: &Directive) -> bool {
         | Directive::Analyze { .. } => true,
         Directive::Drop {
             if_exists, exists, ..
-        } => !(*if_exists && !*exists),
+        } => !*if_exists || *exists,
         _ => false,
     }
 }
