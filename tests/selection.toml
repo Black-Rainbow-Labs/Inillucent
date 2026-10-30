@@ -4057,3 +4057,11 @@ name = "engine"
 module = "derived_table_lookup_work"
 tier = "engine"
 covers = ["inillucent-exec", "inillucent-engine", "inillucent-sql"]
+
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "engine"
+module = "window_sliding_work"
+tier = "engine"
+covers = ["inillucent-exec", "inillucent-engine", "inillucent-sql", "inillucent-scalar"]

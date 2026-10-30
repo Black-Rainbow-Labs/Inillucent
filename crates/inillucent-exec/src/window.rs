@@ -39,8 +39,34 @@ use crate::batch::Batch;
 use crate::join::RowStore;
 use crate::ops::{emit_rows, Flow, Sink};
 
+mod slide;
 mod stream;
 pub use stream::{pieces_computed, StreamShape, WindowStream};
+
+thread_local! {
+    /// How many frame members the calling thread's window aggregates have read.
+    ///
+    /// A member is counted each time a row is added to a frame's accumulator, taken out of it, or
+    /// listed as part of a frame that is computed from its rows. Per thread, so another test in the
+    /// same process cannot move it.
+    static FRAME_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns how many frame members the calling thread's window aggregates have read.
+///
+/// So a test can say that a frame whose start moves is not rebuilt from its rows for every row: the
+/// count is linear in the partition for a sliding frame, and quadratic when each row's frame is
+/// computed afresh.
+pub fn frame_work_done() -> u64 {
+    FRAME_WORK.with(std::cell::Cell::get)
+}
+
+/// Adds to the count of frame members read.
+///
+/// @param members - how many members were read
+fn count_frame_work(members: usize) {
+    FRAME_WORK.with(|work| work.set(work.get().saturating_add(members as u64)));
+}
 
 /// Which family a window call belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +301,9 @@ pub fn compute_values_until_failure(
                 (Some(kind), _) => Some(sliding_sums(rows, call, partition, kind, &mut values)),
                 (None, Some(kind)) => {
                     Some(growing_aggregate(rows, call, partition, kind, &mut values))
+                }
+                (None, None) if slide::slides_by_entering_and_leaving(call) => {
+                    Some(slide::sliding_aggregate(rows, call, partition, &mut values))
                 }
                 (None, None) => None,
             };
@@ -739,7 +768,17 @@ fn evaluate(
         | WindowSlot::Plain(WindowFunc::LastValue)
         | WindowSlot::Plain(WindowFunc::NthValue) => {
             let frame = frame_of(rows, call, partition, row)?;
-            positional(rows, call, &frame, row)?
+            // **A frame with an `EXCLUDE` clause answers NULL without reading `nth_value`'s
+            // position when no row is left in it.** SQLite computes such a frame by adding the
+            // rows it keeps, and checks the position when it adds one, so `nth_value(a, 0) OVER
+            // (ORDER BY id ROWS CURRENT ROW EXCLUDE GROUP)`, which keeps nothing, is NULL for
+            // every row where this raised `second argument to nth_value must be a positive
+            // integer`. A frame with no `EXCLUDE` checks the position for every row.
+            if frame.is_empty() {
+                OwnedDatum::Null
+            } else {
+                positional(rows, call, &frame, row)?
+            }
         }
         WindowSlot::Aggregate(kind) => aggregate(rows, call, partition, row, kind.clone())?,
     })
@@ -897,6 +936,7 @@ fn aggregate(
     kind: AggregateKind,
 ) -> DbResult<OwnedDatum> {
     let mut frame = frame_of(rows, call, partition, row)?;
+    count_frame_work(frame.len());
     // **A sliding `min` or `max` keeps the last of several equal values.** SQLite rebuilds such a
     // frame row by row from its end, so over 0.0 and 0 the answer is the integer 0, where a
     // frame that grows from `UNBOUNDED PRECEDING` keeps the first, 0.0.
@@ -967,6 +1007,30 @@ fn frame_bounds(
     let spec = frame_spec(rows, call, row)?;
     let descending = call.order.first().is_some_and(|term| term.descending);
     Ok(frames::frame_bounds(
+        partition,
+        row,
+        &spec,
+        |member| order_value(rows, call, member),
+        descending,
+    ))
+}
+
+/// Returns the last row the end of one row's frame reaches, or `None` when it reaches none. See
+/// `frames::frame_end`.
+///
+/// @param rows - the buffered input
+/// @param call - the window call
+/// @param partition - the row's partition
+/// @param row - the row whose frame it is
+fn frame_end(
+    rows: &[Vec<OwnedDatum>],
+    call: &WindowCall,
+    partition: &frames::Partition,
+    row: usize,
+) -> DbResult<Option<usize>> {
+    let spec = frame_spec(rows, call, row)?;
+    let descending = call.order.first().is_some_and(|term| term.descending);
+    Ok(frames::frame_end(
         partition,
         row,
         &spec,

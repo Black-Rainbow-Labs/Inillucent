@@ -90,3 +90,8 @@ reason = "Plan text only. A correlated count(*) over a table with no index for i
 case = "automatic-index/plan-of-statement-10"
 kind = "deviation"
 reason = "Plan text only. A join on a.k = b.k + 1 is keyed on the expression over b, shown as (<expr>=?), and this engine keeps the written join order. The pinned sqlite3 scans b and builds the index on the plain column a.k. The rows match"
+
+[[known]]
+case = "bug-hunt-11/window/d11-group-concat-window-empty-string-sqlite-quirk"
+kind = "deviation"
+reason = "SQLite is wrong and this engine is right. A sliding window frame over group_concat takes the value that left the frame out of SQLite's text by its length, and after an empty string it removes the wrong characters: over '', 'x', 'y', '', 'ABC', '' with ROWS 1 PRECEDING, the fifth row is the frame '' and 'ABC', whose group_concat is ',ABC', and SQLite answers 'ABC'. The sixth row is 'ABC,' and SQLite answers 'BC,'. This engine answers the frame's own values joined by the separator. Described in docs/sql.md under smaller differences"

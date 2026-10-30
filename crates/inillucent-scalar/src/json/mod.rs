@@ -1010,6 +1010,57 @@ pub fn group_array_final(items: Vec<Node>, binary: bool) -> DbResult<Answer> {
     answer(&Node::Array(items), binary)
 }
 
+/// Renders one value of a `json_group_array` as the text it takes in the finished array.
+///
+/// A window frame that slides keeps these pieces and joins them for every row, which costs the
+/// length of the frame in bytes and no rendering. [`group_text_answer`] joins them.
+///
+/// @param argument - the value
+pub fn group_array_piece(argument: &Argument<'_>) -> DbResult<String> {
+    let mut items = Vec::with_capacity(1);
+    group_array_step(&mut items, argument)?;
+    Ok(items
+        .pop()
+        .map(|node| render::to_text(&node))
+        .unwrap_or_default())
+}
+
+/// Renders one label and value of a `json_group_object` as the text they take in the finished
+/// object, or `None` for a row whose label is NULL, which has no member.
+///
+/// @param label - the member's label
+/// @param value - the member's value
+pub fn group_object_piece(label: &Argument<'_>, value: &Argument<'_>) -> DbResult<Option<String>> {
+    let mut members = Vec::with_capacity(1);
+    group_object_step(&mut members, label, value)?;
+    Ok(members
+        .pop()
+        .map(|(name, held)| format!("{}:{}", render::to_text(&name), render::to_text(&held))))
+}
+
+/// Joins pieces from [`group_array_piece`] or [`group_object_piece`] into the answer
+/// `json_group_array` or `json_group_object` gives.
+///
+/// @param open - `[` for an array, `{` for an object
+/// @param pieces - the rendered members, in order
+/// @param close - `]` or `}`
+pub fn group_text_answer<'a>(
+    open: char,
+    pieces: impl Iterator<Item = &'a str>,
+    close: char,
+) -> DbResult<Answer> {
+    let mut text = String::new();
+    text.push(open);
+    for (position, piece) in pieces.enumerate() {
+        if position > 0 {
+            text.push(',');
+        }
+        text.push_str(piece);
+    }
+    text.push(close);
+    Ok(Answer::marked(Value::owned_text(text.as_bytes())?))
+}
+
 /// Folds one label and value into a `json_group_object` accumulator.
 ///
 /// **A row whose label is NULL is skipped, value and all.** SQLite's

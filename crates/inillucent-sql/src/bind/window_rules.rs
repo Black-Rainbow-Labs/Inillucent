@@ -8,7 +8,8 @@
 //! binder reads from a literal's spelling.
 
 use super::{
-    no_such_window, refused, unsupported, wrong_arguments, Binder, WindowCall, MAX_COMPOUND_SELECT,
+    no_such_window, refused, unsupported, wrong_arguments, Binder, BoundExpr, WindowCall,
+    MAX_COMPOUND_SELECT,
 };
 use crate::ast::{self, ExprId};
 use crate::diagnostic::ParseError;
@@ -93,6 +94,75 @@ impl Binder<'_> {
         ))
     }
 
+    /// Refuses a window call that has an `ORDER BY` inside its parentheses.
+    ///
+    /// **A window call takes no `ORDER BY` inside its parentheses.** SQLite refuses
+    /// `group_concat(a ORDER BY b) OVER ()` and the same for every other function, an aggregate
+    /// included; this dropped the clause and answered in row order.
+    ///
+    /// @param name - the function's name as written
+    /// @param has_order_by - whether the call has an `ORDER BY`
+    /// @param span - where the call was written
+    pub(super) fn refuse_order_by_in_window_call(
+        &self,
+        name: ast::NameId,
+        has_order_by: bool,
+        span: Span,
+    ) -> Result<(), ParseError> {
+        if !has_order_by {
+            return Ok(());
+        }
+        Err(refused(
+            format!(
+                "ORDER BY may not be used with non-aggregate {}()",
+                String::from_utf8_lossy(self.ast.text(name))
+            ),
+            span,
+        ))
+    }
+
+    /// Refuses `FILTER` on a function that only exists in a window.
+    ///
+    /// **`FILTER` belongs to an aggregate.** `row_number() FILTER (WHERE a > 1) OVER ()` ran and
+    /// ignored the filter; SQLite refuses it for every function that only exists in a window.
+    ///
+    /// @param call - the window function or aggregate being called
+    /// @param has_filter - whether the call has a `FILTER` clause
+    /// @param span - where the call was written
+    pub(super) fn refuse_filter_on_plain_window(
+        &self,
+        call: &WindowCall,
+        has_filter: bool,
+        span: Span,
+    ) -> Result<(), ParseError> {
+        if has_filter && matches!(call, WindowCall::Plain(_)) {
+            return Err(refused(
+                "FILTER clause may only be used with aggregate window functions",
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Binds a frame offset.
+    ///
+    /// **An offset SQLite cannot fold to a literal is NULL there.** SQLite reads `(SELECT 1)`,
+    /// `abs(1)`, `coalesce(1, 2)`, `'a' LIKE 'a'` and a column as NULL in a frame offset, and
+    /// answers `frame starting offset must be a non-negative integer` when a row reaches the frame.
+    /// Literals and the operators between them (`1 + 1`, `CASE`, `CAST`, `IN`) evaluate. This
+    /// refused the others when the statement was compiled, with a message SQLite never prints.
+    /// Replacing the expression with NULL gives the same runtime error, and no error at all when
+    /// the query has no rows, which is also what SQLite does.
+    ///
+    /// @param expr - the offset as written
+    pub(super) fn bind_frame_offset(&mut self, expr: ExprId) -> Result<BoundExpr, ParseError> {
+        let bound = self.bind_expr(expr)?;
+        if !folds_to_a_literal(&bound) {
+            return Ok(BoundExpr::Null);
+        }
+        Ok(bound)
+    }
+
     /// Resolves an `OVER` clause into one fully-written window specification.
     ///
     /// @param id - the window
@@ -142,7 +212,21 @@ impl Binder<'_> {
             return Err(unsupported("a window that inherits from itself", span));
         }
         let folded = self.ast.folded(base).to_vec();
-        let Some((_, base_id)) = self.named_windows.iter().find(|(name, _)| *name == folded) else {
+        // **The last definition of a name wins, as it does in SQLite.** `WINDOW w AS (ORDER BY a),
+        // w AS (ORDER BY a DESC)` makes `OVER w` the descending one, and a window written between
+        // the two sees only the definition before it. The first match was used for both.
+        let defined_before = self
+            .named_windows
+            .iter()
+            .position(|(_, held)| *held == id)
+            .unwrap_or(self.named_windows.len());
+        let found = self
+            .named_windows
+            .iter()
+            .take(defined_before)
+            .rev()
+            .find(|(name, _)| *name == folded);
+        let Some((_, base_id)) = found else {
             return Err(no_such_window(self.ast.text(base), span));
         };
         let parent = self.resolve_window_at(*base_id, span, depth.saturating_add(1))?;
@@ -199,4 +283,53 @@ pub(super) fn starts_after_end(
                 BoundFrameBound::Preceding(_) | BoundFrameBound::CurrentRow
             )
     )
+}
+
+/// Reports whether SQLite evaluates a frame offset expression, which it does only for the
+/// forms it folds to a constant: literals, parameters and the operators between them.
+///
+/// A function call, a pattern match, a subquery and a column are not in the list, and SQLite
+/// reads each as NULL there. See [`Binder::bind_frame_offset`].
+///
+/// @param expr - the bound offset
+fn folds_to_a_literal(expr: &BoundExpr) -> bool {
+    let all = |list: &[&BoundExpr]| list.iter().all(|held| folds_to_a_literal(held));
+    match expr {
+        BoundExpr::Null
+        | BoundExpr::Integer(_)
+        | BoundExpr::Real(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::Blob(_)
+        | BoundExpr::Parameter(_) => true,
+        BoundExpr::Unary { operand, .. }
+        | BoundExpr::Collate { operand, .. }
+        | BoundExpr::Not(operand)
+        | BoundExpr::IsNull { operand, .. }
+        | BoundExpr::Cast { operand, .. } => folds_to_a_literal(operand),
+        BoundExpr::Arithmetic { left, right, .. }
+        | BoundExpr::Compare { left, right, .. }
+        | BoundExpr::Is { left, right, .. } => all(&[left, right]),
+        BoundExpr::And(left, right) | BoundExpr::Or(left, right) => all(&[left, right]),
+        BoundExpr::Between {
+            operand, low, high, ..
+        } => all(&[operand, low, high]),
+        BoundExpr::InList { operand, list, .. } => {
+            folds_to_a_literal(operand) && list.iter().all(folds_to_a_literal)
+        }
+        BoundExpr::Case {
+            operand,
+            branches,
+            otherwise,
+            ..
+        } => {
+            operand.as_ref().is_none_or(|held| folds_to_a_literal(held))
+                && branches
+                    .iter()
+                    .all(|(when, then)| folds_to_a_literal(when) && folds_to_a_literal(then))
+                && otherwise
+                    .as_ref()
+                    .is_none_or(|held| folds_to_a_literal(held))
+        }
+        _ => false,
+    }
 }

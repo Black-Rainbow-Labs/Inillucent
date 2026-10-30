@@ -103,6 +103,23 @@ impl Number {
     }
 }
 
+impl Number {
+    /// Orders two numbers the way SQLite's `RANGE` test does when a sum came out as NaN.
+    ///
+    /// SQLite stores NaN as NULL, and the test sorts a NULL below every number, so a NaN is the
+    /// lowest value there is and two NaNs are equal.
+    ///
+    /// @param other - the number to compare with
+    fn order_nan_lowest(self, other: Number) -> std::cmp::Ordering {
+        match (self.real().is_nan(), other.real().is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => self.order(other).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    }
+}
+
 /// One end of a frame, with the offset already resolved to a number.
 ///
 /// The offset expression is evaluated once per row by the caller, because the
@@ -446,6 +463,88 @@ pub fn frame_bounds<N: Into<Number>>(
     (low <= high && !partition.is_empty()).then_some((low, high))
 }
 
+/// Returns the last row the end of one row's frame reaches, or `None` when it reaches no row of the
+/// partition, whether or not the frame's start leaves that row out.
+///
+/// SQLite adds a row to an aggregate when the end of the frame passes it and takes it out when the
+/// start does, so a frame that is empty because its start is beyond the last row (`ROWS BETWEEN
+/// 1000 FOLLOWING AND UNBOUNDED FOLLOWING`) still added every row. A function that refuses an
+/// argument when it is stepped, such as `nth_value(a, 0)` or `median` over a text, raises its
+/// error there.
+///
+/// @param partition - the row's partition
+/// @param row - the row whose frame this is
+/// @param spec - the frame, with its offsets already resolved
+/// @param order_value - as for [`frame`]
+/// @param descending - whether that ordering term is descending
+pub fn frame_end<N: Into<Number>>(
+    partition: &Partition,
+    row: usize,
+    spec: &FrameSpec,
+    order_value: impl Fn(usize) -> Option<N>,
+    descending: bool,
+) -> Option<usize> {
+    let order_value = |member: usize| order_value(member).map(Into::into);
+    if partition.is_empty() {
+        return None;
+    }
+    bound_of(
+        partition,
+        row,
+        spec,
+        spec.end,
+        false,
+        &order_value,
+        descending,
+    )
+}
+
+/// Reports whether a `ROWS` or `GROUPS` frame starts after it ends whatever the data is, as in
+/// `ROWS BETWEEN 1 FOLLOWING AND 0 FOLLOWING`.
+///
+/// SQLite adds no row to a `median` or another percentile when the frame is empty for that reason,
+/// so such a frame never raises the error a bad value raises when it is added. A `RANGE` frame
+/// written the same way does add its rows, and `nth_value` adds them in either unit.
+///
+/// @param spec - the frame, with its offsets already resolved
+pub fn starts_after_end(spec: &FrameSpec) -> bool {
+    spec.unit != FrameUnit::Range && position_of(spec.start) > position_of(spec.end)
+}
+
+/// Returns where one end of a frame sits relative to the current row, with the unbounded ends at
+/// the two infinities, so two ends can be compared before any row is read.
+///
+/// @param bound - one end of a frame
+fn position_of(bound: Bound) -> f64 {
+    match bound {
+        Bound::UnboundedPreceding => f64::NEG_INFINITY,
+        Bound::UnboundedFollowing => f64::INFINITY,
+        Bound::CurrentRow => 0.0,
+        Bound::Offset {
+            distance,
+            preceding,
+        } => {
+            let far = distance as f64;
+            if preceding {
+                -far
+            } else {
+                far
+            }
+        }
+        Bound::RangeOffset {
+            distance,
+            preceding,
+        } => {
+            let far = distance.real();
+            if preceding {
+                -far
+            } else {
+                far
+            }
+        }
+    }
+}
+
 /// Returns the rows of one row's frame, in partition order.
 ///
 /// @param partition - the row's partition
@@ -714,7 +813,28 @@ fn range_bound(
             })
         }
     };
-    let limit = here.shifted(offset, preceding != descending);
+    // **A `PRECEDING` offset is added to the candidate row and a `FOLLOWING` offset to the current
+    // row, which is how SQLite tests a `RANGE` frame.** The two sums are not the same test once a
+    // double rounds. Over 0.1 to 0.5 in steps of 0.1, `RANGE BETWEEN 0.1 PRECEDING AND 0.1
+    // FOLLOWING` on 0.4 holds 0.3 because 0.3 + 0.1 is 0.4, where 0.4 - 0.1 is 0.30000000000000004
+    // and excluded it; on 0.3 it holds 0.4 because 0.3 + 0.1 is 0.4. The offset is added when the
+    // window sorts ascending and taken away when it sorts descending. The same split gave a
+    // different answer for an offset of 1e300 and for infinity.
+    //
+    // **A sum that is not a number is the lowest value there is.** `-Inf` plus an infinite offset
+    // is NaN, which SQLite stores as NULL and sorts below every number.
+    //
+    // **The first row of a partition keeps its own start.** SQLite moves the start of the frame
+    // only after it has moved to the next row, so the first row's frame begins at the first row
+    // even when the sum above is NaN or rounds past the row's own value.
+    if is_start && preceding && row == partition.start {
+        return Some(partition.start);
+    }
+    let limit = if preceding {
+        here
+    } else {
+        here.shifted(offset, preceding != descending)
+    };
     // **NULL rows sit beyond every value at the end they sort to.** SQLite
     // compares a bound with a NULL row's value as though the NULL were smaller
     // than any number in the order the window sorts by, so the NULLs at the
@@ -732,14 +852,15 @@ fn range_bound(
     let effective = |member: usize| match order_value(member) {
         None => null_value,
         Some(value) if value.real().is_nan() => Number::Real(f64::INFINITY),
+        Some(value) if preceding => value.shifted(offset, preceding == descending),
         Some(value) => value,
     };
     let inside = |member: usize| {
         let value = effective(member);
-        let order = value.order(limit);
+        let order = value.order_nan_lowest(limit);
         match (is_start, descending) {
-            (true, false) | (false, true) => order.is_some_and(|found| found.is_ge()),
-            (true, true) | (false, false) => order.is_some_and(|found| found.is_le()),
+            (true, false) | (false, true) => order.is_ge(),
+            (true, true) | (false, false) => order.is_le(),
         }
     };
     // **A binary search, because the partition is sorted.** The values run in
@@ -948,6 +1069,39 @@ mod tests {
             frame(&partition, 2, &spec, |row| Some(values[row]), false),
             vec![2, 3]
         );
+    }
+
+    /// A `PRECEDING` offset is added to the candidate row and a `FOLLOWING` offset to the current
+    /// row, so a double that rounds does not move a row out of the frame.
+    ///
+    /// Over 0.1 to 0.5 in steps of 0.1, `RANGE BETWEEN 0.1 PRECEDING AND 0.1 FOLLOWING` holds 0.3,
+    /// 0.4 and 0.5 on 0.4 in SQLite, because 0.3 + 0.1 is 0.4. The frame was computed as the
+    /// candidate against the current value minus the offset, and 0.4 - 0.1 is
+    /// 0.30000000000000004, so 0.3 fell outside it.
+    #[test]
+    fn a_real_range_offset_adds_the_offset_to_the_candidate_or_the_current_row() {
+        let values = [0.1f64, 0.2, 0.3, 0.4, 0.5];
+        let partition = one(&[1, 2, 3, 4, 5]);
+        let spec = FrameSpec {
+            unit: FrameUnit::Range,
+            start: Bound::RangeOffset {
+                distance: Number::Real(0.1),
+                preceding: true,
+            },
+            end: Bound::RangeOffset {
+                distance: Number::Real(0.1),
+                preceding: false,
+            },
+            exclude: FrameExclude::NoOthers,
+        };
+        let order = |row: usize| Some(values[row]);
+        assert_eq!(frame(&partition, 3, &spec, order, false), vec![2, 3, 4]);
+        assert_eq!(frame(&partition, 2, &spec, order, false), vec![1, 2, 3]);
+        // Sorted descending, the frame of 0.4 holds 0.5 and 0.4 and not 0.3, as SQLite answers,
+        // because 0.4 - 0.1 is 0.30000000000000004 and 0.3 is below it.
+        let descending: Vec<f64> = values.iter().rev().copied().collect();
+        let order_down = |row: usize| Some(descending[row]);
+        assert_eq!(frame(&partition, 1, &spec, order_down, true), vec![0, 1]);
     }
 
     /// A frame written entirely off one end of the partition is empty.

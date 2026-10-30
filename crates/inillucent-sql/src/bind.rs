@@ -2529,6 +2529,7 @@ impl<'a> Binder<'a> {
             },
         };
         self.check_call_arity(&call, bound_arguments.len(), star, name, span)?;
+        self.refuse_filter_on_plain_window(&call, filter.is_some(), span)?;
         if distinct {
             return Err(refused(
                 "DISTINCT is not supported for window functions",
@@ -2565,17 +2566,13 @@ impl<'a> Binder<'a> {
                     BoundFrameBound::CurrentRow
                 },
             ),
-            (Some(start), None) => (
-                self.bind_frame_bound(start, span)?,
-                BoundFrameBound::CurrentRow,
-            ),
-            (Some(start), Some(end)) => (
-                self.bind_frame_bound(start, span)?,
-                self.bind_frame_bound(end, span)?,
-            ),
+            (Some(start), None) => (self.bind_frame_bound(start)?, BoundFrameBound::CurrentRow),
+            (Some(start), Some(end)) => {
+                (self.bind_frame_bound(start)?, self.bind_frame_bound(end)?)
+            }
             (None, Some(end)) => (
                 BoundFrameBound::UnboundedPreceding,
-                self.bind_frame_bound(end, span)?,
+                self.bind_frame_bound(end)?,
             ),
         };
         let starts_after_end = window_rules::starts_after_end(&start, &end);
@@ -2633,34 +2630,18 @@ impl<'a> Binder<'a> {
     }
 
     /// Binds one end of a frame.
-    fn bind_frame_bound(
-        &mut self,
-        bound: FrameBound,
-        span: Span,
-    ) -> Result<BoundFrameBound, ParseError> {
+    fn bind_frame_bound(&mut self, bound: FrameBound) -> Result<BoundFrameBound, ParseError> {
         let bound = match bound {
             FrameBound::UnboundedPreceding => BoundFrameBound::UnboundedPreceding,
             FrameBound::CurrentRow => BoundFrameBound::CurrentRow,
             FrameBound::UnboundedFollowing => BoundFrameBound::UnboundedFollowing,
             FrameBound::Preceding(expr) => {
-                BoundFrameBound::Preceding(self.bind_frame_offset(expr, span)?)
+                BoundFrameBound::Preceding(self.bind_frame_offset(expr)?)
             }
             FrameBound::Following(expr) => {
-                BoundFrameBound::Following(self.bind_frame_offset(expr, span)?)
+                BoundFrameBound::Following(self.bind_frame_offset(expr)?)
             }
         };
-        Ok(bound)
-    }
-
-    /// Binds a frame offset, which may not read a column.
-    fn bind_frame_offset(&mut self, expr: ExprId, span: Span) -> Result<BoundExpr, ParseError> {
-        let bound = self.bind_expr(expr)?;
-        if !bound.is_constant() {
-            return Err(ParseError::new(
-                ParseErrorKind::Unsupported("a frame offset must be a constant"),
-                span,
-            ));
-        }
         Ok(bound)
     }
 
@@ -3599,6 +3580,7 @@ impl<'a> Binder<'a> {
                 over,
             } => {
                 if let Some(over) = over {
+                    self.refuse_order_by_in_window_call(name, !order_by.is_empty(), span)?;
                     return self.bind_window_call(name, distinct, arguments, filter, over, span);
                 }
                 // **`FILTER` and an in-argument `ORDER BY` belong to the

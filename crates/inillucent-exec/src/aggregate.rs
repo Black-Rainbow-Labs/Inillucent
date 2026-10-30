@@ -155,23 +155,78 @@ impl Percentile {
     ///
     /// `median` ignores its (absent) second argument; `percentile` divides by a
     /// hundred; the other two take the argument as written. A fraction outside
-    /// the range, or one that is not a number, has no answer and the aggregate
-    /// reports NULL rather than clamping - which is what the reference does.
+    /// the range, or one that is not a number, is an error naming the aggregate,
+    /// which is what the reference answers.
     ///
     /// @param argument - the second argument's value, when there is one
-    fn fraction(self, argument: Option<f64>) -> Option<f64> {
-        let fraction = match self {
-            Percentile::Median => 0.5,
-            Percentile::Hundredths => argument? / 100.0,
-            Percentile::Continuous | Percentile::Discrete => argument?,
+    pub(crate) fn fraction(self, argument: Option<&Value<'static>>) -> DbResult<f64> {
+        let (divisor, upper) = match self {
+            Percentile::Median => return Ok(0.5),
+            Percentile::Hundredths => (100.0, "100.0"),
+            Percentile::Continuous | Percentile::Discrete => (1.0, "1.0"),
         };
-        (0.0..=1.0).contains(&fraction).then_some(fraction)
+        let given = argument.cloned().unwrap_or(Value::Null);
+        let number = match inillucent_value::affinity::apply_numeric_affinity(given, true) {
+            Value::Integer(held) => Some(held as f64),
+            Value::Real(held) => Some(held),
+            _ => None,
+        };
+        match number.map(|held| held / divisor) {
+            Some(fraction) if (0.0..=1.0).contains(&fraction) => Ok(fraction),
+            _ => Err(inillucent_base::error::statement_refusal(format!(
+                "the fraction argument to {}() is not between 0.0 and {upper}",
+                self.name()
+            ))),
+        }
+    }
+
+    /// Returns the SQL name SQLite's error messages use for this aggregate.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Percentile::Median => "median",
+            Percentile::Hundredths => "percentile",
+            Percentile::Continuous => "percentile_cont",
+            Percentile::Discrete => "percentile_disc",
+        }
     }
 
     /// Returns whether the answer may be a value no row held.
     fn interpolates(self) -> bool {
         !matches!(self, Percentile::Discrete)
     }
+}
+
+/// Returns what a percentile aggregate answers over values already sorted, lowest first.
+///
+/// A sliding window frame keeps its values sorted as rows enter and leave and calls this for every
+/// row, so the answer is the one [`Accumulator::finish`] gives. An empty list answers NULL.
+///
+/// `percentile_disc` picks a row; the other three interpolate between the two rows the position
+/// falls between.
+///
+/// @param which - which of the four is being computed
+/// @param fraction - the fraction of the way through the values, from 0 to 1
+/// @param values - the values, sorted
+pub(crate) fn percentile_of_sorted(which: Percentile, fraction: f64, values: &[f64]) -> OwnedDatum {
+    if values.is_empty() {
+        return OwnedDatum::Null;
+    }
+    let last = values.len().saturating_sub(1);
+    let position = fraction * last as f64;
+    if !which.interpolates() {
+        // The row the position lands *in*, which is what "discrete" means:
+        // an answer some row actually held. It rounds down rather than to
+        // nearest, so `percentile_disc(x, 0.5)` over four rows is the
+        // second of them and not the third - measured against the
+        // reference, which is the only way to get this one right.
+        let at = position.floor().max(0.0) as usize;
+        return OwnedDatum::Real(values.get(at.min(last)).copied().unwrap_or(f64::NAN));
+    }
+    let below = position.floor().max(0.0) as usize;
+    let above = position.ceil().max(0.0) as usize;
+    let low = values.get(below.min(last)).copied().unwrap_or(f64::NAN);
+    let high = values.get(above.min(last)).copied().unwrap_or(f64::NAN);
+    OwnedDatum::Real(low + (high - low) * (position - below as f64))
 }
 
 /// How one key of an aggregate's own `ORDER BY` is compared.
@@ -376,7 +431,7 @@ struct Rare {
     /// `["{\"id\":1}"]` where SQLite answers `[{"id":1}]`.
     json_marks: Vec<u32>,
     /// The joined text, for `group_concat`.
-    joined: String,
+    joined: Vec<u8>,
     /// Whether the joined text would have passed the value limit, so the answer
     /// is the refusal and not a string.
     joined_too_big: bool,
@@ -384,6 +439,11 @@ struct Rare {
     ///
     /// Empty for every built-in, which is what makes them pay nothing for it.
     rows: Vec<Vec<inillucent_value::value::Value<'static>>>,
+    /// Whether `group_concat` records how long each piece of `joined` is, so the oldest piece can
+    /// be taken off the front again. Only a window frame that slides asks for it.
+    track_pieces: bool,
+    /// The length in bytes of each value in `joined`, oldest first, separators not counted.
+    pieces: std::collections::VecDeque<usize>,
 }
 
 /// Returns a real result, or NULL when it is NaN.
@@ -643,6 +703,67 @@ impl Accumulator {
         seen.first_sight(&datum.borrow(), scratch)
     }
 
+    /// Tells a `group_concat` to remember where each value ends, so that [`Accumulator::pull_oldest`]
+    /// can take the oldest one back out. Costs one length per value, and only for the accumulator
+    /// that asks.
+    pub fn track_pieces(&mut self) {
+        self.rare_mut().track_pieces = true;
+    }
+
+    /// Reports whether a `group_concat` stopped growing at the value limit.
+    ///
+    /// The limit is remembered for good, so an accumulator that slides cannot go on: a later frame
+    /// that is small enough would still answer the refusal. The caller computes the remaining rows
+    /// frame by frame instead.
+    pub fn is_overfull(&self) -> bool {
+        self.rare.as_ref().is_some_and(|rare| rare.joined_too_big)
+    }
+
+    /// Takes the oldest row back out of an aggregate that keeps its rows, as a sliding window
+    /// frame needs when its first row leaves.
+    ///
+    /// **Only the aggregates that a frame computes from a list of its rows.** A percentile, a JSON
+    /// group aggregate and a `group_concat` whose separator is a value of each row drop the first
+    /// row they collected. A `group_concat` with a fixed separator drops the first value and the
+    /// separator after it, which needs [`Accumulator::track_pieces`] to have been asked for before
+    /// the value was added. The counts and `min` and `max` have no inverse here: a window computes
+    /// them without an accumulator. Does nothing for any other kind, and when no row is held.
+    ///
+    /// Before this a frame whose start moved was rebuilt from its rows for every row of the
+    /// partition, which made `median(v) OVER (ORDER BY id ROWS 300 PRECEDING)` 24 times slower
+    /// than SQLite, and `group_concat` and `json_group_array` 11 and 14 times.
+    pub fn pull_oldest(&mut self) {
+        self.count = self.count.saturating_sub(1);
+        let kind = self.kind.clone();
+        let Some(rare) = self.rare.as_deref_mut() else {
+            return;
+        };
+        match kind {
+            AggregateKind::Percentile(_) | AggregateKind::GroupConcatComputed
+                if !rare.rows.is_empty() =>
+            {
+                rare.rows.remove(0);
+            }
+            AggregateKind::JsonGroupArray(_) | AggregateKind::JsonGroupObject(_) => {
+                if !rare.json_rows.is_empty() {
+                    rare.json_rows.remove(0);
+                }
+                if !rare.json_marks.is_empty() {
+                    rare.json_marks.remove(0);
+                }
+            }
+            AggregateKind::GroupConcat(separator) => {
+                let Some(piece) = rare.pieces.pop_front() else {
+                    return;
+                };
+                let more = !rare.pieces.is_empty();
+                let taken = piece.saturating_add(if more { separator.len() } else { 0 });
+                rare.joined.drain(..taken.min(rare.joined.len()));
+            }
+            _ => {}
+        }
+    }
+
     /// Folds a whole batch's worth of rows into a `count(*)`.
     ///
     /// **Design 4 of task-2000: `count(*)` is a batch's row count, not a loop.**
@@ -844,9 +965,14 @@ impl Accumulator {
                     return;
                 }
                 if !first {
-                    rare.joined.push_str(separator);
+                    rare.joined.extend_from_slice(separator.as_bytes());
                 }
-                rare.joined.push_str(&render(value));
+                let before = rare.joined.len();
+                rare.joined.extend_from_slice(&render(value));
+                if rare.track_pieces {
+                    let piece = rare.joined.len().saturating_sub(before);
+                    rare.pieces.push_back(piece);
+                }
             }
             // Unreachable: `AggregateSpec::takes_whole_row` sends all three of
             // these through `push_values`. Stated rather than folded into
@@ -866,7 +992,7 @@ impl Accumulator {
     /// makes `group_concat(s, n)` over `('a',1),('b',2)` read `a2b` rather
     /// than `1a2b`. See [`AggregateKind::GroupConcatComputed`].
     fn group_concat_computed(&self) -> DbResult<OwnedDatum> {
-        let mut joined = String::new();
+        let mut joined: Vec<u8> = Vec::new();
         let mut any = false;
         for row in self.kept_rows() {
             let Some(value) = row.first() else {
@@ -890,15 +1016,15 @@ impl Accumulator {
             if any {
                 if let Some(separator) = row.get(1) {
                     if !matches!(separator, inillucent_value::value::Value::Null) {
-                        joined.push_str(&text_of(separator));
+                        joined.extend_from_slice(&text_of(separator));
                     }
                 }
             }
-            joined.push_str(&text_of(value));
+            joined.extend_from_slice(&text_of(value));
             any = true;
         }
         Ok(if any {
-            OwnedDatum::Text(joined.into_bytes())
+            OwnedDatum::Text(joined)
         } else {
             OwnedDatum::Null
         })
@@ -919,40 +1045,54 @@ impl Accumulator {
     /// complete until now.
     ///
     /// @param which - which of the four is being computed
-    fn finish_percentile(&self, which: Percentile) -> OwnedDatum {
-        let argument = self
-            .kept_rows()
-            .first()
-            .and_then(|row| row.get(1))
-            .and_then(numeric_value);
-        let Some(fraction) = which.fraction(argument) else {
-            return OwnedDatum::Null;
+    fn finish_percentile(&self, which: Percentile) -> DbResult<OwnedDatum> {
+        let (fraction, mut values) = self.percentile_inputs(which)?;
+        let (Some(fraction), false) = (fraction, values.is_empty()) else {
+            return Ok(OwnedDatum::Null);
         };
-        let mut values: Vec<f64> = self
-            .kept_rows()
-            .iter()
-            .filter_map(|row| row.first().and_then(numeric_value))
-            .collect();
-        if values.is_empty() {
-            return OwnedDatum::Null;
-        }
         values.sort_by(|left, right| left.total_cmp(right));
-        let last = values.len().saturating_sub(1);
-        let position = fraction * last as f64;
-        if !which.interpolates() {
-            // The row the position lands *in*, which is what "discrete" means:
-            // an answer some row actually held. It rounds down rather than to
-            // nearest, so `percentile_disc(x, 0.5)` over four rows is the
-            // second of them and not the third - measured against the
-            // reference, which is the only way to get this one right.
-            let at = position.floor().max(0.0) as usize;
-            return OwnedDatum::Real(values.get(at.min(last)).copied().unwrap_or(f64::NAN));
+        Ok(percentile_of_sorted(which, fraction, &values))
+    }
+
+    /// Reads the collected rows of a percentile aggregate the way SQLite steps them.
+    ///
+    /// **Every row is checked in arrival order, as SQLite's step does.** The fraction of a row is
+    /// checked first, even when its value is NULL, then compared with the fraction of the rows
+    /// before it, and only then is a NULL value skipped or a text or blob value refused with
+    /// `input to median() is not numeric`. A text that looks like a number is refused too. This
+    /// accepted every value as a number and the first row's fraction for the whole group, so
+    /// `median('abc')` answered a number and a fraction that varied by row answered a value where
+    /// SQLite raises an error. A group with no rows is never checked and answers NULL.
+    ///
+    /// @param which - which of the four is being computed
+    fn percentile_inputs(&self, which: Percentile) -> DbResult<(Option<f64>, Vec<f64>)> {
+        use inillucent_value::value::Value;
+        let mut fraction: Option<f64> = None;
+        let mut values: Vec<f64> = Vec::new();
+        for row in self.kept_rows() {
+            let wanted = which.fraction(row.get(1))?;
+            match fraction {
+                Some(held) if held != wanted => {
+                    return Err(inillucent_base::error::statement_refusal(format!(
+                        "the fraction argument to {}() is not the same for all input rows",
+                        which.name()
+                    )));
+                }
+                _ => fraction = Some(wanted),
+            }
+            match row.first() {
+                None | Some(Value::Null) => {}
+                Some(Value::Integer(number)) => values.push(*number as f64),
+                Some(Value::Real(number)) => values.push(*number),
+                Some(_) => {
+                    return Err(inillucent_base::error::statement_refusal(format!(
+                        "input to {}() is not numeric",
+                        which.name()
+                    )));
+                }
+            }
         }
-        let below = position.floor().max(0.0) as usize;
-        let above = position.ceil().max(0.0) as usize;
-        let low = values.get(below.min(last)).copied().unwrap_or(f64::NAN);
-        let high = values.get(above.min(last)).copied().unwrap_or(f64::NAN);
-        OwnedDatum::Real(low + (high - low) * (position - below as f64))
+        Ok((fraction, values))
     }
 
     /// Returns the box that holds every polygon the group held.
@@ -1301,7 +1441,7 @@ impl Accumulator {
             AggregateKind::CountStar | AggregateKind::Count => OwnedDatum::Int(self.count),
             // The whole group at once, which is what the boundary promises.
             AggregateKind::External(body) => OwnedDatum::from((body.0)(self.kept_rows())?),
-            AggregateKind::Percentile(which) => self.finish_percentile(*which),
+            AggregateKind::Percentile(which) => self.finish_percentile(*which)?,
             AggregateKind::GeopolyBox => self.finish_geopoly_box(),
             AggregateKind::VectorFold(average) => self.finish_vector_fold(*average),
             AggregateKind::Sum => {
@@ -1408,7 +1548,7 @@ impl Accumulator {
                     OwnedDatum::Text(
                         self.rare
                             .as_ref()
-                            .map_or_else(Vec::new, |rare| rare.joined.clone().into_bytes()),
+                            .map_or_else(Vec::new, |rare| rare.joined.clone()),
                     )
                 }
             }
@@ -1493,9 +1633,14 @@ impl Accumulator {
                 // `group_concat` whose separator is a value of each row: the
                 // separator travels with the value it precedes, so folding the
                 // value alone would lose it (task-1913).
+                //
+                // A percentile too: its fraction is the second value of each row, and folding the
+                // first value alone left it with no fraction, so `percentile(a, 50 ORDER BY b)`
+                // answered NULL.
                 AggregateKind::JsonGroupArray(_)
                 | AggregateKind::JsonGroupObject(_)
-                | AggregateKind::GroupConcatComputed => {
+                | AggregateKind::GroupConcatComputed
+                | AggregateKind::Percentile(_) => {
                     folded.push_values_marked(row, marks);
                 }
                 // Everything else reduces one value, and a NULL is a row it
@@ -1533,7 +1678,7 @@ fn exceeds_value_limit(length: usize, added: usize) -> bool {
 /// Refuses an answer that reaches the value limit.
 ///
 /// @param value - the finished answer of an aggregate
-fn refuse_past_value_limit(value: &OwnedDatum) -> DbResult<()> {
+pub(crate) fn refuse_past_value_limit(value: &OwnedDatum) -> DbResult<()> {
     match value {
         OwnedDatum::Text(bytes) | OwnedDatum::Blob(bytes) if bytes.len() >= VALUE_LIMIT => {
             Err(string_too_big())
@@ -1573,50 +1718,38 @@ fn value_length(value: &inillucent_value::value::Value<'_>) -> usize {
     }
 }
 
-/// Renders a value as text, the way the dialect's text conversion does.
+/// Renders a value as text bytes, the way the dialect's text conversion does.
+///
+/// **The bytes of a text or blob are kept as they are.** SQLite's `group_concat` appends the bytes
+/// `sqlite3_value_text` returns, which for a blob or for text that is not valid UTF-8 are the
+/// stored bytes. Going through `String::from_utf8_lossy` replaced each invalid byte with U+FFFD,
+/// so `group_concat(x'ff')` answered EFBFBD where SQLite answers FF.
 ///
 /// @param value - the value to render
-fn render(value: &Datum<'_>) -> String {
+fn render(value: &Datum<'_>) -> Vec<u8> {
     match value {
-        Datum::Null => String::new(),
-        Datum::Int(number) => number.to_string(),
-        Datum::Real(number) => format_real(*number),
-        Datum::Text(bytes) | Datum::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        Datum::Null => Vec::new(),
+        Datum::Int(number) => number.to_string().into_bytes(),
+        Datum::Real(number) => format_real(*number).into_bytes(),
+        Datum::Text(bytes) | Datum::Blob(bytes) => bytes.to_vec(),
     }
 }
 
-/// Returns a value as the text `group_concat` writes into its answer.
+/// Returns a value as the text bytes `group_concat` writes into its answer.
 ///
 /// The same rendering [`render`] does, over the owned form the whole-row path
 /// collects: NULL is empty, a real is formatted the way the reference formats
-/// one, and a blob is its bytes.
+/// one, and a text or a blob is its bytes, invalid UTF-8 included.
 ///
 /// @param value - the collected value
-fn text_of(value: &inillucent_value::value::Value<'_>) -> String {
+fn text_of(value: &inillucent_value::value::Value<'_>) -> Vec<u8> {
     use inillucent_value::value::Value;
     match value {
-        Value::Null => String::new(),
-        Value::Integer(number) => number.to_string(),
-        Value::Real(number) => format_real(*number),
-        Value::Text(text) => String::from_utf8_lossy(&text.utf8_bytes()).into_owned(),
-        Value::Blob(blob) => String::from_utf8_lossy(blob.raw()).into_owned(),
-    }
-}
-
-/// Returns a value as a number, or nothing when it is not one.
-///
-/// A percentile is arithmetic over the group, so a text value that looks like a
-/// number counts and one that does not is skipped - the same rule `sum()`
-/// follows, and the reason both are written in terms of the dialect's own
-/// coercion rather than Rust's parser.
-///
-/// @param value - one collected argument
-fn numeric_value(value: &inillucent_value::value::Value<'static>) -> Option<f64> {
-    match value {
-        inillucent_value::value::Value::Null => None,
-        inillucent_value::value::Value::Integer(number) => Some(*number as f64),
-        inillucent_value::value::Value::Real(number) => Some(*number),
-        other => Some(inillucent_value::cast::real_value(other)),
+        Value::Null => Vec::new(),
+        Value::Integer(number) => number.to_string().into_bytes(),
+        Value::Real(number) => format_real(*number).into_bytes(),
+        Value::Text(text) => text.utf8_bytes().to_vec(),
+        Value::Blob(blob) => blob.raw().to_vec(),
     }
 }
 
@@ -1857,5 +1990,149 @@ mod tests {
             std::cmp::Ordering::Equal
         );
         assert!(matches!(dense.finish().unwrap(), OwnedDatum::Int(124_750)));
+    }
+
+    /// `group_concat` appends the bytes of a blob and of text that is not UTF-8 as they are.
+    ///
+    /// It replaced each invalid byte with U+FFFD, so `group_concat(x'ff')` answered EFBFBD where
+    /// SQLite answers FF.
+    #[test]
+    fn group_concat_keeps_invalid_utf8_bytes() {
+        let blobs = [Datum::Blob(&[0xff]), Datum::Blob(&[0xfe, 0x41])];
+        let joined = fold(AggregateKind::GroupConcat(",".into()), &blobs);
+        assert_eq!(joined, OwnedDatum::Text(vec![0xff, b',', 0xfe, 0x41]));
+        let text = [Datum::Text(&[0xc3]), Datum::Text(&[0x28])];
+        let joined = fold(AggregateKind::GroupConcat("-".into()), &text);
+        assert_eq!(joined, OwnedDatum::Text(vec![0xc3, b'-', 0x28]));
+    }
+
+    /// A separator that is a value of each row keeps its bytes too.
+    #[test]
+    fn group_concat_with_a_blob_separator_keeps_its_bytes() {
+        use inillucent_value::value::Value;
+        let mut accumulator = Accumulator::new(AggregateKind::GroupConcatComputed);
+        for letter in [b"a", b"b"] {
+            accumulator.push_values(vec![
+                Value::owned_text(letter).unwrap(),
+                Value::owned_blob(&[0xff]).unwrap(),
+            ]);
+        }
+        let joined = accumulator.finish().unwrap();
+        assert_eq!(joined, OwnedDatum::Text(vec![b'a', 0xff, b'b']));
+    }
+
+    /// `median` and the percentiles refuse a value that is not an integer or a real, naming the
+    /// function, and a text that spells a number is refused too.
+    #[test]
+    fn a_percentile_of_text_or_a_blob_is_an_error() {
+        use inillucent_value::value::Value;
+        let refused = |kind: Percentile, with_fraction: bool, value: Value<'static>| {
+            let mut accumulator = Accumulator::new(AggregateKind::Percentile(kind));
+            let mut first = vec![Value::Integer(2)];
+            let mut second = vec![value];
+            if with_fraction {
+                first.push(Value::Integer(50));
+                second.push(Value::Integer(50));
+            }
+            accumulator.push_values(first);
+            accumulator.push_values(second);
+            accumulator
+                .finish()
+                .expect_err("a value that is not numeric")
+                .message()
+                .to_string()
+        };
+        for value in [
+            Value::owned_text(b"abc").unwrap(),
+            Value::owned_text(b"1").unwrap(),
+            Value::owned_blob(b"1").unwrap(),
+        ] {
+            assert_eq!(
+                refused(Percentile::Median, false, value.clone()),
+                "input to median() is not numeric"
+            );
+            assert_eq!(
+                refused(Percentile::Hundredths, true, value),
+                "input to percentile() is not numeric"
+            );
+        }
+    }
+
+    /// A fraction outside its range, or one that is not a number, is an error naming the
+    /// function and the range, and a fraction that changes between rows is an error too.
+    #[test]
+    fn a_percentile_fraction_is_checked() {
+        use inillucent_value::value::Value;
+        let cases: [(Percentile, Value<'static>, &str); 4] = [
+            (
+                Percentile::Hundredths,
+                Value::Integer(101),
+                "percentile() is not between 0.0 and 100.0",
+            ),
+            (
+                Percentile::Continuous,
+                Value::Real(1.5),
+                "percentile_cont() is not between 0.0 and 1.0",
+            ),
+            (
+                Percentile::Discrete,
+                Value::Real(-0.5),
+                "percentile_disc() is not between 0.0 and 1.0",
+            ),
+            (
+                Percentile::Hundredths,
+                Value::Null,
+                "percentile() is not between 0.0 and 100.0",
+            ),
+        ];
+        for (kind, fraction, wanted) in cases {
+            let mut accumulator = Accumulator::new(AggregateKind::Percentile(kind));
+            accumulator.push_values(vec![Value::Integer(1), fraction]);
+            let error = accumulator.finish().expect_err("a fraction out of range");
+            assert_eq!(
+                error.message(),
+                format!("the fraction argument to {wanted}")
+            );
+        }
+        let mut accumulator = Accumulator::new(AggregateKind::Percentile(Percentile::Hundredths));
+        accumulator.push_values(vec![Value::Integer(1), Value::Integer(10)]);
+        accumulator.push_values(vec![Value::Integer(2), Value::Integer(20)]);
+        let error = accumulator.finish().expect_err("a fraction that changes");
+        assert_eq!(
+            error.message(),
+            "the fraction argument to percentile() is not the same for all input rows"
+        );
+    }
+
+    /// Taking the oldest value out of a `group_concat` leaves the others joined by the separator,
+    /// and an empty string is a value like any other.
+    #[test]
+    fn pulling_the_oldest_group_concat_value_drops_it_and_one_separator() {
+        let mut accumulator = Accumulator::new(AggregateKind::GroupConcat(",".into()));
+        accumulator.track_pieces();
+        for value in [
+            Datum::Text(b""),
+            Datum::Text(b"x"),
+            Datum::Null,
+            Datum::Text(b"yz"),
+        ] {
+            accumulator.push(&value);
+        }
+        assert_eq!(
+            accumulator.finish().unwrap(),
+            OwnedDatum::Text(b",x,yz".to_vec())
+        );
+        accumulator.pull_oldest();
+        assert_eq!(
+            accumulator.finish().unwrap(),
+            OwnedDatum::Text(b"x,yz".to_vec())
+        );
+        accumulator.pull_oldest();
+        assert_eq!(
+            accumulator.finish().unwrap(),
+            OwnedDatum::Text(b"yz".to_vec())
+        );
+        accumulator.pull_oldest();
+        assert_eq!(accumulator.finish().unwrap(), OwnedDatum::Null);
     }
 }
