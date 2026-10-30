@@ -12,6 +12,55 @@ use inillucent_tree::datum::OwnedDatum;
 use crate::engine::integrity::CheckDepth;
 use crate::Outcome;
 
+/// The most lines `integrity_check` reports when it is not given a number.
+const DEFAULT_ERROR_LIMIT: usize = 100;
+
+/// Reads the argument of `integrity_check` or `quick_check`.
+///
+/// A number is how many problems to stop at, where zero or less means the default, and anything
+/// else names the one table to check.
+///
+/// @param argument - the pragma's argument, when it has one
+fn check_arguments(argument: Option<&PragmaArgument>) -> (usize, Option<Vec<u8>>) {
+    let Some(argument) = argument else {
+        return (DEFAULT_ERROR_LIMIT, None);
+    };
+    let text = argument_text(argument);
+    match text.trim().parse::<i32>() {
+        Ok(number) if number > 0 => (usize::try_from(number).unwrap_or(DEFAULT_ERROR_LIMIT), None),
+        Ok(_) => (DEFAULT_ERROR_LIMIT, None),
+        Err(_) => (DEFAULT_ERROR_LIMIT, Some(text.to_ascii_lowercase().into_bytes())),
+    }
+}
+
+/// Builds the query that counts the rows of a table that break one of its `CHECK` constraints.
+///
+/// @param database - the connection, which names the schema
+/// @param table - the table
+/// @param at - the database the table is in
+fn check_violation_query(
+    database: &crate::ImportedDatabase,
+    table: &inillucent_sql::catalog_view::TableInfo,
+    at: usize,
+) -> String {
+    let quote = |text: &[u8]| String::from_utf8_lossy(text).replace('"', "\"\"");
+    let schema = inillucent_sql::catalog_view::CatalogView::database_name(
+        &database.schema.catalog,
+        at,
+    );
+    let broken: Vec<String> = table
+        .checks
+        .iter()
+        .map(|check| format!("NOT ({})", String::from_utf8_lossy(&check.expr_sql)))
+        .collect();
+    format!(
+        "SELECT count(*) FROM \"{}\".\"{}\" WHERE {}",
+        quote(schema),
+        quote(&table.name),
+        broken.join(" OR ")
+    )
+}
+
 impl crate::ImportedDatabase {
     /// Reports every row whose foreign key has no parent.
     ///
@@ -213,19 +262,76 @@ impl crate::ImportedDatabase {
         named: (Option<&PragmaArgument>, Option<usize>),
     ) -> DbResult<Outcome> {
         self.check_named_table(named.0, named.1)?;
-        let answer = match self.check_trees_to(depth) {
-            Ok(()) => b"ok".to_vec(),
-            Err(error) => error
-                .detail()
-                .unwrap_or(error.message())
-                .as_bytes()
-                .to_vec(),
-        };
+        let (limit, table) = check_arguments(named.0);
+        let mut found: Vec<String> = Vec::new();
+        if let Err(error) = self.check_trees_to(depth) {
+            found.push(error.detail().unwrap_or(error.message()).to_string());
+        }
+        found.extend(self.check_constraint_failures(table.as_deref(), named.1, limit)?);
+        found.truncate(limit);
+        if found.is_empty() {
+            found.push("ok".to_string());
+        }
         Ok(Outcome {
-            rows: vec![vec![OwnedDatum::Text(answer)]],
+            rows: found
+                .into_iter()
+                .map(|line| vec![OwnedDatum::Text(line.into_bytes())])
+                .collect(),
             names: std::rc::Rc::new(vec![column.into()]),
             changes: Default::default(),
         })
+    }
+
+    /// Returns one line for every row that breaks a `CHECK` constraint of its table.
+    ///
+    /// **Both `integrity_check` and `quick_check` read the rows against the constraints**, as
+    /// SQLite does, and a row that fails more than one constraint is reported once. A `NULL`
+    /// result passes, as it does on a write. Nothing is reported while
+    /// `PRAGMA ignore_check_constraints` is on, which is when SQLite skips the check too.
+    /// Tables are visited newest first within each database, the order SQLite walks its table
+    /// hash in, and the databases in the order `main`, `temp`, then the attached ones.
+    ///
+    /// @param only - one table's folded name, when the pragma named a table
+    /// @param at - the database the pragma was qualified with, when it was
+    /// @param limit - how many lines to stop at
+    fn check_constraint_failures(
+        &self,
+        only: Option<&[u8]>,
+        at: Option<usize>,
+        limit: usize,
+    ) -> DbResult<Vec<String>> {
+        let mut lines = Vec::new();
+        if self.pragmas.ignore_check_constraints() {
+            return Ok(lines);
+        }
+        let databases = match at {
+            Some(database) => vec![database],
+            None => self.schema_numbers(),
+        };
+        for database in databases {
+            let tables = self
+                .schema
+                .tables
+                .iter()
+                .filter(|table| table.database == database && !table.checks.is_empty());
+            let newest_first: Vec<_> = tables.collect::<Vec<_>>().into_iter().rev().collect();
+            for table in newest_first {
+                if only.is_some_and(|name| name != table.folded.as_slice()) {
+                    continue;
+                }
+                let broken = self.count_rows(&check_violation_query(self, table, database))?;
+                for _ in 0..broken.min(i64::try_from(limit).unwrap_or(i64::MAX)) {
+                    lines.push(format!(
+                        "CHECK constraint failed in {}",
+                        String::from_utf8_lossy(&table.name)
+                    ));
+                }
+                if lines.len() >= limit {
+                    return Ok(lines);
+                }
+            }
+        }
+        Ok(lines)
     }
     /// Refuses an `integrity_check` or `quick_check` argument that names a table that does not exist.
     ///

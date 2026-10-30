@@ -3168,9 +3168,12 @@ fn affinity_type(
     declared: &[u8],
     expression: Option<inillucent_value::affinity::Affinity>,
 ) -> &'static [u8] {
-    let affinity = match (declared.is_empty(), expression) {
-        (true, Some(held)) => held,
-        _ => inillucent_value::affinity::for_column(declared),
+    // The expression's own affinity wins when there is one: it is the column's real affinity,
+    // which the declared type does not give for an `ANY` column of a `STRICT` table. Its
+    // affinity is none, and the name `ANY` alone reads as NUMERIC.
+    let affinity = match expression {
+        Some(held) => held,
+        None => inillucent_value::affinity::for_column(declared),
     };
     match affinity {
         inillucent_value::affinity::Affinity::Blob => b"",

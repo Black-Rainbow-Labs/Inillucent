@@ -205,3 +205,46 @@ create table x(a);
 create trigger tr after insert on x begin select 1; end;
 select count(*) from sqlite_master where type='trigger';
 select count(*) from sqlite_temp_master where type='trigger';
+-- case: bug-hunt-11/pragma/D8-integrity-check-reports-each-row-and-each-table
+create table t(a check(a>0), b, c as (a*2) check(c<100), constraint c2 check(b<10 or b is null));
+create table u(x check(x>0));
+pragma ignore_check_constraints=on;
+insert into t(a,b) values(-1,1),(1,50),(-2,60),(5,null);
+insert into u values(-5),(3),(-7);
+pragma integrity_check;
+pragma integrity_check(1);
+pragma integrity_check(t);
+pragma quick_check(u);
+pragma ignore_check_constraints=off;
+pragma integrity_check(2);
+pragma quick_check;
+-- case: bug-hunt-11/pragma/D8-integrity-check-ignores-checks-while-they-are-ignored
+create table u(x check(x>0));
+pragma ignore_check_constraints=on;
+insert into u values(-5);
+pragma integrity_check;
+-- case: bug-hunt-11/pragma/D8-integrity-check-per-database
+create table m(x check(x>0));
+create temp table z(a check(a>1));
+pragma ignore_check_constraints=on;
+insert into m values(-1);
+insert into z values(0),(1);
+pragma ignore_check_constraints=off;
+pragma main.integrity_check;
+pragma temp.integrity_check;
+pragma integrity_check;
+pragma integrity_check(z);
+-- case: bug-hunt-11/pragma/D9-ctas-strict-any-in-every-source
+create table t(a any, b int, c text, d real, e blob, f any) strict;
+insert into t values('1',2,'x',1.5,x'00',3);
+select typeof(a), typeof(f) from t;
+create table n as select * from t;
+select sql from sqlite_master where name='n';
+create view v as select * from t;
+create table n2 as select * from v;
+select sql from sqlite_master where name='n2';
+create table n3 as select a as z, a+0 as y, cast(a as any) w, '1' as q from t;
+select sql from sqlite_master where name='n3';
+create table w(a any, b int);
+create table n4 as select * from w;
+select sql from sqlite_master where name='n4';

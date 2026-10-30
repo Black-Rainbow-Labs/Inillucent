@@ -207,7 +207,7 @@ impl crate::ImportedDatabase {
     /// Runs a query that returns one integer and returns it.
     ///
     /// @param sql - a `SELECT count(*)` statement
-    fn count_rows(&self, sql: &str) -> DbResult<i64> {
+    pub(crate) fn count_rows(&self, sql: &str) -> DbResult<i64> {
         let (rows, _) = self.run(sql)?;
         match rows.first().and_then(|row| row.first()) {
             Some(OwnedDatum::Int(count)) => Ok(*count),
