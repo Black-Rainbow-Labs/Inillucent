@@ -74,6 +74,14 @@ pub struct ParseError {
     pub span: Span,
 }
 
+/// Returns the refusal made when the calling thread's stack has too little room left to go one
+/// level deeper.
+///
+/// @param span - where in the statement the recursion stopped
+pub fn stack_exhausted(span: Span) -> ParseError {
+    ParseError::new(ParseErrorKind::LimitExceeded("stack space"), span)
+}
+
 impl ParseError {
     /// Returns a failure at a span.
     pub fn new(kind: ParseErrorKind, span: Span) -> ParseError {
@@ -127,6 +135,11 @@ impl ParseError {
                 "Expression tree is too large (maximum depth 1000)".to_string()
             }
             ParseErrorKind::LimitExceeded("parser stack depth") => "Recursion limit".to_string(),
+            // The calling thread's stack is smaller than the statement's nesting needs. SQLite has
+            // no such refusal, because it keeps its parser stack on the heap.
+            ParseErrorKind::LimitExceeded("stack space") => {
+                inillucent_base::stack::REFUSAL.to_string()
+            }
             ParseErrorKind::LimitExceeded(what) => format!("{what} exceeded"),
         }
     }
@@ -139,7 +152,9 @@ impl ParseError {
     /// which is the case for parser depth and compound depth.
     pub fn code(&self) -> PrimaryCode {
         match &self.kind {
-            ParseErrorKind::LimitExceeded("string or blob too big") => PrimaryCode::TooBig,
+            ParseErrorKind::LimitExceeded("string or blob too big" | "stack space") => {
+                PrimaryCode::TooBig
+            }
             _ => PrimaryCode::Error,
         }
     }

@@ -614,6 +614,141 @@ def test_a_failed_query_carries_the_rows_before_the_failure() -> None:
         raise AssertionError("row 4 did not fail through the command line")
 
 
+#: A script run in a process of its own, because a native stack overflow ends the process that
+#: runs it and a test that ran in the runner's own process would end the runner.
+_DEEP_SCRIPT = """
+import sys, threading
+sys.path.insert(0, sys.argv[1])
+from inillucent import Database, DriverError
+
+SHAPES = {
+    "or": lambda n: "SELECT " + " OR ".join("1=1" for _ in range(n)),
+    "subquery": lambda n: "SELECT " + "(SELECT " * n + "1" + ")" * n,
+    "view": None,
+}
+
+def attempt(shape, depth):
+    connection = Database(":memory:").connect()
+    if shape == "view":
+        connection.execute_batch("CREATE TABLE b (a)")
+        connection.execute_batch("CREATE VIEW v0 AS SELECT a FROM b")
+        for level in range(1, depth):
+            connection.execute_batch(f"CREATE VIEW v{level} AS SELECT a FROM v{level - 1}")
+        sql = f"SELECT count(*) FROM v{depth - 1}"
+    else:
+        sql = SHAPES[shape](depth)
+    try:
+        return "answered " + repr(connection.execute(sql).rows[0][0])
+    except DriverError as refused:
+        return "refused " + refused.status_name + ": " + refused.message
+
+def run(shape, depth):
+    print(shape, depth, attempt(shape, depth), flush=True)
+
+stack = int(sys.argv[2])
+if stack:
+    threading.stack_size(stack)
+    worker = threading.Thread(target=lambda: [run(s, d) for s, d in (("or", 400), ("subquery", 300), ("view", 600), ("subquery", 900))])
+    worker.start()
+    worker.join()
+else:
+    for shape, depth in (("or", 400), ("subquery", 300), ("view", 600), ("subquery", 900)):
+        run(shape, depth)
+print("done")
+"""
+
+
+def test_deeply_nested_sql_is_answered_or_refused_and_never_ends_the_process() -> None:
+    """400 ``OR`` terms, 300 nested subqueries and 600 chained views ended the process.
+
+    The engine used about 6 KB of native stack for each level of nesting, and Python's main thread
+    on Windows has 2,000,000 bytes and a thread started with ``threading.stack_size(1 << 20)`` has
+    1 MiB, so valid SQL overflowed the stack and the operating system ended the interpreter. Each
+    statement now answers or raises ``DriverError`` whose message names the stack.
+    """
+    import subprocess  # noqa: PLC0415
+
+    staged = _need()
+    for stack in (0, 1 << 20, 2_000_000):
+        run = subprocess.run(
+            [sys.executable, "-I", "-c", _DEEP_SCRIPT, str(staged["root"]), str(stack)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert run.returncode == 0, (stack, run.returncode, run.stdout, run.stderr[-500:])
+        lines = run.stdout.splitlines()
+        assert lines and lines[-1] == "done", (stack, run.stdout)
+        for line in lines[:-1]:
+            assert " answered " in line or ("refused too_big" in line and "stack" in line), (stack, line)
+        # A thread with 8 MiB answers what a small one may refuse, so a refusal is the stack's.
+    big = subprocess.run(
+        [sys.executable, "-I", "-c", _DEEP_SCRIPT, str(staged["root"]), str(8 << 20)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert big.returncode == 0, (big.returncode, big.stdout, big.stderr[-500:])
+    assert "or 400 answered 1" in big.stdout, big.stdout
+
+
+def test_fewer_values_than_parameters_is_refused() -> None:
+    """``INSERT INTO t VALUES (?1, ?2)`` with one value wrote a row holding a NULL it was never given.
+
+    Python's ``sqlite3`` raises ``Incorrect number of bindings supplied``. The driver raises
+    ``DriverError`` with the same words and the status ``INVALID_STATE``. Too many values has been
+    ``INVALID_STATE`` all along, with its own sentence.
+    """
+    module = _need()["module"]
+    database, _ = _database("bindings")
+    connection = database.connect()
+    connection.execute("CREATE TABLE t (a, b)")
+    for sql, params in (
+        ("INSERT INTO t VALUES (?1, ?2)", ["x"]),
+        ("INSERT INTO t VALUES (?1, ?2)", [1, 2, 3]),
+        ("SELECT ?1", None),
+    ):
+        try:
+            if params is None:
+                connection.execute(sql)
+            else:
+                connection.execute(sql, params)
+        except module.DriverError as refused:
+            assert refused.status == module.driver.INVALID_STATE, (sql, refused)
+            if params is None or len(params) < 2:
+                assert "Incorrect number of bindings supplied" in refused.message, refused.message
+        else:
+            raise AssertionError(f"{sql} with {params} ran")
+    assert connection.execute("SELECT count(*) FROM t").rows == [[0]]
+    connection.execute("INSERT INTO t VALUES (?1, ?2)", ["x", None])
+    assert connection.execute("SELECT count(*) FROM t").rows == [[1]]
+    database.close()
+
+
+def test_a_statement_or_transaction_is_refused_after_its_connection_closes() -> None:
+    """A ``Statement`` and a ``Transaction`` kept running, and committing, after ``Connection.close()``."""
+    module = _need()["module"]
+    database, _ = _database("closed")
+    connection = database.connect()
+    connection.execute("CREATE TABLE t (a)")
+    statement = connection.prepare("INSERT INTO t VALUES (?1)")
+    statement.execute([1])
+    transaction = connection.transaction()
+    transaction.execute("INSERT INTO t VALUES (2)")
+    connection.close()
+    for call in (lambda: statement.execute([3]), lambda: statement.execute_many([[4]]), lambda: transaction.execute("INSERT INTO t VALUES (5)")):
+        try:
+            call()
+        except module.DriverError as refused:
+            assert refused.status == module.driver.INVALID_STATE, refused
+        else:
+            raise AssertionError("a call on a closed connection ran")
+    statement.close()
+    reader = database.connect()
+    assert reader.execute("SELECT a FROM t ORDER BY a").rows == [[1]]
+    database.close()
+
+
 def main() -> int:
     """Run every test in this file, for a machine with no pytest."""
     failures = []

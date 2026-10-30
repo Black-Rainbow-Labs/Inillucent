@@ -3456,6 +3456,12 @@ name = "session"
 tier = "e2e"
 
 [[target]]
+package = "inillucent-driver"
+kind = "test"
+name = "small_stack"
+tier = "e2e"
+
+[[target]]
 package = "inillucent-driver-capi"
 kind = "test"
 name = "abi"

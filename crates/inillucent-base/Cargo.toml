@@ -9,6 +9,13 @@ description = "Checked binary primitives, identifiers, buffers, limits, and the 
 
 [dependencies]
 
+# The bounds of the calling thread's stack, for `stack.rs` and nothing else.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 # The one skip helper, compiled only when a consumer's test targets ask for it.
 #
 # **A feature rather than an always-on module (task-1969, 4.6).** `testing`

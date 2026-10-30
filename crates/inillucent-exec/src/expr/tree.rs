@@ -596,6 +596,20 @@ pub enum StaticType {
 /// @param expr - the expression to compile
 /// @param types - the static type of each input column
 pub fn compile(expr: &Expr, types: &[StaticType]) -> DbResult<Box<dyn Eval>> {
+    if !inillucent_base::stack::has_room() {
+        return Err(inillucent_base::stack::refusal());
+    }
+    compile_node(expr, types)
+}
+
+/// Compiles one node of an expression, after [`compile`] has checked the stack.
+///
+/// Its recorded length in `policy.rs` is the one `compile` had, which is why the check is in a
+/// function of its own.
+///
+/// @param expr - the expression to compile
+/// @param types - the static type of each input column
+fn compile_node(expr: &Expr, types: &[StaticType]) -> DbResult<Box<dyn Eval>> {
     Ok(match expr {
         Expr::Column(index) => Box::new(ColumnRef { index: *index }),
         Expr::RowOffset { boundaries, rowid } => Box::new(RowOffsetOf {

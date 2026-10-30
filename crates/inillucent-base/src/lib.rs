@@ -57,6 +57,10 @@ pub mod page;
 pub mod probe;
 pub mod rng;
 pub mod sha3;
+/// How much stack the calling thread has left. The second module here that calls the operating
+/// system, for the one question the standard library cannot answer.
+#[allow(unsafe_code)]
+pub mod stack;
 /// The hasher this engine's own hash tables use - see the module for why it is
 /// not SipHash and not a checksum.
 pub mod table_hash;

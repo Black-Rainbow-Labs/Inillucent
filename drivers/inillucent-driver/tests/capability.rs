@@ -118,7 +118,10 @@ fn probe_with(name: &str, setup: &[&str], sql: &str, want_value: bool, register:
             }
         }
     }
-    let outcome = match connection.query(sql, &[], usize::MAX) {
+    // A parameter with no value is refused, so each one the statement declares is bound to 1.
+    let declared = connection.parameter_count(sql).unwrap_or(0);
+    let bound = vec![Value::Integer(1); declared as usize];
+    let outcome = match connection.query(sql, &bound, usize::MAX) {
         Err(why) => Outcome::Refused(format!("{}: {}", why.status.name(), why.message)),
         Ok(rows) if want_value => Outcome::Answered(match rows.value(0, 0) {
             Some(Value::Text(text)) => text.clone(),

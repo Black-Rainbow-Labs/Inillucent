@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 28] = [
+const UNSAFE_ALLOWED: [&str; 29] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -122,6 +122,13 @@ const UNSAFE_ALLOWED: [&str; 28] = [
     // test compares every answer with the table implementation at every
     // length to 300 bytes and random lengths to 70 KiB.
     "crates/inillucent-base/src/crc_hardware.rs",
+    // **How much stack the calling thread has left, so a statement that nests too deeply is
+    // refused instead of overflowing it.** A language binding runs a statement on its caller's
+    // thread, which may have 1 or 2 MB, and the standard library cannot report a thread's stack
+    // bounds. One call per operating system (`GetCurrentThreadStackLimits`, `pthread_getattr_np`,
+    // `pthread_get_stackaddr_np`), each writing integers on the caller's frame and keeping nothing,
+    // each with its SAFETY note.
+    "crates/inillucent-base/src/stack.rs",
     // **The AVX2 dot product, added by task-2000's design 9.** It is the one place
     // in the engine where safe Rust cannot express the thing that has to happen: a
     // 256-bit fused multiply-add is an intrinsic, every intrinsic in
@@ -2732,12 +2739,20 @@ const FUNCTION_CEILINGS: [(&str, &str, usize); 52] = [
     ("crates/inillucent-compat/src/bin/fullgate.rs", "run", 263),
     ("crates/inillucent-compat/src/bin/readgate.rs", "run", 280),
     ("crates/inillucent-compat/src/bin/writegate.rs", "run", 226),
-    ("crates/inillucent-sql/src/bind.rs", "bind_expr", 303),
+    (
+        "crates/inillucent-sql/src/bind.rs",
+        "bind_expr_general",
+        303,
+    ),
     ("crates/inillucent-engine/src/ddl.rs", "run_directive", 273),
     ("crates/inillucent-tree/src/paged/skip.rs", "skip_scan", 249),
     ("crates/inillucent-sql/src/bind.rs", "bind_call_with", 248),
     // 237 in task-2088, which lifted the `IN` list arm into `in_list`.
-    ("crates/inillucent-exec/src/expr/tree.rs", "compile", 237),
+    (
+        "crates/inillucent-exec/src/expr/tree.rs",
+        "compile_node",
+        237,
+    ),
     (
         "crates/inillucent-tree/src/leaf/encode.rs",
         "encode_rows_with",
@@ -3193,7 +3208,11 @@ const OVER_THREE_HUNDRED: [(&str, &str, &str); 1] = [
     // that only 11 of the 114 byte-or-string identifier signatures are in this
     // file, so A15 does not depend on the split; both are one ticket of their
     // own, which section 6.4 of the task-1969 review designs.
-    ("crates/inillucent-sql/src/bind.rs", "bind_expr", "A15"),
+    (
+        "crates/inillucent-sql/src/bind.rs",
+        "bind_expr_general",
+        "A15",
+    ),
     // The three `inillucent-bench` rows that were here came off in task-1973,
     // which split all three: `gradeembed.rs::run` is 94 lines, `main.rs::main`
     // is 127 and `scenarios.rs::grade` is 86. `bind_expr` is the last function

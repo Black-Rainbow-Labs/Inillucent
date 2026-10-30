@@ -340,7 +340,15 @@ impl<'a> Parser<'a> {
     /// the parser's recursion against the tree's limit refused
     /// `SELECT ((( ... 1 ... )))` at a thousand parentheses, which the
     /// reference accepts because its parser stack is allowed 2500.
+    ///
+    /// **It also asks the thread how much stack is left.** The depth limit is counted in levels,
+    /// and a level costs about 6 KB, so a limit of 2,500 levels needs 15 MB. A binding runs a
+    /// statement on its caller's thread, which may have 1 or 2 MB, so the counter alone lets
+    /// valid SQL overflow it and end the process.
     fn enter(&mut self) -> Result<(), ParseError> {
+        if !inillucent_base::stack::has_room() {
+            return Err(crate::diagnostic::stack_exhausted(Span::at(self.cursor())));
+        }
         self.depth = self.depth.saturating_add(1);
         if self.depth > self.limits.get(Limit::ParserDepth) {
             let span = Span::at(self.cursor());

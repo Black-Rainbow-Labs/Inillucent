@@ -88,6 +88,9 @@ pub(crate) fn translate(
     params: &Params,
     frame: Frame<'_>,
 ) -> DbResult<Expr> {
+    if !inillucent_base::stack::has_room() {
+        return Err(inillucent_base::stack::refusal());
+    }
     if let Some(found) = resolve_in_frame(expr, frame)? {
         return Ok(found);
     }

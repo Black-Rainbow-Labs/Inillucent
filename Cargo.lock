@@ -581,6 +581,10 @@ version = "2.8.1"
 [[package]]
 name = "inillucent-base"
 version = "2.8.1"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "inillucent-bench"

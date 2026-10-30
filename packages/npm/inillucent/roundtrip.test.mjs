@@ -519,3 +519,113 @@ everyRoute('a query that fails on its 4th row carries the 3 rows before it on ev
     );
   }
 });
+
+/**
+ * Opens one session per route over a database each, so a case can run the same calls on the addon
+ * and on the `inillucent-mcp` server and compare what they answer.
+ *
+ * @param db - the path of the test's database, which the two databases are named after
+ * @param body - what to run, given `{ addon, server }`: two sessions
+ */
+async function bothSessions(db, body) {
+  const addon = await open(`${db}.addon`);
+  const server = await open(`${db}.server`, { root: dirname(db) });
+  try {
+    await body({ addon, server });
+  } finally {
+    await addon.close();
+    await server.close();
+  }
+}
+
+/**
+ * Returns the number of rows a session's table holds.
+ *
+ * @param session - the session
+ * @param table - the table
+ */
+async function countOf(session, table) {
+  const answer = await session.inillucent('query', { sql: `SELECT count(*) AS n FROM ${table}` });
+  assert.equal(answer.ok, true, answer.message);
+  return Number(answer.rows[0][0]);
+}
+
+withDatabase('a statement text that holds several statements is refused on every route and runs none', async (db) => {
+  await bothSessions(db, async (routes) => {
+    for (const [route, session] of Object.entries(routes)) {
+      assert.equal((await session.inillucent('exec', { sql: 'CREATE TABLE t (a)' })).ok, true, route);
+      const cases = [
+        ['exec', 'INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)'],
+        ['exec', 'CREATE TABLE z (a); garbage here'],
+        ['query', 'SELECT 1; DROP TABLE t'],
+      ];
+      for (const [command, sql] of cases) {
+        const result = await session.inillucent(command, { sql });
+        assert.equal(result.ok, false, `${route}: ${command} ${sql} ran`);
+        assert.equal(result.status, 'invalid_state', `${route}: ${command} ${sql}`);
+        assert.match(result.message, /one statement/, `${route}: ${command} ${sql}`);
+      }
+      assert.equal(await countOf(session, 't'), 0, `${route}: a statement of the refused text ran`);
+      const gone = await session.inillucent('query', { sql: "SELECT count(*) FROM sqlite_master WHERE name = 'z'" });
+      assert.equal(Number(gone.rows[0][0]), 0, `${route}: CREATE TABLE z ran`);
+      // One statement with a trailing semicolon is still one statement.
+      const single = await session.inillucent('exec', { sql: 'INSERT INTO t VALUES (3);' });
+      assert.equal(single.ok, true, `${route}: ${single.message}`);
+    }
+  });
+});
+
+withDatabase('a batch script with its own BEGIN and COMMIT runs on every route', async (db) => {
+  await bothSessions(db, async (routes) => {
+    for (const [route, session] of Object.entries(routes)) {
+      assert.equal((await session.inillucent('exec', { sql: 'CREATE TABLE t (a)' })).ok, true, route);
+      const own = await session.inillucent('batch', { sql: 'BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT' });
+      assert.equal(own.ok, true, `${route}: ${own.message}`);
+      assert.equal(own.changes, 2, route);
+      assert.equal(await countOf(session, 't'), 2, route);
+      const plain = await session.inillucent('batch', { sql: 'INSERT INTO t VALUES (3); INSERT INTO t VALUES (4)' });
+      assert.equal(plain.ok, true, `${route}: ${plain.message}`);
+      assert.equal(await countOf(session, 't'), 4, route);
+      // A script that fails inside its own transaction leaves none open.
+      const failed = await session.inillucent('batch', { sql: 'BEGIN; INSERT INTO t VALUES (5); INSERT INTO missing VALUES (1)' });
+      assert.equal(failed.ok, false, route);
+      assert.equal(await countOf(session, 't'), 4, `${route}: the failed script left its insert`);
+      const after = await session.inillucent('exec', { sql: 'INSERT INTO t VALUES (6)' });
+      assert.equal(after.ok, true, `${route}: a transaction was left open: ${after.message}`);
+    }
+  });
+});
+
+withDatabase('a call with the wrong number of parameters is refused as invalid_state on every route', async (db) => {
+  await bothSessions(db, async (routes) => {
+    for (const [route, session] of Object.entries(routes)) {
+      assert.equal((await session.inillucent('exec', { sql: 'CREATE TABLE t (a, b)' })).ok, true, route);
+      const fewer = await session.inillucent('exec', { sql: 'INSERT INTO t VALUES (?1, ?2)', params: ['x'] });
+      assert.equal(fewer.ok, false, `${route}: one value for two parameters ran`);
+      assert.equal(fewer.status, 'invalid_state', route);
+      assert.match(fewer.message, /Incorrect number of bindings supplied/, route);
+      const none = await session.inillucent('query', { sql: 'SELECT ?1' });
+      assert.equal(none.ok, false, `${route}: no value for one parameter ran`);
+      assert.equal(none.status, 'invalid_state', route);
+      const more = await session.inillucent('query', { sql: 'SELECT ?', params: [1, 2] });
+      assert.equal(more.ok, false, `${route}: two values for one parameter ran`);
+      assert.equal(more.status, 'invalid_state', route);
+      assert.equal(await countOf(session, 't'), 0, `${route}: a refused call wrote a row`);
+      const exact = await session.inillucent('exec', { sql: 'INSERT INTO t VALUES (?1, ?2)', params: ['x', null] });
+      assert.equal(exact.ok, true, `${route}: ${exact.message}`);
+    }
+  });
+});
+
+withDatabase('the raw result writes a BLOB the same way on every route', async (db) => {
+  await bothSessions(db, async (routes) => {
+    const seen = {};
+    for (const [route, session] of Object.entries(routes)) {
+      const result = await session.inillucent('query', { sql: "SELECT x'00ff10' AS b, 1 AS n" });
+      assert.equal(result.ok, true, `${route}: ${result.message}`);
+      seen[route] = result.rows;
+    }
+    assert.deepEqual(seen.addon, [[{ blob: '00ff10' }, 1]]);
+    assert.deepEqual(seen.addon, seen.server);
+  });
+});

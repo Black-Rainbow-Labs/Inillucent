@@ -52,9 +52,11 @@ The statuses you will see most often, each produced by the release build:
 | `busy` | another process holds the file for writing, for longer than `PRAGMA busy_timeout` | `another process holds the file for writing; ...` |
 | `corrupt` | the file is not a database, or is damaged | `database disk image is malformed` |
 | `io` | the file system refused a read or a write | |
-| `invalid_state` | a misuse the command itself refused: a file that already exists, a path outside `--root`, two statements given to `query` or `exec` | `exec runs one statement and this is several; ... Use batch` |
+| `invalid_state` | a misuse the command itself refused: a file that already exists, a path outside `--root`, two statements given to `query` or `exec`, or a number of values that is not the statement's number of parameters | `exec runs one statement and this is several; ... Use batch`, or `Incorrect number of bindings supplied. The current statement uses 2, and there are 1 supplied.` |
 
-The driver has four more statuses: `interrupted`, `full`, `too_big` and `internal`. `internal` is a
+The driver has four more statuses: `interrupted`, `full`, `too_big` and `internal`. `too_big` is also
+the status of a statement nested more deeply than the calling thread's stack holds, which names the
+stack in its message and answers on a thread with a larger one. `internal` is a
 defect in inillucent. Report it. `full` means the disk refused a write, or the file is at its
 `PRAGMA max_page_count` (the message is `database or disk is full` in both cases). The statement that
 met it failed, and the next statement on the same connection writes again once space is free. If the

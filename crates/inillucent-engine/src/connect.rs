@@ -1738,6 +1738,16 @@ impl<'d> Connection<'d> {
         }
     }
 
+    /// Returns how many bytes the first statement of a script uses, from the parser alone.
+    ///
+    /// Unlike [`Connection::prepare_with_tail`] it does not bind, so a script can be cut into its
+    /// statements before any of them has run, when a table a later statement names is not made yet.
+    ///
+    /// @param sql - the script, positioned at the statement to measure
+    pub fn parsed_statement_length(&self, sql: &str) -> DbResult<usize> {
+        self.engine()?.statement_length(sql)
+    }
+
     /// Runs one statement and returns its rows.
     ///
     /// @param sql - the statement
@@ -2290,6 +2300,11 @@ pub struct Statement<'d> {
 }
 
 impl Statement<'_> {
+    /// Returns how many parameters the statement declares: the highest number it uses.
+    pub fn declared_parameters(&self) -> u32 {
+        self.params.declared().unwrap_or(0)
+    }
+
     /// Binds one parameter.
     ///
     /// **Refuses an index the statement does not have**, with the code SQLite

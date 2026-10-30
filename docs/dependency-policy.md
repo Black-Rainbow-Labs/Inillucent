@@ -66,8 +66,8 @@ These are the rows in `layering.toml` today:
 
 | Crate | Category | Allowed in |
 |---|---|---|
-| `libc` | operating system boundary | `inillucent-vfs`, `inillucent-remote`, `inillucent-cli`, `inillucent-compat` |
-| `windows-sys` | operating system boundary | `inillucent-vfs`, `inillucent-remote`, `inillucent-cli`, `inillucent-compat` |
+| `libc` | operating system boundary | `inillucent-base`, `inillucent-vfs`, `inillucent-remote`, `inillucent-cli`, `inillucent-compat` |
+| `windows-sys` | operating system boundary | `inillucent-base`, `inillucent-vfs`, `inillucent-remote`, `inillucent-cli`, `inillucent-compat` |
 | `memmap2` | operating system boundary | `inillucent-core` |
 | `libloading` | operating system boundary | `inillucent-core` |
 | `anyhow`, `thiserror` | error handling | `inillucent-core`, `inillucent-bench` |

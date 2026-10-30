@@ -218,6 +218,7 @@ fn produce(
             .unwrap_or(Value::Null);
         bound.push(inillucent_tree::datum::OwnedDatum::from(&held));
     }
+    refuse_missing_parameters(context, sql, bound.len())?;
     let counters = write_counters(context);
     let started = std::time::Instant::now();
     // **Streamed, so only the rows the caller asked for are held.** The statement used to
@@ -409,6 +410,35 @@ fn refuse_a_script(context: &mut Context, command: &str, sql: &str) -> Result<()
         format!(
             "{command} runs one statement and this is several; the next one begins {rest:?}. \
              Use `batch`, which runs them all in one transaction."
+        ),
+    ))
+}
+
+/// Refuses a call that passed fewer values than the statement has parameters.
+///
+/// **A missing value ran the statement with NULL in its place.** `exec "INSERT INTO t VALUES (?1,
+/// ?2)" --params '["a"]'` wrote a row with a NULL the caller never gave. Python's `sqlite3` raises
+/// `Incorrect number of bindings supplied`, and the driver and the Node addon now say the same
+/// words. A statement the parser cannot read is left for the run to report as a syntax error.
+///
+/// @param context - the open shell
+/// @param sql - the statement
+/// @param supplied - how many values the caller passed
+fn refuse_missing_parameters(
+    context: &mut Context,
+    sql: &str,
+    supplied: usize,
+) -> Result<(), Failed> {
+    let Ok(declared) = context.shell().connection().parameter_count(sql) else {
+        return Ok(());
+    };
+    if usize::try_from(declared).map_or(true, |needed| needed <= supplied) {
+        return Ok(());
+    }
+    Err(Failed::said(
+        Status::InvalidState,
+        format!(
+            "Incorrect number of bindings supplied. The current statement uses {declared}, and there are {supplied} supplied."
         ),
     ))
 }

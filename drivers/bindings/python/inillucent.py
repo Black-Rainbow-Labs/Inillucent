@@ -1053,6 +1053,8 @@ class Transaction:
         A failure rolls the whole transaction back before it raises, so a caller
         that stops on the first error has already undone everything.
         """
+        if not self._handle:
+            raise DriverError(INVALID_STATE, "this transaction is finished, or its connection is closed")
         changed = c_uint64()
         error = c_void_p()
         status = _LIB.inillucent_txn_execute(
@@ -1113,6 +1115,10 @@ class Connection:
         self._lock = database._lock
         self._handle = handle
         self._statements: "dict[str, Statement]" = {}
+        # Every statement and transaction this connection made, weakly, so close() can end the ones
+        # a caller still holds. Without it a Statement kept running, and committing, on a closed
+        # connection because the C statement holds the session beside the connection's own handle.
+        self._issued: "weakref.WeakSet" = weakref.WeakSet()
 
     @_serialised
     def _cached(self, sql: str) -> "Statement":
@@ -1199,7 +1205,9 @@ class Connection:
             self._handle, _sql_bytes(sql), ctypes.byref(handle), ctypes.byref(error)
         )
         _check(status, error)
-        return Statement(self, handle)
+        statement = Statement(self, handle)
+        self._issued.add(statement)
+        return statement
 
     @_serialised
     def transaction(self) -> Transaction:
@@ -1208,7 +1216,9 @@ class Connection:
         error = c_void_p()
         status = _LIB.inillucent_txn_begin(self._handle, ctypes.byref(handle), ctypes.byref(error))
         _check(status, error)
-        return Transaction(handle, self._lock)
+        transaction = Transaction(handle, self._lock)
+        self._issued.add(transaction)
+        return transaction
 
     @property
     @_serialised
@@ -1249,6 +1259,16 @@ class Connection:
             # The statements first: each holds the connection's session, and a
             # statement freed after its connection would be the dangling one.
             self._drop_statements()
+            # A transaction still open is rolled back and a statement still held stops running, so
+            # neither can run on a connection that is gone. The statement's handle is not freed
+            # here: ``Database.close`` refuses while one is live, and that refusal is how a caller
+            # finds the statement it forgot.
+            for issued in list(self._issued):
+                if isinstance(issued, Transaction):
+                    issued.rollback()
+                else:
+                    issued._detached = True
+            self._issued.clear()
             _LIB.inillucent_conn_free(self._handle)
             self._handle = None
 
@@ -1270,6 +1290,7 @@ class Statement:
         self._connection = connection
         self._lock = connection._lock
         self._handle = handle
+        self._detached = False
 
     @_serialised
     def execute(self, params: Sequence[Any] = (), limit: Optional[int] = None) -> Rows:
@@ -1278,6 +1299,7 @@ class Statement:
         ``params`` is a sequence of values bound by position. A mapping or a
         string raises ``TypeError``.
         """
+        self._require_open()
         capped = _ALL_ROWS if limit is None else _row_limit(limit)
         if _STMT_EXECUTE is not None and self._handle:
             got = _STMT_EXECUTE(self._handle, params, capped)
@@ -1312,6 +1334,7 @@ class Statement:
         ``rows`` is any iterable of sequences, a generator included. Each row is
         a sequence of values: a string or a mapping as a row raises ``TypeError``.
         """
+        self._require_open()
         if not isinstance(rows, (list, tuple)):
             rows = list(rows)
         if not _JSON:
@@ -1368,6 +1391,12 @@ class Statement:
             _refuse_type(value)
 
     @_serialised
+    def _require_open(self) -> None:
+        """Raise ``DriverError`` with ``INVALID_STATE`` when the statement was closed, directly or
+        by closing its connection."""
+        if not self._handle or self._detached:
+            raise DriverError(INVALID_STATE, "this statement is closed, or its connection is")
+
     def close(self) -> None:
         if self._handle:
             _LIB.inillucent_stmt_free(self._handle)

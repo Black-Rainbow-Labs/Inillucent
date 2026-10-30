@@ -66,6 +66,7 @@ pub mod capability;
 pub mod error;
 pub mod introspect;
 pub mod rows;
+mod script;
 pub mod shared;
 pub mod stream;
 pub mod value;
@@ -1959,11 +1960,50 @@ fn bind_all(statement: &mut EngineStatement<'_>, params: &[Value]) -> Result<()>
                 "that is more bound parameters than a statement can have.",
             )
         })?;
-        statement
-            .bind(index, value.to_engine())
-            .map_err(|error| Error::from_engine(&error, false))?;
+        statement.bind(index, value.to_engine()).map_err(|error| {
+            match error.code() == inillucent_engine::PrimaryCode::Range {
+                true => wrong_binding_count(statement.declared_parameters(), params.len()),
+                false => Error::from_engine(&error, false),
+            }
+        })?;
     }
-    Ok(())
+    refuse_missing_bindings(statement, params.len())
+}
+
+/// Refuses a call that supplied fewer values than the statement has parameters.
+///
+/// **A missing value ran the statement with NULL in its place.** `INSERT INTO t VALUES (?1, ?2)`
+/// with one value wrote a row with a NULL it was never given, and no error said so. Python's
+/// `sqlite3` raises `Incorrect number of bindings supplied` for it and so does this call, with the
+/// same sentence. Too many values is refused already, by [`EngineStatement::bind`]. A caller that
+/// wants a parameter to be NULL passes NULL.
+///
+/// @param statement - the engine statement, with the supplied values bound
+/// @param supplied - how many values the caller passed
+fn refuse_missing_bindings(statement: &EngineStatement<'_>, supplied: usize) -> Result<()> {
+    let declared = statement.declared_parameters();
+    match usize::try_from(declared).is_ok_and(|needed| needed > supplied) {
+        true => Err(wrong_binding_count(declared, supplied)),
+        false => Ok(()),
+    }
+}
+
+/// Builds the refusal for a call whose number of values is not the statement's number of
+/// parameters, in the words Python's `sqlite3` uses.
+///
+/// `invalid_state`: the statement is valid and the call broke the driver's contract. Too many
+/// values used to be reported as `syntax`, and the Node addon and the server route disagreed on
+/// the status for the same call.
+///
+/// @param declared - how many parameters the statement uses
+/// @param supplied - how many values the caller passed
+fn wrong_binding_count(declared: u32, supplied: usize) -> Error {
+    Error::said(
+        Status::InvalidState,
+        format!(
+            "Incorrect number of bindings supplied. The current statement uses {declared}, and there are {supplied} supplied."
+        ),
+    )
 }
 
 /// A statement that failed, with the rows it produced first.

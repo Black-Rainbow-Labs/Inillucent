@@ -437,6 +437,10 @@ pub(crate) fn fire_where(
             "too many levels of trigger recursion",
         ));
     }
+    // A limit of 1,000 levels is 6 MB of stack at the cost of a level, and the thread may have 1.
+    if !inillucent_base::stack::has_room() {
+        return Err(inillucent_base::stack::refusal());
+    }
     let deeper = TriggerFiring {
         depth: depth.deeper(),
         ..*firing

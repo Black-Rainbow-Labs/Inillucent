@@ -703,6 +703,25 @@ unsafe fn run_script(
     }
 }
 
+/// Whether a script begins, commits or rolls back a transaction of its own.
+///
+/// A session that is not open answers false, and the run that follows reports it.
+///
+/// @param conn - the session
+/// @param sql - the script
+unsafe fn script_owns_its_transaction(conn: *mut inillucent_conn, sql: &CStr) -> bool {
+    let Some(database) = database_of(conn) else {
+        return false;
+    };
+    let Ok(text) = sql.to_str() else {
+        return false;
+    };
+    let connection = database.database.session_as(session_of(conn));
+    connection
+        .script_controls_its_own_transaction(text)
+        .unwrap_or(false)
+}
+
 /// `batch(conn, sql)`: runs several statements as one transaction.
 ///
 /// What the command line's `batch` does: a script outside a transaction runs
@@ -726,7 +745,12 @@ unsafe fn batch_body(env: Opaque, info: Opaque) -> Opaque {
             "batch takes the statements as a string",
         );
     };
-    let joined = inillucent_in_transaction(conn) == 1;
+    // **A script with its own BEGIN and COMMIT runs as written**, as `inillucent batch` and the
+    // server route run it. Wrapping it made its BEGIN fail with "cannot start a transaction
+    // within a transaction".
+    let open = inillucent_in_transaction(conn) == 1;
+    let own = !open && script_owns_its_transaction(conn, &sql);
+    let joined = open || own;
     let before = inillucent_total_changes(conn);
     if !joined {
         if let Err((status, error)) = run_script(conn, c"BEGIN") {
@@ -735,6 +759,14 @@ unsafe fn batch_body(env: Opaque, info: Opaque) -> Opaque {
     }
     if let Err((status, error)) = run_script(conn, &sql) {
         if !joined {
+            if let Err((_, second)) = run_script(conn, c"ROLLBACK") {
+                if !second.is_null() {
+                    inillucent_error_free(second);
+                }
+            }
+        }
+        if own && inillucent_in_transaction(conn) == 1 {
+            // The script opened a transaction of its own and failed inside it.
             if let Err((_, second)) = run_script(conn, c"ROLLBACK") {
                 if !second.is_null() {
                     inillucent_error_free(second);
@@ -757,9 +789,10 @@ unsafe fn batch_body(env: Opaque, info: Opaque) -> Opaque {
         c"changes".as_ptr(),
         js_value(api, env, &Value::Integer(changes)),
     );
-    let word = match joined {
-        true => "joined",
-        false => "committed",
+    let word = match (own, joined) {
+        (true, _) => "the script's own",
+        (false, true) => "joined",
+        (false, false) => "committed",
     };
     let mut said = std::ptr::null_mut();
     (api.create_string_utf8)(env, word.as_ptr().cast(), word.len(), &mut said);
@@ -963,6 +996,21 @@ unsafe fn query_body(env: Opaque, info: Opaque) -> Opaque {
             "query takes the statement as a string",
         );
     };
+    // **One statement, as the server route and Python refuse anything else.** The driver's `query`
+    // compiles the first statement of the text and ignores the rest, so `INSERT ...; INSERT ...`
+    // ran one insert and answered ok, and `SELECT 1; DROP TABLE t` ran only the select.
+    let Some(database) = database_of(conn) else {
+        return throw(
+            api,
+            env,
+            "invalid_state",
+            "query was given a session that is not open",
+        );
+    };
+    let connection = database.database.session_as(session_of(conn));
+    if let Err(why) = connection.refuse_extra_statements(&sql) {
+        return throw(api, env, why.status.name(), &why.message);
+    }
     let mut as_arrays = false;
     (api.get_value_bool)(env, arrays, &mut as_arrays);
     let mut only_reads = false;
@@ -983,19 +1031,10 @@ unsafe fn query_body(env: Opaque, info: Opaque) -> Opaque {
         Ok(values) => values,
         Err(message) => return throw(api, env, "invalid_state", &message),
     };
-    let Some(database) = database_of(conn) else {
-        return throw(
-            api,
-            env,
-            "invalid_state",
-            "query was given a session that is not open",
-        );
-    };
     // **The driver, not a statement handle.** A handle is an allocation, a
     // registration in the live handle table and a second lookup of the plan for
     // its parameter count, on every call; the engine already keeps the plan by
     // its text, so the driver's `query` is the same work without them.
-    let connection = database.database.session_as(session_of(conn));
     match connection.query(&sql, &values, usize::MAX) {
         Ok(rows) => result_of(api, env, &rows, conn, as_arrays),
         Err(why) => {

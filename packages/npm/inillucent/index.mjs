@@ -849,6 +849,22 @@ function nativeAddon() {
 }
 
 /**
+ * Writes the bytes of a result as the program's JSON writes them.
+ *
+ * The addon returns a BLOB as a `Buffer` and the program's `--output json` writes it as
+ * `{ "blob": "<hex>" }`, so the raw result of `inillucent('query', ...)` held two forms of the
+ * same value depending on the route. It is the program's form on both now, which is the one
+ * `decodeValue` reads back into a `Buffer` for `query()`.
+ *
+ * @param rows - the rows the addon returned, each an array of cells
+ */
+function rawRows(rows) {
+  return rows.map((row) =>
+    row.map((cell) => (cell instanceof Uint8Array ? { blob: Buffer.from(cell).toString('hex') } : cell)),
+  );
+}
+
+/**
  * Runs one statement through the addon and answers the result object the
  * command line's `--output json` writes for `query` and `exec`.
  *
@@ -865,7 +881,7 @@ function nativeCall(native, conn, command, options) {
     // with status `readonly`, as the `inillucent query` program does. Without it
     // `ATTACH ?1 AS o` reached the engine and came back `unsupported`.
     const result = native.query(conn, String(options.sql), options.params, true, command === 'query');
-    const kept = command === 'query' && limit > 0 ? result.rows.slice(0, limit) : result.rows;
+    const kept = rawRows(command === 'query' && limit > 0 ? result.rows.slice(0, limit) : result.rows);
     return {
       ok: true,
       command,
@@ -902,7 +918,7 @@ function failureOf(command, why, limit = 0) {
   }
   const before = why.partial;
   if (before && Array.isArray(before.rows) && before.rows.length > 0) {
-    const kept = limit > 0 ? before.rows.slice(0, limit) : before.rows;
+    const kept = rawRows(limit > 0 ? before.rows.slice(0, limit) : before.rows);
     failure.columns = before.columns.map((name) => ({ name, type: '' }));
     failure.rows = kept;
     failure.row_count = kept.length;

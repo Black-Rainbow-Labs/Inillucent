@@ -43,6 +43,7 @@ pub use column_use::ColumnUse;
 pub use json_subtype::always_json;
 mod boolean_words;
 mod derived_note;
+mod dispatch;
 mod having;
 mod json_subtype;
 mod limit_columns;
@@ -52,6 +53,7 @@ mod nested_names;
 mod order_alias;
 mod ordinal;
 mod outer_aggregate;
+mod pattern;
 mod plain_value;
 mod raise;
 mod rowvalue;
@@ -1586,6 +1588,9 @@ impl<'a> Binder<'a> {
         };
         if self.authorizer.authorize(AuthAction::Select) == Authorization::Deny {
             return Err(denied("not authorized", select.span));
+        }
+        if !inillucent_base::stack::has_room() {
+            return Err(crate::diagnostic::stack_exhausted(select.span));
         }
         self.depth = self.depth.saturating_add(1);
         if self.depth > MAX_SELECT_DEPTH {
@@ -3346,8 +3351,16 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Binds one expression.
-    pub fn bind_expr(&mut self, id: ExprId) -> Result<BoundExpr, ParseError> {
+    /// Binds every kind of expression `bind_expr` does not bind itself.
+    ///
+    /// **The frame of this function is about 3.5 KB**, because the compiler gives one function
+    /// the room of every arm's locals together. `bind_expr` answers the two kinds that nest
+    /// deepest in generated SQL, a binary operator and a unary operator, without entering this
+    /// one, so a chain of 400 `OR` terms costs 2 KB a level and not 5 KB.
+    ///
+    /// @param id - the expression
+    #[inline(never)]
+    fn bind_expr_general(&mut self, id: ExprId) -> Result<BoundExpr, ParseError> {
         let span = self.ast.expr_span(id);
         let Some(expr) = self.ast.expr(id) else {
             return Err(unsupported("missing expression", span));
@@ -3402,61 +3415,7 @@ impl<'a> Binder<'a> {
                 operand,
                 pattern,
                 escape,
-            } => {
-                if op == PatternOp::Regexp {
-                    // `X REGEXP Y` is sugar for `regexp(Y, X)` - the pattern
-                    // first - and the operator exists only because the function
-                    // does. The reference shell registers one, so this engine
-                    // registers one too, and the operator binds to it here
-                    // rather than refusing.
-                    let subject = self.bind_expr(operand)?;
-                    let pattern = self.bind_expr(pattern)?;
-                    let call = BoundExpr::Function {
-                        func: ScalarFunc::Regexp,
-                        arguments: vec![pattern, subject],
-                        collation: Collation::Binary,
-                    };
-                    return Ok(if negated {
-                        BoundExpr::Not(Box::new(call))
-                    } else {
-                        call
-                    });
-                }
-                if op == PatternOp::Match {
-                    // `x MATCH y` is a call to a function called `match`, which
-                    // does not exist - unless `x` is a column of a virtual
-                    // table, in which case it is a constraint the module is
-                    // offered and the module says what it means. That is the
-                    // whole of how `t MATCH 'word'` reaches FTS5.
-                    let left = self.bind_expr(operand)?;
-                    // Where `x` is not a virtual table column the `match` function
-                    // SQLite registers by default raises the error, and it raises
-                    // it when a row reaches the expression, not when the statement
-                    // is prepared. The physical pass compiles this node to that
-                    // runtime error.
-                    let pattern = Box::new(self.bind_expr(pattern)?);
-                    return Ok(BoundExpr::Pattern {
-                        negated,
-                        op: PatternOp::Match,
-                        operand: Box::new(left),
-                        pattern,
-                        escape: None,
-                    });
-                }
-                let operand = Box::new(self.bind_expr(operand)?);
-                let pattern = Box::new(self.bind_expr(pattern)?);
-                let escape = match escape {
-                    Some(expr) => Some(Box::new(self.bind_expr(expr)?)),
-                    None => None,
-                };
-                Ok(BoundExpr::Pattern {
-                    negated,
-                    op,
-                    operand,
-                    pattern,
-                    escape,
-                })
-            }
+            } => self.bind_pattern_expr(negated, op, operand, pattern, escape),
             Expr::Between {
                 negated,
                 operand,
