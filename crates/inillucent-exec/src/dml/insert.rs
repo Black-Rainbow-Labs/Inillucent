@@ -293,6 +293,7 @@ pub(super) fn insert_row_feed(
         if let Some(Some(OwnedDatum::Int(chosen))) = layout.rowid.map(|slot| image.get(slot)) {
             if sequence_mark.is_some() {
                 high_water = high_water.max(*chosen);
+                publish_sequence_before_replace(statement, target, &mut sequence_mark, *chosen)?;
             }
         }
         // **Affinity first, then the constraints.** `NOT NULL`, `STRICT` and
@@ -820,6 +821,41 @@ fn open_sequence(
     let mark = crate::sequence::read(target, statement.sequence_root, &table.name, floor)?;
     Ok(Some(mark))
 }
+/// Writes the key a row chose into `sqlite_sequence` before a replace can run its triggers.
+///
+/// **A trigger that fires for the row `OR REPLACE` deletes inserts into this table as a
+/// statement of its own**, and it reads `sqlite_sequence` when it begins. With the mark written
+/// only when the outer statement ends, such a trigger row took the key the outer row had
+/// already chosen, and the outer row then replaced it. SQLite shares one counter, so the
+/// trigger's rows come after the chosen key.
+///
+/// @param statement - the bound insert
+/// @param target - the file and its trees
+/// @param sequence_mark - the table's `sqlite_sequence` row, when it has one
+/// @param chosen - the key the row will be written under
+fn publish_sequence_before_replace(
+    statement: &BoundInsert,
+    target: &mut dyn WriteTarget,
+    sequence_mark: &mut Option<crate::sequence::Mark>,
+    chosen: i64,
+) -> DbResult<()> {
+    if statement.replace_triggers.is_empty() {
+        return Ok(());
+    }
+    let Some(mark) = sequence_mark.as_mut() else {
+        return Ok(());
+    };
+    if chosen <= mark.seq {
+        return Ok(());
+    }
+    let (root, name) = (statement.sequence_root, &statement.table.name);
+    crate::sequence::write(target, root, name, mark, chosen)?;
+    let fresh = crate::sequence::read(target, root, name, 0)?;
+    mark.rowid = fresh.rowid;
+    mark.seq = chosen;
+    Ok(())
+}
+
 /// Writes an `AUTOINCREMENT` table's mark back when the statement moved it.
 ///
 /// **The row for the table is written even by a statement that stores

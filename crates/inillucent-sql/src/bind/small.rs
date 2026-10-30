@@ -122,3 +122,24 @@ pub(super) fn source_answers_to(source: &BoundSource, qualifier: &[u8]) -> bool 
     let stem = |name: &[u8]| name.to_ascii_lowercase().starts_with(b"sqlite_temp_");
     catalog_name(&source.alias) && catalog_name(qualifier) && stem(&source.alias) == stem(qualifier)
 }
+
+/// Refuses a block, or one of its compound arms, that forces an index which
+/// cannot answer it.
+///
+/// Here rather than in the planner because this is the last point with a
+/// `Result` to put the refusal in, and every block reaches it: a nested query,
+/// a view body and a CTE body are all bound through `bind_select`. The block's
+/// sources and its `ORDER BY` and `LIMIT` are attached by now, which the
+/// nearest neighbour probe needs.
+/// The refusal points at nothing, because SQLite's does not: the pinned 3.53.4
+/// shell prints `no query solution` with no caret under the statement.
+/// @param bound - the block, with its sources attached
+pub(super) fn refuse_unanswerable_hints(bound: &BoundSelect) -> Result<(), ParseError> {
+    let arms = core::iter::once(bound).chain(bound.compounds.iter().map(|(_, arm)| arm));
+    for arm in arms {
+        if crate::plan::unanswerable_index_hint(arm).is_some() {
+            return Err(no_query_solution(Span::default()));
+        }
+    }
+    Ok(())
+}

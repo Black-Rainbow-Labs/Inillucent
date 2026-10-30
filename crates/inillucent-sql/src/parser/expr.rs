@@ -380,7 +380,8 @@ impl Parser<'_> {
                 self.eat_keyword(Keyword::ALL)?;
             }
             let mut list = Vec::new();
-            loop {
+            // `f(ORDER BY x)` has an empty argument list, as in SQLite's grammar.
+            while !self.at_keyword(Keyword::ORDER)? || !list.is_empty() {
                 list.push(self.parse_expr()?);
                 if !self.eat(Punctuator::Comma)? {
                     break;

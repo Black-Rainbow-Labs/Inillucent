@@ -204,6 +204,26 @@ impl ImportedDatabase {
         Ok(usize::try_from(count).unwrap_or_default())
     }
 
+    /// Runs a statement, after measuring the keys it can change when it is the outermost one.
+    ///
+    /// **Measured before the statement writes anything**, and inside the nesting count so the
+    /// queries it runs are not taken for outermost statements.
+    ///
+    /// @param cached - the compiled statement
+    /// @param params - the bound parameters
+    /// @param outermost - whether no other statement is running
+    pub(crate) fn apply_measuring_keys(
+        &mut self,
+        cached: &std::rc::Rc<Cached>,
+        params: &Params,
+        outermost: bool,
+    ) -> DbResult<Outcome> {
+        if outermost {
+            self.record_key_baselines(cached)?;
+        }
+        self.apply_compiled(cached, params)
+    }
+
     /// Forgets the baselines, when the transaction ends.
     pub(crate) fn clear_key_baselines(&self) {
         self.session_state.key_baselines.borrow_mut().clear();

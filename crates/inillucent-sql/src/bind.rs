@@ -60,7 +60,8 @@ mod scratch;
 mod small;
 pub use small::block_over;
 use small::{
-    denied, no_such_window, short_circuit_constant, source_answers_to, subquery_table,
+    denied, no_such_window, refuse_unanswerable_hints, short_circuit_constant, source_answers_to,
+    subquery_table,
     window_aggregate, DISTRUSTED_SCHEMA_WORD,
 };
 mod set_rules;
@@ -682,27 +683,6 @@ pub enum IndexChoice {
     Only(Vec<u8>),
 }
 
-/// Refuses a block, or one of its compound arms, that forces an index which
-/// cannot answer it.
-///
-/// Here rather than in the planner because this is the last point with a
-/// `Result` to put the refusal in, and every block reaches it: a nested query,
-/// a view body and a CTE body are all bound through `bind_select`. The block's
-/// sources and its `ORDER BY` and `LIMIT` are attached by now, which the
-/// nearest neighbour probe needs.
-/// The refusal points at nothing, because SQLite's does not: the pinned 3.53.4
-/// shell prints `no query solution` with no caret under the statement.
-/// @param bound - the block, with its sources attached
-fn refuse_unanswerable_hints(bound: &BoundSelect) -> Result<(), ParseError> {
-    let arms = core::iter::once(bound).chain(bound.compounds.iter().map(|(_, arm)| arm));
-    for arm in arms {
-        if crate::plan::unanswerable_index_hint(arm).is_some() {
-            return Err(no_query_solution(Span::default()));
-        }
-    }
-    Ok(())
-}
-
 /// One aggregate the statement computes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundAggregate {
@@ -1107,7 +1087,7 @@ pub struct Binder<'a> {
     /// correlated - which is exactly the information the compiler needs to
     /// decide whether the child runs once or once per outer row.
     pub(crate) scopes: Vec<Vec<usize>>,
-    aggregates: Vec<BoundAggregate>,
+    pub(crate) aggregates: Vec<BoundAggregate>,
     result_aliases: Vec<(Vec<u8>, BoundExpr)>,
     /// The aliases of the result columns of the blocks whose `WHERE` is being
     /// bound, innermost last, each with the expression it names.
@@ -1140,7 +1120,7 @@ pub struct Binder<'a> {
     tail_may_name_an_alias: bool,
     dependencies: Dependencies,
     inside_aggregate: bool,
-    allow_aggregates: bool,
+    pub(crate) allow_aggregates: bool,
     /// Whether a window function may be written here: only in the result
     /// columns and the `ORDER BY` of a `SELECT`. Everywhere else SQLite says
     /// `misuse of window function`.
@@ -1197,6 +1177,8 @@ pub struct Binder<'a> {
     pub(crate) row_aliases: Option<RowAliases>,
     /// Whether a `RETURNING` clause is being bound, which may name `RAISE`.
     pub(crate) in_returning: bool,
+    /// The one row `VALUES` source of an `INSERT`, whose own `WITH` SQLite never looks at.
+    pub(crate) values_without_with: Option<SelectId>,
     /// The FROM term a write to a view runs against, when the target is one.
     ///
     /// A view has no rows of its own, so an `UPDATE` or `DELETE` on one is
@@ -1466,6 +1448,7 @@ impl<'a> Binder<'a> {
             excluded: None,
             row_aliases: None,
             in_returning: false,
+            values_without_with: None,
             view_target: None,
             firing: Vec::new(),
             trigger_depth: crate::dml::MAX_TRIGGER_DEPTH,
@@ -1623,7 +1606,7 @@ impl<'a> Binder<'a> {
         let Some(select) = self.ast.select(id) else {
             return Err(unsupported("missing select", Span::default()));
         };
-        let pushed = self.push_ctes(&select.with)?;
+        let pushed = self.values_without_with != Some(id) && self.push_ctes(&select.with)?;
         let bound = self.bind_arms(select);
         if pushed {
             self.ctes.pop();
@@ -3601,7 +3584,8 @@ impl<'a> Binder<'a> {
                 over,
             } => {
                 if let Some(over) = over {
-                    self.refuse_order_by_in_window_call(name, !order_by.is_empty(), span)?;
+                    let ignored = arguments.as_ref().is_some_and(Vec::is_empty);
+                    self.refuse_order_by_in_window_call(name, !order_by.is_empty(), ignored, span)?;
                     return self.bind_window_call(name, distinct, arguments, filter, over, span);
                 }
                 // **`FILTER` and an in-argument `ORDER BY` belong to the

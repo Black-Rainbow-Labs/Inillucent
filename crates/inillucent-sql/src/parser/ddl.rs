@@ -273,13 +273,19 @@ impl Parser<'_> {
         // column name it begins `GENERATED ALWAYS AS (...)`. Read as a type it
         // gave the column the NUMERIC affinity of an unknown type name, which
         // turned a generated 556.0 into 556.
-        let declared_type =
-            if Parser::token_is_type_word(self.peek()?) && !self.at_constraint_keyword()? {
-                let id = self.parse_type_name()?;
-                Some(declared_type_text(self.ast.text(id)))
-            } else {
-                None
-            };
+        //
+        // **`GENERATED` not followed by `ALWAYS` is the type name.** `a GENERATED AS (x + 1)` is a
+        // column of type `GENERATED` that is generated, and `a GENERATED` is a column of that type.
+        let generated_is_type = self.at_keyword(Keyword::GENERATED)?
+            && self.peek_at(1)?.keyword() != Some(Keyword::ALWAYS);
+        let declared_type = if Parser::token_is_type_word(self.peek()?)
+            && (generated_is_type || !self.at_constraint_keyword()?)
+        {
+            let id = self.parse_type_name()?;
+            Some(declared_type_text(self.ast.text(id)))
+        } else {
+            None
+        };
         let mut constraints = Vec::new();
         loop {
             if self.at_deferral()? {

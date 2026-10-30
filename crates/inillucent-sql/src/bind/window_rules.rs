@@ -100,16 +100,33 @@ impl Binder<'_> {
     /// `group_concat(a ORDER BY b) OVER ()` and the same for every other function, an aggregate
     /// included; this dropped the clause and answered in row order.
     ///
+    /// **The five functions that take no argument accept it and ignore it.** SQLite runs
+    /// `row_number(ORDER BY a) OVER ()` and `rank(ORDER BY a) OVER (ORDER BY b)` in the order
+    /// of the window, and refuses every other function.
+    ///
     /// @param name - the function's name as written
     /// @param has_order_by - whether the call has an `ORDER BY`
+    /// @param no_arguments - whether the call's argument list is empty
     /// @param span - where the call was written
     pub(super) fn refuse_order_by_in_window_call(
         &self,
         name: ast::NameId,
         has_order_by: bool,
+        no_arguments: bool,
         span: Span,
     ) -> Result<(), ParseError> {
         if !has_order_by {
+            return Ok(());
+        }
+        let folded = self.ast.folded(name);
+        let ranking = [
+            b"row_number".as_slice(),
+            b"rank",
+            b"dense_rank",
+            b"percent_rank",
+            b"cume_dist",
+        ];
+        if no_arguments && ranking.contains(&folded) {
             return Ok(());
         }
         Err(refused(

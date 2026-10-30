@@ -455,6 +455,11 @@ pub struct BoundUpdate {
     pub index_hint: crate::bind::IndexChoice,
     /// The `RETURNING` columns.
     pub returning: Vec<BoundResultColumn>,
+    /// The aggregate calls in the assignments of an `UPDATE ... FROM`.
+    ///
+    /// **SQLite runs the join as one aggregate query**, so `SET v = json_group_array(s.x) FROM s`
+    /// computes over every joined row and changes one target row. Empty for every other update.
+    pub aggregates: Vec<crate::bind::BoundAggregate>,
     /// The `ORDER BY` that decides which rows a `LIMIT` keeps.
     ///
     /// Empty unless the statement wrote one, and then always with a `LIMIT`,
@@ -1047,7 +1052,14 @@ impl<'a> Binder<'a> {
         // resolves to it first - which is SQLite's rule and the reason
         // `UPDATE t SET v = v + 1 FROM s` means the target's `v`.
         let (joined, arguments) = self.bind_update_from(&update.from)?;
-        let assignments = self.bind_update_assignments(update, &table)?;
+        // An aggregate in the assignments of an `UPDATE ... FROM` belongs to the join.
+        let aggregating = !update.from.is_empty();
+        let outer_aggregates = core::mem::take(&mut self.aggregates);
+        let allowed = core::mem::replace(&mut self.allow_aggregates, aggregating);
+        let assignments = self.bind_update_assignments(update, &table);
+        self.allow_aggregates = allowed;
+        let aggregates = core::mem::replace(&mut self.aggregates, outer_aggregates);
+        let assignments = assignments?;
         let mut filter = match update.filter {
             Some(expr) => Some(self.bind_plain_value(expr)?),
             None => None,
@@ -1135,6 +1147,7 @@ impl<'a> Binder<'a> {
             not_null_defaults,
             virtual_columns,
             returning,
+            aggregates,
             order_by,
             limit,
             offset,
@@ -2018,7 +2031,9 @@ impl<'a> Binder<'a> {
                 // target's, and `INSERT INTO t SELECT a FROM u` would then
                 // resolve `a` against `t` when `u` has no such column.
                 let saved = core::mem::take(&mut self.scopes);
+                self.values_without_with = self.single_values_row(*id).then_some(*id);
                 let select = self.bind_select(*id);
+                self.values_without_with = None;
                 let bound = match select {
                     Ok(bound) => bound,
                     Err(error) => {
@@ -2042,6 +2057,22 @@ impl<'a> Binder<'a> {
                 Ok((BoundInsertSource::Values(bound.values), arity))
             }
         }
+    }
+
+    /// Reports whether an insert's source is a `VALUES` list of exactly one row.
+    ///
+    /// @param id - the insert's source select
+    fn single_values_row(&self, id: ast::SelectId) -> bool {
+        let Some(select) = self.ast.select(id) else {
+            return false;
+        };
+        if !select.compounds.is_empty() {
+            return false;
+        }
+        matches!(
+            self.ast.core(select.first).map(|core| &core.body),
+            Some(ast::SelectBody::Values(rows)) if rows.len() == 1
+        )
     }
 
     /// Works out where every table column's value comes from.

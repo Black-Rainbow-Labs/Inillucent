@@ -251,14 +251,7 @@ impl crate::ImportedDatabase {
         self.session_state
             .nesting
             .set(self.session_state.nesting.get().saturating_add(1));
-        // **Measured before the statement writes anything**, and inside the nesting count so
-        // the queries it runs are not taken for outermost statements. See `key_baselines`.
-        let outcome = match outermost {
-            true => self
-                .record_key_baselines(cached)
-                .and_then(|()| self.apply_compiled(cached, params)),
-            false => self.apply_compiled(cached, params),
-        };
+        let outcome = self.apply_measuring_keys(cached, params, outermost);
         self.session_state
             .nesting
             .set(self.session_state.nesting.get().saturating_sub(1));
@@ -1409,7 +1402,17 @@ impl crate::ImportedDatabase {
         query: &CachedQuery,
         params: &Params,
     ) -> DbResult<Vec<Vec<inillucent_tree::datum::OwnedDatum>>> {
-        let keys = self.keys_of(query, params)?;
+        let mut keys = self.keys_of(query, params)?;
+        // **An aggregate query answers one row even over no joined row**, with no key in it,
+        // and there is no target row to change then.
+        if !statement.aggregates.is_empty() {
+            keys.retain(|row| {
+                !matches!(
+                    row.first(),
+                    None | Some(inillucent_tree::datum::OwnedDatum::Null)
+                )
+            });
+        }
         // A view fires its trigger once for every row of the join, so its rows
         // are not reduced to one per target row.
         let keys = match statement.from.is_empty() || statement.view_rows.is_some() {
@@ -1470,6 +1473,7 @@ impl crate::ImportedDatabase {
             &assigned,
         )?;
         select.order_by = statement.order_by.clone();
+        select.aggregates = statement.aggregates.clone();
         dml::hint_target(&mut select, &statement.index_hint, &statement.index_exprs);
         let plan = plan_select_with(select, self.pragmas.levers());
         let prepared = physical::prepare_any(&plan, self)?;

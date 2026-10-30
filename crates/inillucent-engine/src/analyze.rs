@@ -325,7 +325,12 @@ impl ImportedDatabase {
         // tables that were not measured are left alone - which is what
         // `ANALYZE one_table` means.
         let names: Vec<Vec<u8>> = subjects.iter().map(|held| held.name.clone()).collect();
-        self.clear_stat1(at, &names, only_index.as_deref())?;
+        // **A bare `ANALYZE` or `ANALYZE schema` replaces the whole table**, so a row for a name
+        // that is no table or index any more does not survive it.
+        match table {
+            None => self.clear_stat1_where(at, &|_, _| true)?,
+            Some(_) => self.clear_stat1(at, &names, only_index.as_deref())?,
+        }
         self.write_stat1(at, &rows)?;
         Ok(())
     }
