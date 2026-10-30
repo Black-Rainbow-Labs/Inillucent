@@ -13,7 +13,7 @@ fails the build when any copy of it disagrees.
 This release fixes the defects found by the eleventh bug hunt. Eight areas were compared with SQLite
 3.53.4 by about 1.2 million generated and hand written statements: applications written through the
 language packages, files that older releases and real SQLite wrote, JSON, window functions, dates
-and numbers, FTS5 and R*Tree, the bugs other projects found since mid October, and the pragmas. 403
+and numbers, FTS5 and R*Tree, the bugs other projects found since mid October, and the pragmas. 421
 new cases in `compat/corpus/usage/bug-hunt-11-*.sql` compare each fix with SQLite.
 
 **A table that a release before 2.1.0 altered after a table constraint is read again.** Those

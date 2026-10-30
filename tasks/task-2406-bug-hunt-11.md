@@ -118,7 +118,7 @@ and code was moved to new modules (`bind/small.rs`, `ddl/helpers.rs`, `fts5/cont
 
 ### 4.4 Lanes after the first round
 
-Three more lanes ran after the first twelve were merged, for what the first round left open.
+Three more lanes ran after the first twelve were merged, for what the first round left open. The last two rows were found by CI and by the nightly tier after the merge to main.
 
 | Lane | Defect | Cause and fix | Test |
 |---|---|---|---|
@@ -126,6 +126,8 @@ Three more lanes ran after the first twelve were merged, for what the first roun
 | matrix | a nested aggregate (upstream D8) failed with the internal error `does not carry` where SQLite answers 1 | the aggregate belongs to the outermost query and sits in an unread column of a `UNION ALL` subquery. SQLite replaces such a column with `NULL` and drops the call. The binder now does the same before it settles aggregates (`bind/unused_columns.rs`), and still refuses with `misuse of aggregate` where SQLite does | `bug-hunt-11-matrix.sql`, 22 cases |
 | exprindex | `min()`, `max()` and `GROUP BY` over an indexed expression read the whole table | `min()` and `max()` are planned as `ORDER BY ... LIMIT 1` over the same index (`plan/extreme.rs`), and `GROUP BY` walks the index in order (`plan/group_walk.rs`), with the expression's value read from the index entry. 200,000 rows: `min` 42.4 ms to 0.31 ms (SQLite 0.06 ms), `GROUP BY` 43.9 ms to 4.8 ms (SQLite 5.3 ms) | `bug-hunt-11-exprindex.sql`, 15 cases; `engine::expression_index_shapes` |
 | widerows | a row of 800 or more integer columns took a 32 KiB leaf of its own | a leaf with several delta rows and no sorted rows is an ordinary leaf, so the builder now puts as many wide rows in one delta area as fit, and an append that splits a full leaf of a wide table keeps its rows on the left. No format change. 1,000 rows of 900 columns: 31.4 MiB to 10.6 MiB (SQLite 3.9 MiB) | `inillucent-tree::wide_rows`, `bug-hunt-11-widerows.sql`, the 63 durability suites |
+| CI | the C library's conformance program, built with the address sanitizer on Linux, had its first open refused with `too_big` | the stack guard from the bindings lane took the address of a local as the stack pointer, and the sanitizer keeps such a local on a fake stack in the heap. `stack::room` now reports no limit when that address is outside the thread's stack bounds | `inillucent-driver-capi::conformance` on Linux |
+| research | the nightly `research_corpus` found three new differences: `+c0` read NULL beside `c0` when an index on `(+c0, c0)` exists, a `UNIQUE` index on a virtual generated column took a duplicate after `REINDEX`, and `integrity_check` failed with `integer overflow` on an empty table whose `CHECK` overflows | a stage that reads an expression from an index entry did not decode that entry's column when the statement also read the plain column, so both the read and the duplicate check saw NULL; `integrity_check` now evaluates no `CHECK` on a table with no rows, as SQLite evaluates it once per row | `bug-hunt-11-research.sql`, 18 cases; `nightly::research_corpus` |
 
 ## 5. Found and not changed
 
@@ -153,10 +155,10 @@ the nightly run of `main` at 7333d3ca (`usage_corpus`, `process_storm`, `automat
 `node tools/doc-facts/check.mjs` agrees with the engine after the feature probe and the register
 audit were run on a release build.
 
-**The usage corpus.** Fourteen new files hold 403 cases, all graded against SQLite 3.53.4 by
+**The usage corpus.** Fifteen new files hold 421 cases, all graded against SQLite 3.53.4 by
 `differential::usage_corpus`, and every one passes: pragma 65, window 59, ftsquery 51, ftstables
 39, appsengine 37, datetime 33, files 27, json 27, matrix 22, planner 19, exprindex 15, lead 4,
-migrate 3 and widerows 2. Deviations that follow SQLite's development version or a documented
+research 18, migrate 3 and widerows 2. Deviations that follow SQLite's development version or a documented
 difference are in `compat/corpus/usage/known.toml`.
 
 **New interop fixtures:** `tests/interop/alter-after-constraint/` (written by 2.0.2) and
