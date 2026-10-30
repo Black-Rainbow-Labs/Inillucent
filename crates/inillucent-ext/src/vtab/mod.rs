@@ -257,6 +257,26 @@ pub trait VirtualTable: Send {
         Err(read_only())
     }
 
+    /// Returns what this table is holding in memory for the open transaction, for a module that
+    /// reads this table's shadow tables to see what is not written out yet.
+    ///
+    /// The default is nothing, which is what a table that writes straight to its shadow tables
+    /// has.
+    fn staged_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
+    /// Returns the rowid an insert names through one of its columns, when the table has one.
+    ///
+    /// An R*Tree's first column is its rowid, so `INSERT INTO r VALUES (1, ...)` names rowid 1
+    /// without the statement having a rowid of its own. `INSERT OR REPLACE` needs that rowid to
+    /// remove the row an insert collided with. The default says the table names none.
+    ///
+    /// @param _values - the declared columns of the insert, in declared order
+    fn rowid_in_columns(&self, _values: &[Value<'static>]) -> Option<i64> {
+        None
+    }
+
     /// Starts a transaction on the module.
     fn begin(&mut self, _context: &mut Context<'_>) -> DbResult<()> {
         Ok(())
@@ -394,6 +414,40 @@ pub fn failure(detail: impl Into<String>) -> DbError {
 /// Returns a constraint failure, which is what a rejected row reports.
 pub fn constraint(detail: impl Into<String>) -> DbError {
     DbError::primary(inillucent_base::PrimaryCode::Constraint).with_detail(detail)
+}
+
+/// Returns the datatype mismatch SQLite reports for a rowid that is not an integer.
+pub fn mismatch() -> DbError {
+    DbError::new(inillucent_base::ExtendedCode(
+        inillucent_sql::dml::codes::MISMATCH,
+    ))
+    .with_message("datatype mismatch")
+}
+
+/// Returns the rowid a value names when a lookup compares it with the rowid column.
+///
+/// **The rowid column has integer affinity, so the other side of the comparison is converted
+/// first.** `rowid = '5'` and `rowid = 5.0` find row 5, and `rowid = 5.5` or `rowid = 'abc'`
+/// find nothing. A lookup that took only an integer returned no rows for the first two.
+///
+/// @param value - the value the statement compared the rowid with
+pub fn rowid_to_look_up(value: &Value<'_>) -> Option<i64> {
+    let number = match value {
+        Value::Text(text)
+            if inillucent_value::numeric::looks_numeric(text.raw(), text.encoding()) =>
+        {
+            inillucent_value::cast::numerify(value.clone())
+        }
+        Value::Integer(_) | Value::Real(_) => value.clone(),
+        _ => return None,
+    };
+    match number {
+        Value::Integer(rowid) => Some(rowid),
+        Value::Real(real) if inillucent_value::numeric::real_same_as_int(real, real as i64) => {
+            Some(real as i64)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

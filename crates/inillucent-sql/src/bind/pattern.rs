@@ -50,6 +50,17 @@ impl Binder<'_> {
             // table, in which case it is a constraint the module is
             // offered and the module says what it means. That is the
             // whole of how `t MATCH 'word'` reaches FTS5.
+            //
+            // **A `MATCH` written in a schema is refused unless the schema is trusted.**
+            // SQLite flags the `match` function as unsafe, so a view, a trigger body or a
+            // `CHECK` that uses it fails while `PRAGMA trusted_schema` is off, which is its
+            // default in the shell.
+            if self.call_site != crate::function::CallSite::Statement && !self.trusted_schema {
+                return Err(super::refused(
+                    concat!("un", "safe use of MATCH()").to_string(),
+                    self.ast.expr_span(operand),
+                ));
+            }
             let left = self.bind_expr(operand)?;
             // Where `x` is not a virtual table column the `match` function
             // SQLite registers by default raises the error, and it raises

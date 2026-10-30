@@ -405,6 +405,34 @@ pub struct ShadowTable {
     pub owner: Option<Vec<u8>>,
 }
 
+/// Joins a schema and a table into the owner a module names for shadows in another schema.
+///
+/// **One byte string, because `ShadowTable::owner` is one.** The two names are joined by a NUL,
+/// which neither can hold, and [`split_owner`] takes them apart again. An owner with no NUL names
+/// a table in the schema the module's own table is in.
+///
+/// @param schema - the schema name as written
+/// @param table - the table's name
+pub fn qualified_owner(schema: &[u8], table: &[u8]) -> Vec<u8> {
+    let mut owner = schema.to_vec();
+    owner.push(0);
+    owner.extend_from_slice(table);
+    owner
+}
+
+/// Splits an owner into its schema, when it names one, and its table.
+///
+/// @param owner - what a module put in `ShadowTable::owner`
+pub fn split_owner(owner: &[u8]) -> (Option<&[u8]>, &[u8]) {
+    match owner.iter().position(|byte| *byte == 0) {
+        Some(at) => (
+            owner.get(..at),
+            owner.get(at.saturating_add(1)..).unwrap_or_default(),
+        ),
+        None => (None, owner),
+    }
+}
+
 /// One row a write asks a module to make.
 #[derive(Clone, Debug)]
 pub enum Change {
@@ -457,6 +485,21 @@ pub struct ModuleRef {
 /// its rowid; the keyed ones are for a `WITHOUT ROWID` table, whose whole row is
 /// its key. FTS5 uses both.
 pub trait ShadowStore {
+    /// Returns what the table that owns a shadow tree is holding in memory for the transaction.
+    ///
+    /// **How one module reads what another has not written out yet.** `fts5vocab` reports the
+    /// terms of an FTS5 index, and a row the transaction inserted is in the index's buffer until
+    /// the transaction commits, so a vocabulary table that read only the stored tree missed it.
+    /// The default knows nothing, which is what a store with no connected tables answers.
+    ///
+    /// @param _root - the root of one shadow table of the table whose state is wanted
+    fn staged_state(
+        &mut self,
+        _root: u32,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
     /// Reads one row by rowid, or nothing when there is not one.
     ///
     /// @param root - the shadow table's root

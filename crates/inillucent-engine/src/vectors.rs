@@ -274,7 +274,9 @@ impl ImportedDatabase {
         };
         let mut cursor = connected.table.open()?;
         let store = vtab::ReadStore {
-            pool: self.storage.database.pool(),
+            pool: self.pool_of_schema(connected.arguments.database),
+            staged: None,
+            pools: Some(self),
             trees: &self.schema.trees,
             view: None,
         };

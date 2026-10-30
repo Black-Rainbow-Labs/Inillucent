@@ -716,9 +716,9 @@ pub static CAPABILITIES: &[Capability] = &[
         },
     },
     Capability {
-        name: "fts5_unavailable_tokenizer",
-        support: Support::No,
-        note: "The FTS5 tokenizers are ascii, unicode61 and porter; a name this build has not got, such as trigram or icu, is refused rather than silently replaced.",
+        name: "fts5_trigram_tokenizer",
+        support: Support::Yes,
+        note: "The FTS5 tokenizers are ascii, unicode61, porter and trigram, which makes MATCH a substring search and narrows LIKE and GLOB. A name this build has not got, such as icu, is refused as SQLite refuses it.",
         probe: Probe::Runs {
             setup: &[],
             sql: "CREATE VIRTUAL TABLE d USING fts5(body, tokenize='trigram')",

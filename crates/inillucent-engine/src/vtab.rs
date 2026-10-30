@@ -144,8 +144,8 @@ impl ImportedDatabase {
             )));
         }
         let mut connect = ModuleArguments {
-            database: 0,
-            schema: b"main".to_vec(),
+            database: self.schema.ddl_schema,
+            schema: self.schema_name_of(self.schema.ddl_schema),
             table: name.to_vec(),
             module: module.to_vec(),
             arguments: arguments.to_vec(),
@@ -359,9 +359,18 @@ impl ImportedDatabase {
     /// @param owner - the table the shadows belong to
     /// @param suffix - which shadow
     fn existing_shadow_root(&self, owner: &[u8], suffix: &[u8]) -> DbResult<u32> {
-        let wanted = shadow_table_name(owner, suffix).to_ascii_lowercase();
-        self.schema
-            .entries
+        let (schema, table) = inillucent_sql::vtab::split_owner(owner);
+        let at = match schema {
+            Some(name) => self.schema_named(name).ok_or_else(|| {
+                refusal(format!(
+                    "unknown database {}",
+                    String::from_utf8_lossy(name)
+                ))
+            })?,
+            None => self.schema.ddl_schema,
+        };
+        let wanted = shadow_table_name(table, suffix).to_ascii_lowercase();
+        self.entries_of(at)
             .iter()
             .find(|recorded| recorded.entry.name.to_ascii_lowercase() == wanted)
             .map(|recorded| recorded.root)
@@ -371,6 +380,19 @@ impl ImportedDatabase {
                     String::from_utf8_lossy(&wanted)
                 ))
             })
+    }
+
+    /// Returns the pool the pages of one schema live in, falling back to the main database's.
+    ///
+    /// A module reads its shadow tables through one pool, and a table in `temp` or an attached
+    /// file has its pages in that file's pool, so reading it through the main pool asked for
+    /// pages the main file does not have.
+    ///
+    /// @param at - the schema, as the binder numbers them
+    pub(crate) fn pool_of_schema(&self, at: usize) -> &inillucent_pool::Pool {
+        self.schema_file(at)
+            .unwrap_or(&self.storage.database)
+            .pool()
     }
 
     /// Returns whether a name is a shadow table of a connected virtual table.
@@ -480,7 +502,9 @@ impl ImportedDatabase {
         };
         let mut table = found.connect(&arguments, false)?;
         let store = ReadStore {
-            pool: self.storage.database.pool(),
+            pool: self.pool_of_schema(arguments.database),
+            staged: None,
+            pools: Some(self),
             trees: &self.schema.trees,
             view: None,
         };
@@ -636,7 +660,7 @@ impl ImportedDatabase {
             view: view.as_ref(),
             modules: &self.session_state.virtual_tables,
             registry: &self.session_state.registry,
-            pool: self.storage.database.pool(),
+            pool: self.pool_of_schema(table.database),
             trees: &self.schema.trees,
             limits: self.pragmas.limits(),
             catalog: &self.schema.catalog,
@@ -776,8 +800,22 @@ pub(crate) fn scan_module(
             rechecks: rechecks_of(connected, offer, &query, supplied, params, reach.folding)?,
         };
         let mut cursor = connected.table.open()?;
+        // What another connected table holds in memory for the transaction, for a module that
+        // reads that table's shadow tables, such as `fts5vocab`.
+        let staged_of = |root: u32| {
+            reach.modules.values().find_map(|held| {
+                let owns = held
+                    .arguments
+                    .shadows
+                    .iter()
+                    .any(|shadow| shadow.root == root);
+                owns.then(|| held.table.staged_state()).flatten()
+            })
+        };
         let store = ReadStore {
             pool: reach.pool,
+            staged: Some(&staged_of),
+            pools: Some(reach.folding),
             trees: reach.trees,
             view: reach.view,
         };

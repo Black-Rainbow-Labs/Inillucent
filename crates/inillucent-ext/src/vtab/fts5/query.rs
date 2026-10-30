@@ -58,6 +58,10 @@ pub(crate) struct Fts5Cursor {
     pub(crate) external: Option<Vec<u8>>,
     /// The column names, for a `column:term` filter to resolve against.
     pub(crate) names: Vec<Vec<u8>>,
+    /// Which columns are `UNINDEXED`, whose text is stored and never searched or marked.
+    pub(crate) unindexed: Vec<bool>,
+    /// The schema the table is in, which a refusal about its content table names.
+    pub(crate) schema: Vec<u8>,
     pub(crate) match_column: i32,
     pub(crate) rank_column: i32,
     /// Which columns were declared UNINDEXED.
@@ -552,7 +556,7 @@ impl Fts5Cursor {
                 .map(|values| (row.rowid, values));
         }
         let Some((_, content)) = self.held.as_ref() else {
-            return Ok(None);
+            return self.missing_content_row(row.rowid, false).map(|_| None);
         };
         // A number in a column is read as the text it is written as, which is what SQLite's
         // `sqlite3_column_text` gives `highlight` and `snippet`.
@@ -564,6 +568,60 @@ impl Fts5Cursor {
     }
 
     /// Returns every term the query asked for, across its phrases.
+    /// Answers for a row whose content the owner table no longer has.
+    ///
+    /// **An external content table's index can name a row the owner has lost.** SQLite reports
+    /// that as corruption when a column of the row is read: `fts5: missing row 2 from content
+    /// table 'main'.'t'` for a column read, and the bare `database disk image is malformed` from
+    /// an auxiliary function such as `highlight`. A table that owns its rows never gets here,
+    /// and its answer is NULL as before.
+    ///
+    /// @param rowid - the row that has no content
+    /// @param named - whether the message names the row, which a column read does
+    fn missing_content_row(&self, rowid: i64, named: bool) -> DbResult<Value<'static>> {
+        let Some(owner) = &self.external else {
+            return Ok(Value::Null);
+        };
+        if !named {
+            return Err(
+                inillucent_base::error::corrupt("database disk image is malformed")
+                    .with_message("database disk image is malformed"),
+            );
+        }
+        let said = format!(
+            "fts5: missing row {rowid} from content table '{}'.'{}'",
+            String::from_utf8_lossy(&self.schema),
+            String::from_utf8_lossy(owner)
+        );
+        Err(inillucent_base::error::corrupt(said.clone()).with_message(said))
+    }
+
+    /// Fills the cursor with every row of the table, in rowid order.
+    ///
+    /// **An external content table reads through to the owner.** SQLite
+    /// answers `SELECT * FROM t` on `content='n'` with every row of `n`,
+    /// before any `rebuild`, because the scan runs a query over `n` and
+    /// never looks at the index. That holds for FTS3, FTS4 and FTS5, and
+    /// for an owner that is a view as well as for one that is a table.
+    /// A contentless table has no owner, so `%_docsize` has the rows.
+    ///
+    /// @param context - the running statement
+    fn scan_every_row(&mut self, context: &mut Context<'_>) -> DbResult<()> {
+        let reads_owner = self.external.is_some();
+        let suffix: &[u8] = if reads_owner {
+            b""
+        } else if self.contentless {
+            b"docsize"
+        } else {
+            b"content"
+        };
+        self.shadows.scan(context, suffix, |rowid, _| {
+            self.rows.push(MatchedRow { rowid, score: None });
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
     /// Returns `offsets(t)`: where every hit in the row is, as four numbers.
     ///
     /// **Column, term, byte offset, byte length**, one quadruple per hit,
@@ -728,25 +786,7 @@ impl VirtualCursor for Fts5Cursor {
             return self.filter_by_rowid(context, plan);
         }
         if plan.index_number & PLAN_MATCH == 0 {
-            // **An external content table reads through to the owner.** SQLite
-            // answers `SELECT * FROM t` on `content='n'` with every row of `n`,
-            // before any `rebuild`, because the scan runs a query over `n` and
-            // never looks at the index. That holds for FTS3, FTS4 and FTS5, and
-            // for an owner that is a view as well as for one that is a table.
-            // A contentless table has no owner, so `%_docsize` has the rows.
-            let reads_owner = self.external.is_some();
-            let suffix: &[u8] = if reads_owner {
-                b""
-            } else if self.contentless {
-                b"docsize"
-            } else {
-                b"content"
-            };
-            self.shadows.scan(context, suffix, |rowid, _| {
-                self.rows.push(MatchedRow { rowid, score: None });
-                Ok(true)
-            })?;
-            return Ok(());
+            return self.scan_every_row(context);
         }
         // **Here rather than at the top of `filter`, because this is where the
         // index is read.** The two plans above answer out of `%_content` and
@@ -841,7 +881,7 @@ impl VirtualCursor for Fts5Cursor {
                 .map(|values| (row.rowid, values));
         }
         let Some((_, content)) = self.held.as_ref() else {
-            return Ok(Value::Null);
+            return self.missing_content_row(row.rowid, true);
         };
         Ok(self
             .offsets

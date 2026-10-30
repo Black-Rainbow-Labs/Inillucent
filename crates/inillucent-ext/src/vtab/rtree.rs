@@ -239,6 +239,22 @@ pub struct RTreeShape {
 /// @param shape - whether this is `geopoly`
 fn parse_arguments_for(arguments: &[Vec<u8>], shape: bool) -> DbResult<RTreeShape> {
     if shape {
+        let auxiliary: Vec<Vec<u8>> = arguments
+            .iter()
+            .filter_map(|argument| {
+                let word = argument
+                    .split(|byte| byte.is_ascii_whitespace())
+                    .find(|part| !part.is_empty())?;
+                Some(word.to_vec())
+            })
+            .collect();
+        // A polygon table has no `+name` columns, and its own `_shape` column is taken.
+        if auxiliary.iter().any(|name| name.first() == Some(&b'+')) {
+            return Err(failure("near \"+\": syntax error"));
+        }
+        let mut declared = vec![b"_shape".to_vec()];
+        declared.extend(auxiliary.iter().cloned());
+        check_distinct_names(&declared, &[])?;
         return Ok(RTreeShape {
             coordinates: vec![
                 b"rowid".to_vec(),
@@ -247,15 +263,7 @@ fn parse_arguments_for(arguments: &[Vec<u8>], shape: bool) -> DbResult<RTreeShap
                 b"_miny".to_vec(),
                 b"_maxy".to_vec(),
             ],
-            auxiliary: arguments
-                .iter()
-                .filter_map(|argument| {
-                    let word = argument
-                        .split(|byte| byte.is_ascii_whitespace())
-                        .find(|part| !part.is_empty())?;
-                    Some(word.to_vec())
-                })
-                .collect(),
+            auxiliary,
         });
     }
     parse_coordinate_arguments(arguments)
@@ -265,6 +273,7 @@ fn parse_arguments_for(arguments: &[Vec<u8>], shape: bool) -> DbResult<RTreeShap
 fn parse_coordinate_arguments(arguments: &[Vec<u8>]) -> DbResult<RTreeShape> {
     let mut coordinates: Vec<Vec<u8>> = Vec::new();
     let mut auxiliary: Vec<Vec<u8>> = Vec::new();
+    let mut misplaced = false;
     for argument in arguments {
         // A column may be written `minX REAL`; only the name is kept, which is
         // what SQLite does with an R-Tree's declared types.
@@ -272,20 +281,91 @@ fn parse_coordinate_arguments(arguments: &[Vec<u8>]) -> DbResult<RTreeShape> {
             .split(|byte| byte.is_ascii_whitespace())
             .find(|part| !part.is_empty())
             .unwrap_or(argument);
+        // An empty argument, as a trailing comma leaves, is skipped.
+        if word.is_empty() {
+            continue;
+        }
         match word.split_first() {
             Some((b'+', rest)) => auxiliary.push(rest.to_vec()),
-            _ => coordinates.push(word.to_vec()),
+            _ => {
+                // A coordinate column written after an auxiliary one is the order SQLite refuses.
+                if !auxiliary.is_empty() {
+                    misplaced = true;
+                }
+                coordinates.push(word.to_vec());
+            }
         }
     }
-    if coordinates.len() < 3 || coordinates.len() > 11 || coordinates.len().is_multiple_of(2) {
-        return Err(failure(
-            "an rtree table needs an odd number of columns between 3 and 11",
-        ));
-    }
+    check_coordinate_counts(coordinates.len(), auxiliary.len(), misplaced)?;
+    check_distinct_names(&coordinates, &auxiliary)?;
     Ok(RTreeShape {
         coordinates,
         auxiliary,
     })
+}
+
+/// Refuses a column list SQLite's R*Tree refuses, with SQLite's own sentence.
+///
+/// The order is SQLite's: too few columns in all, an auxiliary column before a coordinate, too
+/// many coordinates, and then a coordinate count that is not odd (the id and a pair per
+/// dimension). A message of this module's own wording was given for every one of them.
+///
+/// @param coordinates - how many columns are the id and the coordinates
+/// @param auxiliary - how many columns are `+name` columns
+/// @param misplaced - whether a coordinate column came after an auxiliary one
+fn check_coordinate_counts(coordinates: usize, auxiliary: usize, misplaced: bool) -> DbResult<()> {
+    if coordinates.saturating_add(auxiliary) < 3 {
+        return Err(failure("Too few columns for an rtree table"));
+    }
+    if misplaced {
+        return Err(failure("Auxiliary rtree columns must be last"));
+    }
+    if coordinates > 11 {
+        return Err(failure("Too many columns for an rtree table"));
+    }
+    if coordinates < 3 || coordinates.is_multiple_of(2) {
+        return Err(failure("Wrong number of columns for an rtree table"));
+    }
+    Ok(())
+}
+
+/// Refuses a column name that appears twice, as `CREATE TABLE` does, ignoring case.
+///
+/// @param coordinates - the id and coordinate column names
+/// @param auxiliary - the auxiliary column names, without their `+`
+fn check_distinct_names(coordinates: &[Vec<u8>], auxiliary: &[Vec<u8>]) -> DbResult<()> {
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    for name in coordinates.iter().chain(auxiliary.iter()) {
+        if name.is_empty() {
+            return Err(failure("near \")\": syntax error"));
+        }
+        let plain = unquoted(name);
+        let folded = plain.to_ascii_lowercase();
+        if seen.contains(&folded) {
+            return Err(failure(format!(
+                "duplicate column name: {}",
+                String::from_utf8_lossy(&plain)
+            )));
+        }
+        seen.push(folded);
+    }
+    Ok(())
+}
+
+/// Returns a column name without the quotes it was written in.
+///
+/// @param name - the name as written, possibly in double quotes, backquotes or brackets
+fn unquoted(name: &[u8]) -> Vec<u8> {
+    match (name.first(), name.last()) {
+        (Some(b'"'), Some(b'"')) | (Some(b'`'), Some(b'`')) | (Some(b'['), Some(b']'))
+            if name.len() >= 2 =>
+        {
+            name.get(1..name.len().saturating_sub(1))
+                .unwrap_or_default()
+                .to_vec()
+        }
+        _ => name.to_vec(),
+    }
 }
 
 impl Module for RTreeModule {
@@ -511,7 +591,16 @@ impl VirtualTable for RTreeTable {
             // A polygon table has no coordinate columns, so there is nothing
             // here for a bounding-box descent to be built from and the shape
             // predicates are left to the engine to apply over a scan.
-            if !constraint.usable || constraint.column < 1 || self.shape {
+            // **Only a coordinate column bounds the descent.** A constraint on an auxiliary
+            // column was written into the plan under the column number clamped to 9, which a
+            // five dimension table reads as one of its own coordinates, so `WHERE note = 'x'`
+            // narrowed the box and dropped every row outside it.
+            if !constraint.usable
+                || constraint.column < 1
+                || self.shape
+                || usize::try_from(constraint.column)
+                    .map_or(true, |column| column > self.dimensions.saturating_mul(2))
+            {
                 continue;
             }
             let op = match constraint.op {
@@ -525,7 +614,7 @@ impl VirtualTable for RTreeTable {
             let position = query.use_constraint(index, false);
             let _ = position;
             plan.push(op as char);
-            plan.push((b'0' + (constraint.column as u8).min(9)) as char);
+            plan.push((b'0' + constraint.column as u8) as char);
         }
         if plan.is_empty() {
             query.index_number = PLAN_SCAN;
@@ -541,6 +630,11 @@ impl VirtualTable for RTreeTable {
         query.estimated_cost = (1000.0 / (2.0f64).powi(terms as i32)).max(1.0);
         query.estimated_rows = query.estimated_cost as i64;
         Ok(())
+    }
+
+    /// Returns the rowid an insert names through its id column.
+    fn rowid_in_columns(&self, values: &[Value<'static>]) -> Option<i64> {
+        self.id_of_insert(&Value::Null, values)
     }
 
     /// Opens a cursor over the tree.
@@ -615,12 +709,9 @@ impl VirtualTable for RTreeTable {
                 Ok(None)
             }
             Change::Insert { rowid, values } => {
-                let key = match rowid.as_integer() {
+                let key = match self.id_of_insert(rowid, values) {
                     Some(key) => key,
-                    None => values
-                        .first()
-                        .and_then(Value::as_integer)
-                        .unwrap_or_else(|| self.next_rowid(context)),
+                    None => self.next_rowid(context),
                 };
                 let cell = self.cell_of(key, values)?;
                 self.remember_auxiliary(key, values);
@@ -642,7 +733,18 @@ impl VirtualTable for RTreeTable {
                 let Some(old) = old_rowid.as_integer() else {
                     return Ok(None);
                 };
-                let new = new_rowid.as_integer().unwrap_or(old);
+                let new = self.id_of_update(context, old, new_rowid, values);
+                // **The id column decides the new rowid, and a clash is a unique constraint
+                // failure.** `UPDATE r SET id = ...` was ignored because only `SET rowid` was
+                // read. A rowid that another row already holds is refused before the old row
+                // goes, so a refused statement has not removed what it meant to move.
+                if new != old && self.find_leaf(context, new)?.is_some() {
+                    return Err(constraint(format!(
+                        "UNIQUE constraint failed: {}.{}",
+                        String::from_utf8_lossy(&self.table_name),
+                        String::from_utf8_lossy(&self.rowid_name)
+                    )));
+                }
                 let cell = self.cell_of(new, values)?;
                 self.remember_auxiliary(new, values);
                 self.remove(context, old)?;
@@ -673,7 +775,7 @@ impl VirtualTable for RTreeTable {
                 continue;
             }
             for index in 0..count as usize {
-                let Some(cell) = read_cell(&node, index, self.dimensions) else {
+                let Some(cell) = read_cell(&node, index, self.dimensions, self.coordinates) else {
                     continue;
                 };
                 if depth == 0 {
@@ -791,7 +893,12 @@ fn read_header(node: &[u8]) -> (u16, u16) {
 }
 
 /// Reads one cell out of a node.
-fn read_cell(node: &[u8], index: usize, dimensions: usize) -> Option<Cell> {
+fn read_cell(
+    node: &[u8],
+    index: usize,
+    dimensions: usize,
+    coordinates: Coordinates,
+) -> Option<Cell> {
     let size = CELL_KEY + dimensions * 2 * COORDINATE;
     let at = HEADER + index * size;
     let bytes = node.get(at..at + size)?;
@@ -803,7 +910,10 @@ fn read_cell(node: &[u8], index: usize, dimensions: usize) -> Option<Cell> {
         let raw = bytes.get(at..at + COORDINATE)?;
         let mut word = [0u8; 4];
         word.copy_from_slice(raw);
-        box_.push(f64::from(f32::from_be_bytes(word)));
+        box_.push(match coordinates {
+            Coordinates::Float => f64::from(f32::from_be_bytes(word)),
+            Coordinates::Integer => f64::from(i32::from_be_bytes(word)),
+        });
     }
     Some(Cell {
         key: i64::from_be_bytes(key),
@@ -812,7 +922,7 @@ fn read_cell(node: &[u8], index: usize, dimensions: usize) -> Option<Cell> {
 }
 
 /// Writes one cell into a node.
-fn write_cell(node: &mut [u8], index: usize, cell: &Cell) {
+fn write_cell(node: &mut [u8], index: usize, cell: &Cell, coordinates: Coordinates) {
     let dimensions = cell.box_.len() / 2;
     let size = CELL_KEY + dimensions * 2 * COORDINATE;
     let at = HEADER + index * size;
@@ -825,24 +935,27 @@ fn write_cell(node: &mut [u8], index: usize, cell: &Cell) {
     for (position, value) in cell.box_.iter().enumerate() {
         let at = at.saturating_add(8).saturating_add(position * COORDINATE);
         if let Some(slot) = node.get_mut(at..at.saturating_add(COORDINATE)) {
-            slot.copy_from_slice(&(*value as f32).to_be_bytes());
+            match coordinates {
+                Coordinates::Float => slot.copy_from_slice(&(*value as f32).to_be_bytes()),
+                Coordinates::Integer => slot.copy_from_slice(&(*value as i32).to_be_bytes()),
+            }
         }
     }
 }
 
 /// Reads every cell of a node.
-fn read_cells(node: &[u8], dimensions: usize) -> Vec<Cell> {
+fn read_cells(node: &[u8], dimensions: usize, coordinates: Coordinates) -> Vec<Cell> {
     let (_, count) = read_header(node);
     (0..count as usize)
-        .filter_map(|index| read_cell(node, index, dimensions))
+        .filter_map(|index| read_cell(node, index, dimensions, coordinates))
         .collect()
 }
 
 /// Writes a whole set of cells into a node, replacing what was there.
-fn write_cells(node: &mut [u8], depth: u16, cells: &[Cell]) {
+fn write_cells(node: &mut [u8], depth: u16, cells: &[Cell], coordinates: Coordinates) {
     write_header(node, depth, cells.len() as u16);
     for (index, cell) in cells.iter().enumerate() {
-        write_cell(node, index, cell);
+        write_cell(node, index, cell, coordinates);
     }
 }
 
@@ -923,6 +1036,54 @@ impl RTreeTable {
         Ok(Cell { key, box_ })
     }
 
+    /// Returns the rowid an insert gives its row, or nothing when the table must choose one.
+    ///
+    /// **The id column is read with `sqlite3_value_int64`, as SQLite's R*Tree reads it.** `'abc'`
+    /// is rowid 0, `1.5` is 1, `'7'` is 7 and a blob reads as its text. Only an integer was taken
+    /// before, so every other value was thrown away and the row got a rowid of the table's own.
+    ///
+    /// @param rowid - the rowid the statement named, or NULL
+    /// @param values - the declared columns of the insert, in declared order
+    fn id_of_insert(&self, rowid: &Value<'static>, values: &[Value<'static>]) -> Option<i64> {
+        if self.shape {
+            return rowid.as_integer();
+        }
+        let named = match rowid {
+            Value::Null => values.first().unwrap_or(rowid),
+            supplied => supplied,
+        };
+        match named {
+            Value::Null => None,
+            other => Some(inillucent_value::cast::integer_value(other)),
+        }
+    }
+
+    /// Returns the rowid an update moves a row to.
+    ///
+    /// A NULL id takes the next unused rowid, as SQLite's R*Tree does. A polygon table has no id
+    /// column and moves a row only through `SET rowid`.
+    ///
+    /// @param context - the statement's context
+    /// @param old - the rowid the row has now
+    /// @param new_rowid - the rowid `SET rowid` named, which is the old one when it did not
+    /// @param values - the declared columns after the assignments
+    fn id_of_update(
+        &self,
+        context: &mut Context<'_>,
+        old: i64,
+        new_rowid: &Value<'static>,
+        values: &[Value<'static>],
+    ) -> i64 {
+        if self.shape {
+            return new_rowid.as_integer().unwrap_or(old);
+        }
+        match values.first() {
+            Some(Value::Null) => self.next_rowid(context),
+            Some(id) => inillucent_value::cast::integer_value(id),
+            None => old,
+        }
+    }
+
     /// Returns a rowid nothing is using.
     fn next_rowid(&self, context: &mut Context<'_>) -> i64 {
         max_rowid(context, &self.shadows, &self.pending).saturating_add(1)
@@ -957,7 +1118,7 @@ impl RTreeTable {
             if depth == 0 {
                 return Ok(number);
             }
-            let cells = read_cells(&node, self.dimensions);
+            let cells = read_cells(&node, self.dimensions, self.coordinates);
             let mut best: Option<(f64, i64)> = None;
             for child in &cells {
                 let growth = child.growth(cell);
@@ -977,7 +1138,7 @@ impl RTreeTable {
                 }
             }
             let mut node = node;
-            write_cells(&mut node, depth, &cells);
+            write_cells(&mut node, depth, &cells, self.coordinates);
             put_node(context, &self.shadows, &self.pending, number, &node)?;
             number = chosen;
             let _ = node_bytes;
@@ -998,7 +1159,7 @@ impl RTreeTable {
             return Err(failure(format!("rtree node {number} is missing")));
         };
         let (depth, _) = read_header(&node);
-        let mut cells = read_cells(&node, self.dimensions);
+        let mut cells = read_cells(&node, self.dimensions, self.coordinates);
         cells.push(cell.clone());
         if leaf {
             put_rowid(context, &self.shadows, &self.pending, cell.key, number)?;
@@ -1006,7 +1167,7 @@ impl RTreeTable {
             put_parent(context, &self.shadows, &self.pending, cell.key, number)?;
         }
         if cells.len() <= capacity {
-            write_cells(&mut node, depth, &cells);
+            write_cells(&mut node, depth, &cells, self.coordinates);
             return put_node(context, &self.shadows, &self.pending, number, &node);
         }
         // The node is full. Split it in half along the widest dimension, which
@@ -1015,10 +1176,10 @@ impl RTreeTable {
         let (left, right) = split(&cells, self.dimensions);
         let sibling = max_node(context, &self.shadows, &self.pending).saturating_add(1);
         let mut left_node = vec![0u8; node_bytes];
-        write_cells(&mut left_node, depth, &left);
+        write_cells(&mut left_node, depth, &left, self.coordinates);
         put_node(context, &self.shadows, &self.pending, number, &left_node)?;
         let mut right_node = vec![0u8; node_bytes];
-        write_cells(&mut right_node, depth, &right);
+        write_cells(&mut right_node, depth, &right, self.coordinates);
         put_node(context, &self.shadows, &self.pending, sibling, &right_node)?;
         for moved in &right {
             if depth == 0 {
@@ -1035,7 +1196,7 @@ impl RTreeTable {
             // children. Everything else grows the tree by one level.
             let first = max_node(context, &self.shadows, &self.pending).saturating_add(1);
             let mut moved = vec![0u8; node_bytes];
-            write_cells(&mut moved, depth, &left);
+            write_cells(&mut moved, depth, &left, self.coordinates);
             put_node(context, &self.shadows, &self.pending, first, &moved)?;
             for cell in &left {
                 if depth == 0 {
@@ -1058,6 +1219,7 @@ impl RTreeTable {
                         box_: right_box,
                     },
                 ],
+                self.coordinates,
             );
             put_node(context, &self.shadows, &self.pending, ROOT, &root)?;
             put_parent(context, &self.shadows, &self.pending, first, ROOT)?;
@@ -1091,13 +1253,13 @@ impl RTreeTable {
             return Ok(());
         };
         let (depth, _) = read_header(&node);
-        let mut cells = read_cells(&node, self.dimensions);
+        let mut cells = read_cells(&node, self.dimensions, self.coordinates);
         for cell in cells.iter_mut() {
             if cell.key == child {
                 cell.box_ = box_.clone();
             }
         }
-        write_cells(&mut node, depth, &cells);
+        write_cells(&mut node, depth, &cells, self.coordinates);
         put_node(context, &self.shadows, &self.pending, parent, &node)
     }
 
@@ -1114,14 +1276,14 @@ impl RTreeTable {
             return Ok(());
         };
         let (depth, _) = read_header(&node);
-        let mut cells = read_cells(&node, self.dimensions);
+        let mut cells = read_cells(&node, self.dimensions, self.coordinates);
         cells.retain(|cell| cell.key != rowid);
         // The blob is rewritten whole, so a cell that was removed leaves no
         // stale bytes behind for a reader that trusts the count.
         for byte in node.iter_mut().skip(HEADER) {
             *byte = 0;
         }
-        write_cells(&mut node, depth, &cells);
+        write_cells(&mut node, depth, &cells, self.coordinates);
         put_node(context, &self.shadows, &self.pending, leaf, &node)?;
         delete_rowid(context, &self.shadows, &self.pending, rowid)?;
         // The boxes above the leaf are now larger than they need to be, which
@@ -1299,7 +1461,7 @@ impl VirtualCursor for RTreeCursor {
         self.rows.clear();
         self.at = 0;
         if plan.index_number == PLAN_ROWID {
-            let Some(rowid) = plan.arguments.first().and_then(Value::as_integer) else {
+            let Some(rowid) = plan.arguments.first().and_then(super::rowid_to_look_up) else {
                 return Ok(());
             };
             let Some(leaf) = find_rowid(context, &self.shadows, &self.pending, rowid)? else {
@@ -1308,7 +1470,7 @@ impl VirtualCursor for RTreeCursor {
             let Some(node) = get_node(context, &self.shadows, &self.pending, leaf)? else {
                 return Ok(());
             };
-            for cell in read_cells(&node, self.dimensions) {
+            for cell in read_cells(&node, self.dimensions, self.coordinates) {
                 if cell.key == rowid {
                     self.rows.push(cell);
                 }
@@ -1369,7 +1531,7 @@ impl VirtualCursor for RTreeCursor {
                 continue;
             };
             let (depth, _) = read_header(&node);
-            for cell in read_cells(&node, self.dimensions) {
+            for cell in read_cells(&node, self.dimensions, self.coordinates) {
                 if plan.index_number == PLAN_BOX && !cell.overlaps(&query) {
                     continue;
                 }
@@ -1645,9 +1807,9 @@ mod tests {
                 box_: vec![-1.0, 0.5, 10.0, 20.0],
             },
         ];
-        write_cells(&mut node, 0, &cells);
+        write_cells(&mut node, 0, &cells, Coordinates::Float);
         assert_eq!(read_header(&node), (0, 2));
-        assert_eq!(read_cells(&node, 2), cells);
+        assert_eq!(read_cells(&node, 2, Coordinates::Float), cells);
     }
 
     /// The header carries the depth in the two bytes before the count.

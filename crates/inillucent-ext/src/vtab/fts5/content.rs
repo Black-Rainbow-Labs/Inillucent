@@ -4,7 +4,28 @@
 //! position in the module's own `%_content`.** A column the owner does not have reads as
 //! NULL rather than as another column's value.
 
+use super::options::parse_options;
 use super::ColumnSpec;
+use inillucent_sql::vtab::ModuleArguments;
+
+/// Returns the owner of an external content table and the query that reads its rows.
+///
+/// SQLite reads external content with a query over the named table or view**, so a
+/// view works as an owner. The first column is the rowid, taken from `content_rowid=`
+/// and `rowid` when none was written, and the rest are the columns this table declares,
+/// in declared order. [`content_offsets_named`] reads a view's rows by those positions.
+///
+/// @param arguments - the arguments the table was created with
+pub(super) fn owner_query_of(arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
+    let options = parse_options(&arguments.arguments).ok()?;
+    let owner = options.content?;
+    let quoted =
+        |name: &[u8]| format!("\"{}\"", String::from_utf8_lossy(name).replace('"', "\"\""));
+    let mut selected = vec![quoted(&options.content_rowid)];
+    selected.extend(options.columns.iter().map(|column| quoted(&column.name)));
+    let query = format!("SELECT {} FROM {}", selected.join(", "), quoted(&owner));
+    Some((owner, query))
+}
 
 /// Returns where each declared column sits in a stored content row.
 ///
@@ -50,6 +71,12 @@ pub(super) fn content_offsets_named(
     if found.is_some_and(|table| table.kind == inillucent_sql::catalog_view::TableKind::View) {
         return (0..names.len()).collect();
     }
+    // **A stored row is the rowid followed by every column that is not the rowid alias.** The
+    // alias (`INTEGER PRIMARY KEY`) is the tree's key and is not repeated in the record, so a
+    // column's place in the stored row is its declared position moved up one for the rowid and
+    // down one when the alias is declared before it. Using the declared position alone read
+    // every column one place early for a table with no alias, and the rowid as the first column.
+    let alias = found.and_then(|table| table.rowid_alias).map(usize::from);
     names
         .iter()
         .map(|name| {
@@ -60,6 +87,11 @@ pub(super) fn content_offsets_named(
                         .columns
                         .iter()
                         .position(|held| held.name.to_ascii_lowercase() == folded)
+                })
+                .map(|position| match alias {
+                    Some(alias) if alias == position => 0,
+                    Some(alias) if alias < position => position,
+                    _ => position.saturating_add(1),
                 })
                 .unwrap_or(usize::MAX)
         })

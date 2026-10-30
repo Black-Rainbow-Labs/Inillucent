@@ -57,7 +57,12 @@ impl ImportedDatabase {
         }
         self.rebuild_tables()?;
         self.refresh_catalog();
-        self.reconnect_modules()?;
+        // **Only the tables the statement added or changed are connected again.** Connecting
+        // every table replaced the FTS5 table a dump had written earlier in the same
+        // transaction with a new object that did not hold its staged index, so the index was
+        // discarded and the next integrity check found a checksum mismatch.
+        self.disconnect_changed_modules();
+        self.connect_missing()?;
         self.refresh_vector_indexes();
         self.seal()?;
         self.record_changes(changed as i64, changed as i64);

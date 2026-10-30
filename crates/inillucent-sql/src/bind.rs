@@ -2818,6 +2818,18 @@ impl<'a> Binder<'a> {
         span: Span,
         written: ast::NameId,
     ) -> Result<Option<BoundExpr>, ParseError> {
+        // **A built in function is never an auxiliary function.** `typeof(f)` and `length(f)`
+        // on an FTS5 table's own column are ordinary calls on its value, which is the cursor's
+        // number; they were handed to the module as auxiliary functions it does not have, and
+        // failed with `no such function`.
+        if function::lookup_scalar(name).is_some()
+            || function::lookup_time(name).is_some()
+            || function::lookup_math(name).is_some()
+            || function::lookup_json(name).is_some()
+            || function::is_aggregate_call(name, arguments.len(), false)
+        {
+            return Ok(None);
+        }
         let Some(first) = arguments.first() else {
             return Ok(None);
         };

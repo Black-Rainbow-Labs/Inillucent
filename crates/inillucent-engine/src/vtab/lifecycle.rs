@@ -114,25 +114,45 @@ impl crate::ImportedDatabase {
         Ok(self.session_state.virtual_tables.len() > before)
     }
 
+    /// Returns every schema this connection holds, the one searched last first.
+    ///
+    /// SQLite looks a name up in `temp`, then `main`, then the attached databases. The connected
+    /// tables are kept by name, so a later insert replaces an earlier one, and walking the
+    /// schemas from the lowest priority up leaves the table a statement would find.
+    pub(crate) fn schemas_in_lookup_order(&self) -> Vec<usize> {
+        let mut schemas: Vec<usize> = (0..self.session_state.attached.len())
+            .map(|held| crate::FIRST_ATTACHED.saturating_add(held))
+            .collect();
+        schemas.push(crate::MAIN);
+        if self.session_state.schema_at(crate::TEMP).is_some() {
+            schemas.push(crate::TEMP);
+        }
+        schemas
+    }
+
     /// Connects the virtual tables the catalog declares.
     ///
     /// @param which - every table, only those in `unconnected`, or only those with no connection
     fn connect_declared(&mut self, which: ConnectWhich) -> DbResult<()> {
-        let declarations: Vec<Vec<u8>> = self
-            .schema
-            .entries
-            .iter()
-            .filter(|recorded| recorded.entry.kind == ObjectKind::Table)
+        let declarations: Vec<(usize, Vec<u8>)> = self
+            .schemas_in_lookup_order()
+            .into_iter()
+            .flat_map(|at| {
+                self.entries_of(at)
+                    .iter()
+                    .map(move |recorded| (at, recorded))
+            })
+            .filter(|(_, recorded)| recorded.entry.kind == ObjectKind::Table)
             // **Only a statement that can declare a virtual table is parsed**
             // (task-2191). Every table's `CREATE` was parsed at every open to
             // find the virtual ones. A `CREATE VIRTUAL TABLE` holds the word
             // `virtual` wherever comments put it, so a text without it cannot
             // be one, and a text that has it for another reason is parsed and
             // skipped below as before.
-            .filter(|recorded| names_virtual(&recorded.entry.sql))
-            .map(|recorded| recorded.entry.sql.clone())
+            .filter(|(_, recorded)| names_virtual(&recorded.entry.sql))
+            .map(|(at, recorded)| (at, recorded.entry.sql.clone()))
             .collect();
-        for sql in declarations {
+        for (at, sql) in declarations {
             let parsed = match inillucent_sql::parser::parse_next_statement(
                 &sql,
                 0,
@@ -182,8 +202,8 @@ impl crate::ImportedDatabase {
                 continue;
             };
             let mut connect = ModuleArguments {
-                database: 0,
-                schema: b"main".to_vec(),
+                database: at,
+                schema: self.schema_name_of(at),
                 table: name.clone(),
                 module: module.clone(),
                 arguments,
@@ -195,10 +215,15 @@ impl crate::ImportedDatabase {
                 // see. A shadow table is a real tree either way, and the row is
                 // the authority for what it is registered under.
                 let owned = shadow.owner.clone().unwrap_or_else(|| name.clone());
-                let shadow_name = shadow_table_name(&owned, &shadow.suffix).to_ascii_lowercase();
+                // An owner may name the schema its table is in, which is not always this one.
+                let (owner_schema, owner_table) = inillucent_sql::vtab::split_owner(&owned);
+                let owner_at = owner_schema
+                    .and_then(|schema| self.schema_named(schema))
+                    .unwrap_or(at);
+                let shadow_name =
+                    shadow_table_name(owner_table, &shadow.suffix).to_ascii_lowercase();
                 let Some(recorded) = self
-                    .schema
-                    .entries
+                    .entries_of(owner_at)
                     .iter()
                     .find(|recorded| recorded.entry.name.to_ascii_lowercase() == shadow_name)
                 else {
@@ -296,7 +321,7 @@ impl crate::ImportedDatabase {
         };
         let outcome = {
             let txn = self.current_txn();
-            let at = self.schema.ddl_schema;
+            let at = connected.arguments.database;
             let session = self.session_state.session.get();
             let wal = self
                 .log_of(at)
@@ -422,6 +447,7 @@ impl crate::ImportedDatabase {
                 &inillucent_exec::physical::Params::new(),
             )?;
             let mut new_rowid = rowid;
+            let mut unconverted: Option<Value<'static>> = None;
             let mut values = vec![Value::Null; width];
             if let Some(row) = held.rows.first() {
                 for (position, at) in visible.iter().enumerate() {
@@ -458,7 +484,16 @@ impl crate::ImportedDatabase {
                 // it used to be written into the first declared column while
                 // the row kept its rowid. It is the new rowid of the change.
                 if assignment.rowid {
-                    new_rowid = module_rowid(value)?;
+                    // **A value that is not an integer reaches the module as written.** FTS5
+                    // refuses it with `datatype mismatch`, and an R*Tree takes the rowid from its
+                    // id column and does not read it, so refusing it here for every module was
+                    // wrong for the second.
+                    match module_rowid(value.clone()) {
+                        Ok(rowid) => new_rowid = rowid,
+                        Err(_) => {
+                            unconverted = Some(Value::from(&value.borrow()).into_owned()?);
+                        }
+                    }
                     continue;
                 }
                 if let Some(slot) = values.get_mut(usize::from(assignment.column)) {
@@ -469,7 +504,7 @@ impl crate::ImportedDatabase {
                 &table.name,
                 &Change::Update {
                     old_rowid: Value::Integer(rowid),
-                    new_rowid: Value::Integer(new_rowid),
+                    new_rowid: unconverted.unwrap_or(Value::Integer(new_rowid)),
                     values,
                 },
             )?;
@@ -657,33 +692,7 @@ impl crate::ImportedDatabase {
                     *slot = value.clone();
                 }
             }
-            // **A supplied rowid is the caller's, not the module's to choose.**
-            // This passed `Null` unconditionally, so `INSERT INTO t(rowid, ...)
-            // VALUES (?1, ...)` was accepted and the rowid silently discarded -
-            // the module allocated its own, and every row came back under a
-            // number the caller had not written. It surfaced as a migrated
-            // search index whose every ranking was correct and whose every
-            // identifier was one too high, because the source numbered its
-            // chunks from zero and the module numbered them from one.
-            let rowid = match (statement.named_rowid, &statement.rowid) {
-                // `INSERT INTO t(rowid, ...)`, which the binder records apart
-                // from the columns because a rowid is not one: nothing writes
-                // it into the record. It is the only place the value appears -
-                // no `ColumnSource` refers to it - so reading `statement.rowid`
-                // alone found nothing and the value was dropped on the floor.
-                (Some(at), _) => supplied.get(at).cloned().unwrap_or(Value::Null),
-                (None, Some(inillucent_sql::dml::ColumnSource::Row(at))) => {
-                    supplied.get(*at).cloned().unwrap_or(Value::Null)
-                }
-                (None, Some(inillucent_sql::dml::ColumnSource::Expr(expr))) => Value::from(
-                    &inillucent_exec::physical::literal_value_in(expr, params, Some(&*self))?
-                        .borrow(),
-                )
-                .into_owned()?,
-                // Nothing named one, so the module allocates - which is what
-                // `Null` asks it for.
-                (None, Some(inillucent_sql::dml::ColumnSource::Generated(_)) | None) => Value::Null,
-            };
+            let rowid = self.rowid_of_module_insert(statement, &supplied, params)?;
             // **Tried gating this on `change_module`'s `Option<i64>` return -
             // `Some` for an ordinary content row, `None` for a command, on the
             // theory that a command never counts as a change.** That broke
@@ -711,8 +720,8 @@ impl crate::ImportedDatabase {
                 // tries again**, which is what SQLite asks FTS5 to do for it.
                 // Only a constraint failure on a rowid the statement named
                 // can be answered that way.
-                Err(error) if module_replaces(statement, &error, &change) => {
-                    self.replace_in_module(&statement.table.name, &change)
+                Err(error) if module_replaces(statement, &error) => {
+                    self.replace_in_module(&statement.table.name, &change, error)
                 }
                 applied => applied,
             };
@@ -755,14 +764,80 @@ impl crate::ImportedDatabase {
         }
         Ok(())
     }
+    /// Returns the rowid one row of an insert names, or NULL when the module is to choose.
+    ///
+    /// **A supplied rowid is the caller's, not the module's to choose.** This passed `Null`
+    /// unconditionally, so `INSERT INTO t(rowid, ...) VALUES (?1, ...)` was accepted and the
+    /// rowid silently discarded - the module allocated its own, and every row came back under a
+    /// number the caller had not written. It surfaced as a migrated search index whose every
+    /// ranking was correct and whose every identifier was one too high, because the source
+    /// numbered its chunks from zero and the module numbered them from one.
+    ///
+    /// @param statement - the bound insert
+    /// @param supplied - the values the row supplies, in statement order
+    /// @param params - the values bound for this execution
+    fn rowid_of_module_insert(
+        &self,
+        statement: &inillucent_sql::dml::BoundInsert,
+        supplied: &[Value<'static>],
+        params: &inillucent_exec::physical::Params,
+    ) -> DbResult<Value<'static>> {
+        Ok(match (statement.named_rowid, &statement.rowid) {
+            // `INSERT INTO t(rowid, ...)`, which the binder records apart from the columns
+            // because a rowid is not one: nothing writes it into the record. It is the only place
+            // the value appears - no `ColumnSource` refers to it - so reading `statement.rowid`
+            // alone found nothing and the value was dropped on the floor.
+            //
+            // **A named rowid takes integer affinity, as it does for an ordinary table.** `'2'`
+            // and `3.0` are rowids 2 and 3, and `'abc'`, `1.5` and a blob are refused with
+            // `datatype mismatch`. They were handed to the module as they were written, and an
+            // FTS5 table kept a row under a text rowid.
+            (Some(at), _) => match supplied.get(at) {
+                None | Some(Value::Null) => Value::Null,
+                Some(named) => Value::Integer(module_rowid(
+                    inillucent_tree::datum::OwnedDatum::from(named),
+                )?),
+            },
+            (None, Some(inillucent_sql::dml::ColumnSource::Row(at))) => {
+                supplied.get(*at).cloned().unwrap_or(Value::Null)
+            }
+            (None, Some(inillucent_sql::dml::ColumnSource::Expr(expr))) => Value::from(
+                &inillucent_exec::physical::literal_value_in(expr, params, Some(self))?.borrow(),
+            )
+            .into_owned()?,
+            // Nothing named one, so the module allocates - which is what `Null` asks it for.
+            (None, Some(inillucent_sql::dml::ColumnSource::Generated(_)) | None) => Value::Null,
+        })
+    }
+
     /// Deletes the row a replacing insert collided with, then inserts again.
     ///
     /// @param table - the virtual table's name
     /// @param change - the insert the module refused
-    fn replace_in_module(&mut self, table: &[u8], change: &Change) -> DbResult<Option<i64>> {
-        if let Change::Insert { rowid, .. } = change {
-            self.change_module(table, &Change::Delete(rowid.clone()))?;
-        }
+    fn replace_in_module(
+        &mut self,
+        table: &[u8],
+        change: &Change,
+        refused: inillucent_base::error::DbError,
+    ) -> DbResult<Option<i64>> {
+        let Change::Insert { rowid, values } = change else {
+            return Err(refused);
+        };
+        // The rowid the statement named, or the one the table's own first column names (an
+        // R*Tree's `id`). With neither there is no row to remove and the refusal stands.
+        let key = match rowid {
+            Value::Null => self
+                .session_state
+                .virtual_tables
+                .get(&table.to_ascii_lowercase())
+                .and_then(|connected| connected.table.rowid_in_columns(values))
+                .map(Value::Integer),
+            named => Some(named.clone()),
+        };
+        let Some(key) = key else {
+            return Err(refused);
+        };
+        self.change_module(table, &Change::Delete(key))?;
         self.change_module(table, change)
     }
     /// Returns the values one row of an insert supplies, in statement order.
@@ -943,7 +1018,7 @@ impl crate::ImportedDatabase {
             }
             let outcome = {
                 let txn = self.current_txn();
-                let at = self.schema.ddl_schema;
+                let at = connected.arguments.database;
                 let session = self.session_state.session.get();
                 let wal = self
                     .log_of(at)
@@ -1116,7 +1191,7 @@ impl crate::ImportedDatabase {
     ///     transaction
     fn tell_one_module(&mut self, connected: &mut Connected, moment: Moment) -> DbResult<()> {
         let txn = self.current_txn();
-        let at = self.schema.ddl_schema;
+        let at = connected.arguments.database;
         let session = self.session_state.session.get();
         let Some(wal) = self.log_of(at) else {
             return Ok(());
@@ -1229,22 +1304,18 @@ fn module_rolls_back(
         && error.code() == inillucent_base::error::PrimaryCode::Constraint
 }
 
-/// Reports whether an insert replaces the row a module refused it for.
+/// Reports whether an insert may replace the row a module refused it for.
 ///
-/// Only under `OR REPLACE`, only for a constraint failure, and only when the
-/// statement named the rowid, because that rowid is the row to remove.
+/// Only under `OR REPLACE` and only for a constraint failure. Whether the insert names the row
+/// to remove is decided by [`ImportedDatabase::replace_in_module`], which needs the table.
 ///
 /// @param statement - the bound insert
 /// @param error - what the module answered for the row
-/// @param change - the insert the module refused
 fn module_replaces(
     statement: &inillucent_sql::dml::BoundInsert,
     error: &inillucent_base::error::DbError,
-    change: &Change,
 ) -> bool {
-    let named = matches!(change, Change::Insert { rowid, .. } if !matches!(rowid, Value::Null));
-    named
-        && statement.on_conflict == Some(inillucent_sql::ast::ConflictAction::Replace)
+    statement.on_conflict == Some(inillucent_sql::ast::ConflictAction::Replace)
         && error.code() == inillucent_base::error::PrimaryCode::Constraint
 }
 

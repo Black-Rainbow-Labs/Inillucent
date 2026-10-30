@@ -653,7 +653,7 @@ Some FTS5 options are refused with exit code 3 instead of being accepted and ign
 
 | Option | What happens |
 |---|---|
-| `tokenize='trigram'`, `tokenize='icu'` | refused. The tokenizers are `unicode61`, `ascii` and `porter`. A different tokenizer would change what `MATCH` finds, so a name this build does not have is refused by name |
+| `tokenize='icu'` | refused with `no such tokenizer: icu`, as SQLite does without ICU. The tokenizers are `unicode61`, `ascii`, `porter` and `trigram`. A different tokenizer would change what `MATCH` finds, so a name this build does not have is refused by name |
 | `detail='none'`, `detail='column'` | refused. The index stores full positions |
 | `columnsize=0` | refused. The index stores one size per column |
 
@@ -1016,7 +1016,6 @@ the same message and exit code 1.
 | `writing_to_a_view` | `INSERT`, `UPDATE` or `DELETE` on a view with no `INSTEAD OF` trigger for that statement. SQLite refuses it too, with `cannot modify v because it is a view` |
 | `nested_explain` | `EXPLAIN EXPLAIN ...` |
 | `returning_inside_a_trigger` | `RETURNING` inside a trigger body |
-| `fts5_unavailable_tokenizer` | an FTS5 tokenizer other than `ascii`, `unicode61` and `porter` |
 | `fts5_detail_option` | FTS5 `detail='none'` or `detail='column'` |
 | `fts5_columnsize_option` | FTS5 `columnsize=0` |
 | `fts5_contentless_delete_option` | FTS5 `contentless_delete=1` |

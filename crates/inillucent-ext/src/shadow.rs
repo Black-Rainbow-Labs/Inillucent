@@ -74,6 +74,19 @@ impl ShadowTables {
         Ok(ShadowTables { roots })
     }
 
+    /// Returns what the table that owns one shadow table is holding in memory.
+    ///
+    /// @param context - the call's context
+    /// @param suffix - which shadow table
+    pub fn staged_state(
+        &self,
+        context: &mut Context<'_>,
+        suffix: &[u8],
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        let root = self.root_id(suffix).ok()?;
+        store_of(context).ok()?.staged_state(root)
+    }
+
     /// Returns one shadow table's root as the store names it.
     ///
     /// @param suffix - which shadow table

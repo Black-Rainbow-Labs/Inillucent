@@ -298,13 +298,13 @@ impl Polygon {
             let (Some((x0, y0)), Some((x1, y1))) = (pair.first(), pair.get(1)) else {
                 continue;
             };
-            total += (f64::from(*x0) - f64::from(*x1)) * (f64::from(*y0) + f64::from(*y1)) * 0.5;
+            total += edge_area(*x0, *y0, *x1, *y1);
         }
         // The closing edge, back from the last vertex to the first.
         let (Some((xn, yn)), Some((x0, y0))) = (self.vertices.last(), self.vertices.first()) else {
             return total;
         };
-        total += (f64::from(*xn) - f64::from(*x0)) * (f64::from(*yn) + f64::from(*y0)) * 0.5;
+        total += edge_area(*xn, *yn, *x0, *y0);
         total
     }
 
@@ -757,6 +757,21 @@ fn beneath(x: f64, y: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> i64 {
         return 1;
     }
     0
+}
+
+/// Returns the area one edge adds to the shoelace sum.
+///
+/// **The difference, the sum and their product are single precision**, as SQLite's C computes
+/// them on its `float` coordinates, and only the half is taken in double precision. Doing all of
+/// it in double precision gave `64.957467121412265` for a regular hexagon where SQLite gives
+/// `64.957468032836914`.
+///
+/// @param x0 - the edge's first x
+/// @param y0 - the edge's first y
+/// @param x1 - the edge's second x
+/// @param y1 - the edge's second y
+fn edge_area(x0: f32, y0: f32, x1: f32, y1: f32) -> f64 {
+    f64::from((x0 - x1) * (y0 + y1)) * 0.5
 }
 
 /// Returns the reference's own sine approximation.

@@ -20,6 +20,9 @@ pub(super) struct Constraints {
     pub(super) rank: Option<Option<Vec<u8>>>,
     /// The rowid a match is limited to, when the statement gave one.
     pub(super) rowid: Option<Value<'static>>,
+    /// Whether a `LIKE` or `GLOB` was given whose pattern has no piece to narrow by, so that it
+    /// leaves every row a candidate.
+    pub(super) open_pattern: bool,
 }
 
 /// Reads the arguments of a plan by the roles its plan string gives them.
@@ -33,6 +36,7 @@ pub(super) fn read_constraints(plan: &FilterPlan) -> Constraints {
         queries: Vec::new(),
         rank: None,
         rowid: None,
+        open_pattern: false,
     };
     for (position, argument) in plan.arguments.iter().enumerate() {
         let role = roles.get(position).copied().unwrap_or("t");
@@ -40,6 +44,17 @@ pub(super) fn read_constraints(plan: &FilterPlan) -> Constraints {
             "r" if found.rank.is_none() => found.rank = Some(text_of(argument)),
             "r" => {}
             "=" => found.rowid = Some(argument.clone()),
+            // A `LIKE` or `GLOB` on a trigram index adds the phrases of its pattern as a query on
+            // the column, or nothing when the pattern has none.
+            _ if role.starts_with(['L', 'G']) => match super::pattern::narrowed(role, argument) {
+                Some(Some((column_role, query))) => {
+                    let column = column_role
+                        .strip_prefix('c')
+                        .and_then(|digits| digits.parse::<usize>().ok());
+                    found.queries.push((query, column));
+                }
+                _ => found.open_pattern = true,
+            },
             _ => {
                 let column = role
                     .strip_prefix('c')

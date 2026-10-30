@@ -925,6 +925,11 @@ impl crate::ImportedDatabase {
         if self.writing.batch().is_some() {
             return Ok(());
         }
+        // **The before-images of a statement that is its own transaction end here.** A virtual
+        // table's write passes through this commit and nothing else clears them, so the next
+        // `INSERT OR ROLLBACK` that failed undid every earlier autocommit write to the module's
+        // shadow tables as well, and the table read as empty.
+        self.writing.undo().borrow_mut().clear();
         let txn = self.writing.next_txn();
         self.writing.set_next_txn(txn.saturating_add(1));
         let at = self.schema.ddl_schema;

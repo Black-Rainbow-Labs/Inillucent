@@ -106,6 +106,7 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
     let mut contentless_delete: Option<String> = None;
     let mut not_indexed: Vec<String> = Vec::new();
     let mut invalid: Option<String> = None;
+    let mut tokenize_seen = false;
     for argument in arguments {
         let text = String::from_utf8_lossy(argument).trim().to_string();
         if let Some((name, value)) = split_option(&text) {
@@ -113,7 +114,14 @@ pub(super) fn parse_options(arguments: &[Vec<u8>]) -> DbResult<Options> {
                 invalid = refusal_for_option(&name, &value);
             }
             match name.to_ascii_lowercase().as_str() {
-                "tokenize" => tokenizer = tokenize::parse_specification(&value),
+                "tokenize" => {
+                    // SQLite takes one `tokenize=` directive and refuses a second.
+                    if tokenize_seen && invalid.is_none() {
+                        invalid = Some("multiple tokenize=... directives".to_string());
+                    }
+                    tokenize_seen = true;
+                    tokenizer = tokenize::parse_specification(&value);
+                }
                 // **An external content table names its rows' owner**, and
                 // reaching them is the one thing the module contract does not
                 // give a module for free. It is asked for explicitly, by name,
@@ -349,7 +357,8 @@ fn refusal_for_column(text: &str, words: &[Vec<u8>]) -> Option<String> {
             return Some(format!("reserved fts5 column name: {name}"));
         }
     }
-    if words.len() > 2 {
+    // An argument that starts with `=` has no name to take the value.
+    if words.len() > 2 || text.starts_with('=') {
         return Some(format!("parse error in \"{text}\""));
     }
     match words.get(1) {

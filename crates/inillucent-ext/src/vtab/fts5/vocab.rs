@@ -71,19 +71,31 @@ impl Shape {
 /// The `fts5vocab` module.
 pub struct Fts5VocabModule;
 
-/// Returns the target table and shape a `fts5vocab(...)` names.
+/// What a `fts5vocab(...)` names: the schema when it gave one, the FTS5 table and the shape.
+struct VocabArguments {
+    /// The schema the FTS5 table is in, when the declaration named one.
+    schema: Option<Vec<u8>>,
+    /// The FTS5 table.
+    table: Vec<u8>,
+    /// Which of the three shapes the vocabulary has.
+    shape: Shape,
+}
+
+/// Returns the schema, table and shape a `fts5vocab(...)` names.
 ///
-/// The first argument is the FTS5 table and the second is the shape. SQLite
-/// also accepts a schema name before the table; a two-argument call is the form
-/// everything writes and the only one accepted here, so a three-argument call
-/// is refused rather than half-read.
+/// **The schema is optional, comes first, and is only accepted for a table in `temp`**, which is
+/// what SQLite does: `fts5vocab(f, 'row')` is a declaration anywhere, and
+/// `fts5vocab(main, f, 'row')` only for `CREATE VIRTUAL TABLE temp.v`. Without a schema the table is
+/// looked up in the schema the vocabulary table itself is created in. Any other number of
+/// arguments is `wrong number of vtable arguments`.
 ///
 /// @param arguments - the arguments inside the parentheses
-fn parse_arguments(arguments: &[Vec<u8>]) -> DbResult<(Vec<u8>, Shape)> {
-    let (Some(table), Some(shape)) = (arguments.first(), arguments.get(1)) else {
-        return Err(failure(
-            "fts5vocab: expected a table name and one of 'row', 'col' or 'instance'",
-        ));
+/// @param created_in - the schema the vocabulary table is being created in
+fn parse_arguments(arguments: &[Vec<u8>], created_in: &[u8]) -> DbResult<VocabArguments> {
+    let (schema, table, shape) = match arguments {
+        [table, shape] => (None, table, shape),
+        [schema, table, shape] if created_in == b"temp" => (Some(unquote(schema)), table, shape),
+        _ => return Err(failure("wrong number of vtable arguments")),
     };
     let unquoted = unquote(shape);
     let Some(shape) = Shape::named(&unquoted) else {
@@ -92,7 +104,11 @@ fn parse_arguments(arguments: &[Vec<u8>]) -> DbResult<(Vec<u8>, Shape)> {
             String::from_utf8_lossy(&unquoted)
         )));
     };
-    Ok((unquote(table), shape))
+    Ok(VocabArguments {
+        schema,
+        table: unquote(table),
+        shape,
+    })
 }
 
 /// Returns an argument with any surrounding quotes removed.
@@ -128,17 +144,22 @@ impl Module for Fts5VocabModule {
     /// `%_data` holds each term's doclist. The content and the sizes are the
     /// index's own business and are not asked for.
     fn shadow_tables(&self, arguments: &ModuleArguments) -> DbResult<Vec<ShadowTable>> {
-        let (target, _) = parse_arguments(&arguments.arguments)?;
+        let named = parse_arguments(&arguments.arguments, &arguments.schema)?;
+        // The owner carries its schema when the declaration named one.
+        let owner = match &named.schema {
+            Some(schema) => inillucent_sql::vtab::qualified_owner(schema, &named.table),
+            None => named.table,
+        };
         Ok(vec![
             ShadowTable {
                 suffix: b"idx".to_vec(),
                 create_sql: String::new(),
-                owner: Some(target.clone()),
+                owner: Some(owner.clone()),
             },
             ShadowTable {
                 suffix: b"data".to_vec(),
                 create_sql: String::new(),
-                owner: Some(target),
+                owner: Some(owner),
             },
         ])
     }
@@ -149,8 +170,10 @@ impl Module for Fts5VocabModule {
         arguments: &ModuleArguments,
         _creating: bool,
     ) -> DbResult<Box<dyn VirtualTable>> {
-        let (_, shape) = parse_arguments(&arguments.arguments)?;
-        let (target, _) = parse_arguments(&arguments.arguments)?;
+        let named = parse_arguments(&arguments.arguments, &arguments.schema)?;
+        let (shape, target) = (named.shape, named.table);
+        // The schema the table is looked up in, which is the vocabulary's own when none is named.
+        let schema = named.schema.unwrap_or_else(|| arguments.schema.clone());
         // **A target that does not exist is not a reason to refuse the table.**
         // SQLite creates `fts5vocab(nosuch, row)` and reports the missing table
         // when the vocabulary is read, so the roots are optional here and
@@ -159,6 +182,7 @@ impl Module for Fts5VocabModule {
         Ok(Box::new(VocabTable {
             shape,
             target,
+            schema,
             shadows,
             declaration: Declaration {
                 columns: shape
@@ -208,6 +232,8 @@ struct VocabTable {
     shape: Shape,
     /// The FTS5 table this is a vocabulary of, for its column names.
     target: Vec<u8>,
+    /// The schema that table is in, for the refusal when it is not there.
+    schema: Vec<u8>,
     shadows: ShadowTables,
     declaration: Declaration,
 }
@@ -236,6 +262,7 @@ impl VirtualTable for VocabTable {
         Ok(Box::new(VocabCursor {
             shape: self.shape,
             target: self.target.clone(),
+            schema: self.schema.clone(),
             columns: Vec::new(),
             shadows: self.shadows.clone(),
             rows: Vec::new(),
@@ -252,6 +279,8 @@ struct VocabCursor {
     shape: Shape,
     /// The FTS5 table this is a vocabulary of.
     target: Vec<u8>,
+    /// The schema that table is in.
+    schema: Vec<u8>,
     /// Its column names, resolved when the scan runs.
     columns: Vec<Vec<u8>>,
     shadows: ShadowTables,
@@ -268,9 +297,17 @@ impl VirtualCursor for VocabCursor {
     fn filter(&mut self, context: &mut Context<'_>, _plan: &FilterPlan) -> DbResult<()> {
         self.rows.clear();
         self.at = 0;
-        if self.shadows.root_id(b"idx").is_err() {
+        // **A table that was dropped is as missing as one that never was.** The roots this table
+        // was connected with outlive the table, so they are checked against the schema as well.
+        let dropped = context.catalog.is_some_and(|catalog| {
+            catalog
+                .table_named(&self.target.to_ascii_lowercase())
+                .is_none()
+        });
+        if self.shadows.root_id(b"idx").is_err() || dropped {
             return Err(inillucent_base::error::statement_refusal(format!(
-                "no such fts5 table: main.{}",
+                "no such fts5 table: {}.{}",
+                String::from_utf8_lossy(&self.schema),
                 String::from_utf8_lossy(&self.target)
             )));
         }
@@ -285,7 +322,14 @@ impl VirtualCursor for VocabCursor {
         // doclist does not resolve (task-2053), because a table whose whole job is to report
         // what the index holds would otherwise under-report it and say nothing.
         let structure = super::segment::read_structure(context, &self.shadows)?;
-        let terms = super::segment::scan_terms(context, &self.shadows, None, &structure, None)?;
+        // The postings the open transaction staged are in the table's buffer and not in the tree,
+        // so they are laid over what is stored, as a query on the table does.
+        let staged: Option<super::Buffer> = self
+            .shadows
+            .staged_state(context, b"idx")
+            .and_then(|state| state.downcast::<std::sync::Mutex<super::Pending>>().ok());
+        let terms =
+            super::segment::scan_terms(context, &self.shadows, staged.as_ref(), &structure, None)?;
         for (term, entries) in terms {
             let doclist = super::doclist::encode_doclist(&entries);
             self.expand(&term, &doclist);

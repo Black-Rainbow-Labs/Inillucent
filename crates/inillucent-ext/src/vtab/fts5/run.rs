@@ -27,6 +27,10 @@ impl Fts5Cursor {
         plan: &FilterPlan,
     ) -> DbResult<()> {
         let mut constraints = read_constraints(plan);
+        // Only patterns that were too short to narrow by were given, so every row is a candidate.
+        if constraints.queries.is_empty() && constraints.open_pattern {
+            return self.scan_every_row(context);
+        }
         // SQLite is given the constraints of a statement last to first, so it reads the last
         // `MATCH` first. That decides which error is reported when two texts are wrong, which
         // text is a special query, and the order the phrases of the joined query are numbered in.

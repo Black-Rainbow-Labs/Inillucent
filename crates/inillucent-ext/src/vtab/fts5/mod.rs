@@ -87,9 +87,10 @@
 // 2,933 lines in one file, with `Fts5Table`'s two `impl` blocks nine hundred
 // lines apart and the pending buffer's twenty free functions between them.
 // Every item is re-exported, so nothing outside this directory changed.
-use self::content::{content_offsets, content_offsets_named};
+use self::content::{content_offsets, content_offsets_named, owner_query_of};
 use self::index::*;
 use self::query::*;
+mod commands;
 mod constraints;
 mod content;
 mod fold;
@@ -97,6 +98,7 @@ mod fts3_snippet;
 mod grammar;
 mod index;
 mod merge;
+mod pattern;
 mod query;
 mod run;
 mod segment;
@@ -127,7 +129,7 @@ use super::{
 use crate::shadow::ShadowTables;
 
 use self::doclist::{decode_doclist, doclist_rows, DocEntry};
-use self::options::{parse_options, unsupported_option, ColumnSpec, Options};
+use self::options::{parse_options, unsupported_option, Options};
 use self::tokenize::Tokenizer;
 
 /// The `%_data` row that holds the totals.
@@ -292,25 +294,6 @@ impl Module for Fts5Module {
     }
 }
 
-/// Returns the owner of an external content table and the query that reads its rows.
-///
-/// SQLite reads external content with a query over the named table or view**, so a
-/// view works as an owner. The first column is the rowid, taken from `content_rowid=`
-/// and `rowid` when none was written, and the rest are the columns this table declares,
-/// in declared order. [`content_offsets_named`] reads a view's rows by those positions.
-///
-/// @param arguments - the arguments the table was created with
-fn owner_query_of(arguments: &ModuleArguments) -> Option<(Vec<u8>, String)> {
-    let options = parse_options(&arguments.arguments).ok()?;
-    let owner = options.content?;
-    let quoted =
-        |name: &[u8]| format!("\"{}\"", String::from_utf8_lossy(name).replace('"', "\"\""));
-    let mut selected = vec![quoted(&options.content_rowid)];
-    selected.extend(options.columns.iter().map(|column| quoted(&column.name)));
-    let query = format!("SELECT {} FROM {}", selected.join(", "), quoted(&owner));
-    Some((owner, query))
-}
-
 /// Connects one full-text table, in whichever dialect it was made with.
 ///
 /// @param arguments - the `CREATE VIRTUAL TABLE` arguments
@@ -374,6 +357,7 @@ fn connect_with(
             dialect,
             tokenizer: Tokenizer::named(&options.tokenizer)?,
             name: arguments.table.clone(),
+            schema: arguments.schema.clone(),
             content: suffix.to_vec(),
             external: options.content.clone(),
             contentless: options.contentless,
@@ -440,6 +424,8 @@ struct Fts5Table {
     pending: Buffer,
     /// The table's own name, which its refusals name.
     name: Vec<u8>,
+    /// The schema the table is in.
+    schema: Vec<u8>,
     /// The shadow suffix the rows are reached under.
     ///
     /// `content` for a table that owns its rows and the empty name for one
@@ -511,6 +497,27 @@ impl Fts5Table {
         Ok(self.shadows.read_row(context, b"docsize", rowid)?.is_some())
     }
 
+    /// Returns the role a `LIKE` or `GLOB` constraint has in the plan, when the index can narrow it.
+    ///
+    /// Only a trigram index that keeps diacritics can, and `LIKE` needs one that folds case. An
+    /// `UNINDEXED` column is included, as it is in SQLite: it has no trigrams, so the narrowed
+    /// query finds no row of it, and `b LIKE '%x%'` returns nothing there although the row holds
+    /// `x`.
+    ///
+    /// @param constraint - the constraint the planner offered
+    fn pattern_role(&self, constraint: &inillucent_sql::vtab::ConstraintSpec) -> Option<String> {
+        use self::tokenize::PatternSupport;
+        let support = self.tokenizer.pattern_support()?;
+        let column = usize::try_from(constraint.column)
+            .ok()
+            .filter(|column| *column < self.options.columns.len())?;
+        match (constraint.op, support) {
+            (ConstraintOp::Glob, _) => Some(format!("G{column}")),
+            (ConstraintOp::Like, PatternSupport::LikeAndGlob) => Some(format!("L{column}")),
+            _ => None,
+        }
+    }
+
     /// Returns which declared column is the table's own hidden one.
     fn match_column(&self) -> i32 {
         self.options.columns.len() as i32
@@ -573,6 +580,15 @@ impl VirtualTable for Fts5Table {
                 query.use_constraint(index, true);
                 plan |= PLAN_MATCH;
                 roles.push("t".to_string());
+                continue;
+            }
+            // **`LIKE` and `GLOB` on a trigram index are narrowed by the pattern's trigrams.**
+            // The constraint is used but not omitted, so the engine still tests the pattern
+            // against every row the index returns.
+            if let Some(role) = self.pattern_role(&constraint) {
+                query.use_constraint(index, false);
+                plan |= PLAN_MATCH;
+                roles.push(role);
                 continue;
             }
             // A match on one indexed column.
@@ -656,6 +672,11 @@ impl VirtualTable for Fts5Table {
         Ok(())
     }
 
+    /// Hands `fts5vocab` the postings this transaction has staged, which are not in the tree yet.
+    fn staged_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        Some(Arc::clone(&self.pending) as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
     /// Opens a cursor.
     fn open(&self) -> DbResult<Box<dyn VirtualCursor>> {
         Ok(Box::new(Fts5Cursor {
@@ -685,6 +706,13 @@ impl VirtualTable for Fts5Table {
                 .iter()
                 .map(|column| column.name.clone())
                 .collect(),
+            unindexed: self
+                .options
+                .columns
+                .iter()
+                .map(|column| column.unindexed)
+                .collect(),
+            schema: self.schema.clone(),
             match_column: self.match_column(),
             rank_column: self.rank_column(),
             unindexed: self
@@ -773,7 +801,7 @@ impl VirtualTable for Fts5Table {
                     .filter(|value| !matches!(value, Value::Null))
                     .and_then(text_of)
                 {
-                    if command.as_slice() == b"delete" {
+                    if command.eq_ignore_ascii_case(b"delete") {
                         let Some(key) = rowid.as_integer() else {
                             return Ok(None);
                         };
@@ -789,7 +817,10 @@ impl VirtualTable for Fts5Table {
                         // A rowid the caller named may collide, so it is asked
                         // about; and it moves the mark, so the next allocated
                         // one is above it.
-                        if self.holds_row(context, key)? {
+                        // **Only a table that owns its rows has a row to collide with.** A
+                        // contentless or external content table has no row of its own at the
+                        // rowid, so SQLite adds the postings again and reports no error.
+                        if !self.stores_no_rows() && self.holds_row(context, key)? {
                             return Err(self.rowid_taken());
                         }
                         note_content_rowid(&self.pending, key);
@@ -819,7 +850,12 @@ impl VirtualTable for Fts5Table {
                 let Some(old) = old_rowid.as_integer() else {
                     return Ok(None);
                 };
-                let new = new_rowid.as_integer().unwrap_or(old);
+                // A rowid that is not an integer is refused, as SQLite's FTS5 refuses it.
+                let new = match new_rowid {
+                    Value::Integer(rowid) => *rowid,
+                    Value::Null => old,
+                    _ => return Err(super::mismatch()),
+                };
                 let new = self.named_docid(values).unwrap_or(new);
                 // **Checked before the old row goes.** `UPDATE t SET rowid = 5`
                 // onto a rowid the table already holds is a constraint

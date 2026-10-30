@@ -34,10 +34,30 @@ impl Host for Nowhere {}
 pub struct ReadStore<'a> {
     /// The pool the trees' pages live in.
     pub pool: &'a Pool,
+    /// Finds what the table that owns a shadow tree is holding in memory for the transaction.
+    pub staged: Option<&'a StagedLookup<'a>>,
+    /// What answers which pool a tree is in, for a tree that is in another schema than the table
+    /// reading it. An `fts5vocab` table in `temp` over an index in `main` reads pages of both.
+    pub pools: Option<&'a dyn inillucent_exec::physical::TreeCatalog>,
     /// The trees, by the identifier the catalog registered them under.
     pub trees: &'a HashMap<u32, PagedTree>,
     /// The rows of the view an external content table reads, when its owner is a view.
     pub view: Option<&'a ViewContent>,
+}
+
+/// Finds the in memory state of the connected table that owns a shadow tree.
+pub type StagedLookup<'a> =
+    dyn Fn(u32) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> + 'a;
+
+impl ReadStore<'_> {
+    /// Returns the pool the pages of one tree are in.
+    ///
+    /// @param root - the tree's handle
+    fn pool_of(&self, root: u32) -> &Pool {
+        self.pools
+            .and_then(|pools| pools.pool_for(root))
+            .unwrap_or(self.pool)
+    }
 }
 /// The shadow tables of one database, for reading and writing.
 pub struct WriteStore<'a> {
@@ -424,6 +444,13 @@ fn read_only() -> inillucent_base::DbError {
     refusal("a module wrote to a shadow table while answering a query")
 }
 impl ShadowStore for ReadStore<'_> {
+    fn staged_state(
+        &mut self,
+        root: u32,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.staged.and_then(|lookup| lookup(root))
+    }
+
     fn read_row(&mut self, root: u32, rowid: i64) -> DbResult<Option<Vec<Value<'static>>>> {
         if let (VIEW_ROOT, Some(view)) = (root, self.view) {
             return Ok(view.rows.get(&rowid).cloned());
@@ -431,7 +458,7 @@ impl ShadowStore for ReadStore<'_> {
         let Some(tree) = self.trees.get(&root) else {
             return Ok(None);
         };
-        read_rowid(self.pool, tree, rowid)
+        read_rowid(self.pool_of(root), tree, rowid)
     }
 
     fn write_row(&mut self, _root: u32, _rowid: i64, _values: &[Value<'static>]) -> DbResult<()> {
@@ -447,7 +474,7 @@ impl ShadowStore for ReadStore<'_> {
             return Ok(view.highest());
         }
         match self.trees.get(&root) {
-            Some(tree) => highest(self.pool, tree),
+            Some(tree) => highest(self.pool_of(root), tree),
             None => Ok(0),
         }
     }
@@ -463,7 +490,7 @@ impl ShadowStore for ReadStore<'_> {
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };
-        walk(self.pool, tree, &mut |values| {
+        walk(self.pool_of(root), tree, &mut |values| {
             let rowid = match values.first() {
                 Some(Value::Integer(number)) => *number,
                 _ => 0,
@@ -484,7 +511,7 @@ impl ShadowStore for ReadStore<'_> {
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };
-        walk_from(self.pool, tree, from, &mut |values| {
+        walk_from(self.pool_of(root), tree, from, &mut |values| {
             let rowid = match values.first() {
                 Some(Value::Integer(number)) => *number,
                 _ => 0,
@@ -502,7 +529,7 @@ impl ShadowStore for ReadStore<'_> {
         let Some(tree) = self.trees.get(&root) else {
             return Ok(None);
         };
-        read_key(self.pool, tree, key, columns)
+        read_key(self.pool_of(root), tree, key, columns)
     }
 
     fn write_keyed(
@@ -527,7 +554,7 @@ impl ShadowStore for ReadStore<'_> {
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };
-        walk(self.pool, tree, body)
+        walk(self.pool_of(root), tree, body)
     }
 
     fn scan_keyed_from(
@@ -540,7 +567,7 @@ impl ShadowStore for ReadStore<'_> {
         let Some(tree) = self.trees.get(&root) else {
             return Ok(());
         };
-        walk_keyed_from(self.pool, tree, from, body)
+        walk_keyed_from(self.pool_of(root), tree, from, body)
     }
 }
 impl ShadowStore for WriteStore<'_> {

@@ -317,16 +317,13 @@ fn the_settings_are_written_to_the_config_table() {
 /// `SELECT ... WHERE t MATCH 'ell'` ran, and it answered a different question
 /// from the one it was asked with no error anywhere.
 ///
-/// **This case is deliberately not a `compare` step.** SQLite answers these
-/// statements and this engine refuses them, which `compare` would report as a
-/// failure - correctly, because it is a difference. It is a *recorded*
-/// difference: exit code 3, `unsupported`, and the `FTS5 tokenizer options`
-/// row of `docs/feature-comparison.md` says which names are implemented.
-/// Building `trigram` is a separate piece of work; what this asserts is that
-/// asking for it says so.
+/// `trigram` is built now and answers what SQLite answers, so this case checks that it does.
+/// The names SQLite itself does not have, `icu` and `porter2`, are still refused in SQLite's
+/// words. The statements for `trigram` are graded against SQLite in
+/// `compat/corpus/usage/bug-hunt-11-ftstables.sql`.
 ///
 /// Both sides are exercised: the reference's own answer is taken first, so
-/// what is recorded as the difference is measured rather than assumed.
+/// what is asserted is measured rather than assumed.
 #[test]
 fn a_tokenizer_this_build_has_not_got_is_refused_rather_than_substituted() {
     let Some(program) = inillucent_compat::differential::sqlite_oracle() else {
@@ -367,27 +364,34 @@ fn a_tokenizer_this_build_has_not_got_is_refused_rather_than_substituted() {
          difference substituting unicode61 hid"
     );
 
-    // What this engine does: refuse, by name, at `CREATE VIRTUAL TABLE`.
+    // What this engine does: answer the substring search, and refuse a name SQLite does not have.
     let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fts5-trigram.rdb");
     inillucent_base::testing::remove_database(&path);
     let database = Database::open(&path).expect("the database opens");
     let connection = database.session().expect("the connection opens");
-    // `trigram` is one SQLite has and this build has not, so it is `unsupported`; `icu` and
-    // `porter2` are names the pinned SQLite does not know either, and it says `no such tokenizer`.
-    for name in ["trigram", "icu", "porter2"] {
+    connection
+        .execute("CREATE VIRTUAL TABLE t_trigram USING fts5(body, tokenize='trigram')")
+        .expect("trigram is a tokenizer this build has");
+    connection
+        .execute("INSERT INTO t_trigram VALUES ('hello world')")
+        .expect("a row is indexed");
+    let found = connection
+        .query("SELECT rowid FROM t_trigram WHERE t_trigram MATCH 'ell'")
+        .expect("a substring is searched");
+    assert_eq!(
+        found.len(),
+        substring.rows.len(),
+        "trigram makes MATCH a substring search, as it does in SQLite"
+    );
+    // `icu` and `porter2` are names the pinned SQLite does not know either, and it says
+    // `no such tokenizer`.
+    for name in ["icu", "porter2"] {
         let refused = connection
             .execute(&format!(
                 "CREATE VIRTUAL TABLE t_{name} USING fts5(body, tokenize='{name}')"
             ))
             .expect_err("a tokenizer this build has not got must be refused");
-        match name {
-            "trigram" => assert_eq!(
-                refused.unsupported(),
-                Some(format!("the fts5 tokenizer {name}").as_str()),
-                "the refusal must name the tokenizer: {refused:?}"
-            ),
-            _ => assert_eq!(refused.message(), format!("no such tokenizer: {name}")),
-        }
+        assert_eq!(refused.message(), format!("no such tokenizer: {name}"));
         assert!(
             connection
                 .query(&format!("SELECT rowid FROM t_{name}"))

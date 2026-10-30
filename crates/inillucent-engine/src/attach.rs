@@ -374,9 +374,23 @@ impl ImportedDatabase {
             Some(_) => self.session_state.temps.push(held),
             None => self.session_state.attached.push(held),
         }
+        self.publish_attached_schema()?;
+        self.withdraw_indexes_written_without_their_collation()
+    }
+
+    /// Makes an attached file's tables visible to statements, connecting its virtual tables.
+    ///
+    /// **The virtual tables the file declares are connected as an open connects them.** Only
+    /// `main` was walked, so an FTS5, R*Tree or fts5vocab table in an attached file answered
+    /// `no module is connected`. The catalog is built again once the modules are connected,
+    /// because a virtual table's columns are the module's answer and nobody could be asked before.
+    fn publish_attached_schema(&mut self) -> DbResult<()> {
         self.rebuild_tables()?;
         self.refresh_catalog();
-        self.withdraw_indexes_written_without_their_collation()
+        self.connect_missing()?;
+        self.rebuild_tables()?;
+        self.refresh_catalog();
+        Ok(())
     }
 
     /// Removes a database this connection attached.
@@ -466,6 +480,16 @@ impl ImportedDatabase {
             self.session_state.owner.insert(root, owner);
         }
         self.writing.schema_detached(at);
+        // The virtual tables the file declared go with it, and the schemas after it move down
+        // one as the owner map above did.
+        self.session_state
+            .virtual_tables
+            .retain(|_, connected| connected.arguments.database != at);
+        for connected in self.session_state.virtual_tables.values_mut() {
+            if connected.arguments.database > at {
+                connected.arguments.database = connected.arguments.database.saturating_sub(1);
+            }
+        }
         // **Each later file's own `sqlite_schema` moves with it.** Its declaration was
         // built under the file's old number, and the binder matches `a2.sqlite_schema`
         // by number, so without this `a2.sqlite_schema` is "no such table" once an

@@ -87,8 +87,12 @@ impl Fts5Table {
         argument: Option<Value<'static>>,
     ) -> DbResult<()> {
         let name = String::from_utf8_lossy(command).into_owned();
+        // **Commands are matched without regard to case, and stored as they were written.**
+        // SQLite compares them with `sqlite3_stricmp`, so `Optimize` and `DELETE-ALL` are the
+        // commands `optimize` and `delete-all`, and `%_config` keeps the spelling it was given.
+        let lower = name.to_ascii_lowercase();
         let argument = argument.filter(|value| !matches!(value, Value::Null));
-        match name.as_str() {
+        match lower.as_str() {
             "integrity-check" => {
                 if let Some(problem) = self.integrity(context)? {
                     return Err(failure(problem));
@@ -118,8 +122,8 @@ impl Fts5Table {
             // `merge=2,4` and `automerge=8` only tune how segments are merged,
             // and this index has none, so `merge` is accepted and `automerge` is
             // kept as a setting the way FTS5's is.
-            _ if self.dialect == Dialect::Three && is_command_with_value(&name, "merge") => Ok(()),
-            _ if self.dialect == Dialect::Three && is_command_with_value(&name, "automerge") => {
+            _ if self.dialect == Dialect::Three && is_command_with_value(&lower, "merge") => Ok(()),
+            _ if self.dialect == Dialect::Three && is_command_with_value(&lower, "automerge") => {
                 let value = name
                     .split_once('=')
                     .map(|(_, value)| value.trim())
@@ -145,20 +149,24 @@ impl Fts5Table {
             // value that was written and cannot be read back would be a
             // difference a reader can see.
             "automerge" | "crisismerge" | "deletemerge" | "pgsz" | "rank" | "secure-delete"
-            | "usermerge" | "hashsize" => {
+            | "usermerge" | "hashsize" | "insttoken" => {
                 let Some(value) = argument else {
                     return Err(unrecognized());
                 };
+                // A value SQLite would not store is refused here as it is there.
+                if !super::commands::accepted(&lower, &value) {
+                    return Err(unrecognized());
+                }
                 // `hashsize` is how many bytes of changes SQLite holds in memory
                 // before it writes them out. This index has its own buffer, so
                 // the number changes nothing here, but SQLite refuses a value
                 // that is not a positive integer and so does this.
                 // A number given as text is stored as the number, which is
                 // what SQLite's check leaves in `%_config`.
-                let value = match (name.as_str(), positive_integer(&value)) {
+                let value = match (lower.as_str(), positive_integer(&value)) {
                     ("hashsize", None) => return Err(unrecognized()),
                     ("hashsize", Some(number)) => Value::Integer(number),
-                    _ => value,
+                    _ => super::commands::stored(&lower, value),
                 };
                 self.shadows.write_keyed(
                     context,

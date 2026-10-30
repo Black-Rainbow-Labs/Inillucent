@@ -773,16 +773,59 @@ pub(crate) fn next_content_rowid(
 ) -> DbResult<i64> {
     if let Ok(mut held) = buffer.lock() {
         if let Some(highest) = held.content_highest {
+            if highest == i64::MAX {
+                drop(held);
+                return free_content_rowid(context, shadows);
+            }
             let next = highest.saturating_add(1);
             held.content_highest = Some(next);
             return Ok(next);
         }
     }
-    let next = shadows.max_rowid(context, suffix)?.saturating_add(1);
+    let highest = shadows.max_rowid(context, suffix)?;
+    if highest == i64::MAX {
+        if let Ok(mut held) = buffer.lock() {
+            held.content_highest = Some(i64::MAX);
+        }
+        return free_content_rowid(context, shadows);
+    }
+    let next = highest.saturating_add(1);
     if let Ok(mut held) = buffer.lock() {
         held.content_highest = Some(next);
     }
     Ok(next)
+}
+
+/// How many candidates are tried before an insert gives up, which is SQLite's own limit.
+const FREE_ROWID_ATTEMPTS: usize = 100;
+
+/// Which stream of candidates the next allocation draws from.
+static NEXT_PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Returns a rowid the index does not hold, for a table whose largest rowid is `i64::MAX`.
+///
+/// **`saturating_add(1)` answered `i64::MAX` again, so the automatic rowid replaced the row that
+/// held it.** SQLite starts drawing random positive rowids from 1 to 2^62 and fails with
+/// `database or disk is full` after 100 draws that are all taken, as it does for an ordinary table.
+///
+/// @param context - the host
+/// @param shadows - the table's shadow tables
+fn free_content_rowid(context: &mut Context<'_>, shadows: &ShadowTables) -> DbResult<i64> {
+    let seed = NEXT_PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut stream = inillucent_base::rng::Rng::new(seed);
+    for _ in 0..FREE_ROWID_ATTEMPTS {
+        let candidate = ((stream.next_u64() & (i64::MAX as u64 >> 1)) as i64).saturating_add(1);
+        if shadows.read_row(context, b"docsize", candidate)?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(
+        inillucent_base::DbError::primary(inillucent_base::PrimaryCode::Full)
+            .with_message("database or disk is full")
+            .with_detail(format!(
+                "no unused rowid was found in {FREE_ROWID_ATTEMPTS} attempts"
+            )),
+    )
 }
 /// Records that a rowid the caller named is now in the table.
 ///
