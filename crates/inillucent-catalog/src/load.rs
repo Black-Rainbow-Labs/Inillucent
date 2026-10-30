@@ -457,6 +457,61 @@ pub fn stored_create_table_text(sql: &[u8]) -> Option<Vec<u8>> {
         .map(|_| fixed)
 }
 
+/// Builds a table entry from a parsed `CREATE VIRTUAL TABLE`, or `None` when
+/// the statement is something else.
+///
+/// @param sql - the text that was parsed, which the entry keeps
+/// @param parsed - the parse of `sql`
+/// @param database - the database the table is in
+/// @param root - the table's root page or tree identifier
+fn virtual_table_from_parsed(
+    sql: &[u8],
+    parsed: &inillucent_sql::parser::ParsedStatement,
+    database: usize,
+    root: u32,
+) -> Option<TableInfo> {
+    let Statement::CreateVirtualTable {
+        name,
+        module,
+        arguments,
+        ..
+    } = &parsed.statement
+    else {
+        return None;
+    };
+    let text = parsed.ast.text(*name).to_vec();
+    let module_name = parsed.ast.text(*module).to_vec();
+    Some(TableInfo {
+        folded: text.to_ascii_lowercase(),
+        name: text,
+        database,
+        root,
+        columns: Vec::new(),
+        rowid_alias: None,
+        without_rowid: false,
+        strict: false,
+        autoincrement: false,
+        kind: TableKind::Virtual,
+        create_sql: sql.to_vec(),
+        view: None,
+        triggers: Vec::new(),
+        analysed_rows: None,
+        indexes: Vec::new(),
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        foreign_key_triggers: Vec::new(),
+        // The columns stay empty here on purpose: only the module can
+        // say what they are, and the catalog is below the module
+        // registry. The connection fills them in when it loads the
+        // schema, which is the same moment SQLite calls `xConnect`.
+        module: Some(inillucent_sql::vtab::ModuleRef {
+            folded: module_name.to_ascii_lowercase(),
+            name: module_name,
+            arguments: arguments.clone(),
+        }),
+    })
+}
+
 /// Builds a table entry from a parsed `CREATE TABLE` or `CREATE VIRTUAL TABLE`.
 ///
 /// @param sql - the text that was parsed, which the entry keeps
@@ -470,48 +525,8 @@ fn table_from_parsed_sql(
     root: u32,
 ) -> DbResult<TableInfo> {
     let Statement::CreateTable { name, body, .. } = &parsed.statement else {
-        if let Statement::CreateVirtualTable {
-            name,
-            module,
-            arguments,
-            ..
-        } = &parsed.statement
-        {
-            let text = parsed.ast.text(*name).to_vec();
-            let module_name = parsed.ast.text(*module).to_vec();
-            return Ok(TableInfo {
-                folded: text.to_ascii_lowercase(),
-                name: text,
-                database,
-                root,
-                columns: Vec::new(),
-                rowid_alias: None,
-                without_rowid: false,
-                strict: false,
-                autoincrement: false,
-                kind: TableKind::Virtual,
-                create_sql: sql.to_vec(),
-                view: None,
-                triggers: Vec::new(),
-                analysed_rows: None,
-                indexes: Vec::new(),
-                checks: Vec::new(),
-                foreign_keys: Vec::new(),
-                foreign_key_triggers: Vec::new(),
-                // The columns stay empty here on purpose: only the module can
-                // say what they are, and the catalog is below the module
-                // registry. The connection fills them in when it loads the
-                // schema, which is the same moment SQLite calls `xConnect`.
-                module: Some(inillucent_sql::vtab::ModuleRef {
-                    folded: module_name.to_ascii_lowercase(),
-                    name: module_name,
-                    arguments: arguments.clone(),
-                }),
-            });
-        }
-        return Err(corrupt_schema(
-            "the schema SQL for this table is not a CREATE TABLE",
-        ));
+        return virtual_table_from_parsed(sql, &parsed, database, root)
+            .ok_or_else(|| corrupt_schema("the schema SQL for this table is not a CREATE TABLE"));
     };
     let text = parsed.ast.text(*name).to_vec();
     let CreateTableBody::Columns {
