@@ -544,7 +544,9 @@ const PACKAGE_TEST_ROOTS: [&str; 2] = ["packages", "drivers/bindings"];
 /// Whether a file under those roots is a test.
 ///
 /// By name, the way each language names one: `*_test.go`, `*.test.mjs`,
-/// `test_*.py` or `run_*.py`, and any `.php` under a `tests/` directory. A
+/// `test_*.py` or `run_*.py`, any `.php` under a `tests/` directory, a Kotlin
+/// `*Test.kt` under an Android `androidTest/` source set, and a Swift
+/// `*Tests.swift` under a Swift package's `Tests/` directory. A
 /// rule per language rather than one rule, because there is no rule they share
 /// and a rule that tried would either miss a file or claim a source file was a
 /// test.
@@ -559,6 +561,8 @@ fn is_a_package_test(relative: &str) -> bool {
         || name.starts_with("test_") && name.ends_with(".py")
         || name.starts_with("run_") && name.ends_with(".py")
         || name.ends_with(".php") && relative.contains("/tests/")
+        || name.ends_with("Test.kt") && relative.contains("/androidTest/")
+        || name.ends_with("Tests.swift") && relative.contains("/Tests/")
 }
 
 /// Every `.rs`-less test file under the package roots.

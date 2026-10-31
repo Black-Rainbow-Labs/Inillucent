@@ -204,3 +204,16 @@ __pycache__/
 # plan. The nightly commits the history, the dashboard and the scorecard
 # beside them so a regression is a diff, and these are rebuilt every night.
 /compat/perf/nightly/*/
+
+# The Android package's Gradle and CMake output, and the SDK path Android Studio writes.
+/packages/android/.gradle/
+/packages/android/build/
+/packages/android/inillucent/build/
+/packages/android/inillucent/.cxx/
+/packages/android/local.properties
+# The Swift package's build products: the XCFramework build-xcframework.sh makes, SwiftPM's own
+# folders, and the copy of the conformance suite run-tests.sh puts in the test target.
+/packages/swift/InillucentFFI.xcframework/
+/packages/swift/.build/
+/packages/swift/.swiftpm/
+/packages/swift/Tests/InillucentTests/Resources/

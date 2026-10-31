@@ -19,6 +19,8 @@ packages/go/README.md
 packages/npm/inillucent/README.md
 packages/php/README.md
 packages/python/README.md
+packages/android/README.md
+packages/swift/README.md
 examples/README.md
 examples/rag-agent/README.md
 examples/rag-agent/cli-example/README.md

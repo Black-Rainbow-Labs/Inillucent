@@ -345,3 +345,11 @@ jobs:
             exit 1
           fi
           echo "the run changed nothing that is tracked"
+
+  # The Android and iOS packages, on an emulator and a simulator. A workflow of
+  # its own so it can also run by itself; called here so the run
+  # `packaging/ci-status.ps1` waits for covers both platforms. Its jobs carry
+  # the same `if:` as the suite above.
+  mobile:
+    name: mobile
+    uses: ./.github/workflows/mobile.yml

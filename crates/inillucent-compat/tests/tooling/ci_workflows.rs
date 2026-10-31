@@ -178,7 +178,7 @@ fn structural_lines(text: &str) -> Vec<(usize, &str)> {
 fn no_plain_value_holds_a_colon() {
     let mut problems = Vec::new();
     let mut read = 0usize;
-    for name in ["tests.yml", "nightly.yml"] {
+    for name in ["tests.yml", "nightly.yml", "mobile.yml"] {
         let text = workflow(name);
         for (number, line) in structural_lines(&text) {
             read += 1;
@@ -294,17 +294,17 @@ fn every_prerequisite_has_an_answer_in_ci() {
     );
 }
 
-/// Both workflows run only on the public mirror, and never on a push.
+/// Every workflow runs only on the public mirror, and never on a push.
 ///
 /// The development repository is private, so its Actions minutes are billed:
 /// each push there cost about seven runner hours, and on 2026-10-02 the
-/// account's spending stopped every job. Both workflows are disabled there, and
+/// account's spending stopped every job. The workflows are disabled there, and
 /// each job's `if:` names the mirror so a workflow turned back on still runs
 /// nothing. A `push:` or `pull_request:` trigger would start runs on every
 /// push to the mirror's release branch, which `ship.ps1` already starts by hand.
 #[test]
 fn the_workflows_run_only_on_the_mirror_and_never_on_a_push() {
-    for name in ["tests.yml", "nightly.yml"] {
+    for name in ["tests.yml", "nightly.yml", "mobile.yml"] {
         let text = workflow(name);
         let structure: Vec<&str> = structural_lines(&text)
             .into_iter()

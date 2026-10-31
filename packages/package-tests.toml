@@ -113,3 +113,31 @@ path = "packages/go/cmd/inillucent-install/main_test.go"
 command = "go test -C packages/go ./cmd/..."
 requires = ["go"]
 about = "the installer's platform table and its archive names, checked without downloading one"
+
+[[test]]
+language = "android"
+path = "packages/android/inillucent/src/androidTest/kotlin/com/blackrainbowlabs/inillucent/ConformanceTest.kt"
+command = "sh packages/android/run-tests.sh"
+requires = ["android-sdk", "emulator"]
+about = "the shared conformance suite through the Kotlin binding and its JNI glue, on an Android emulator the script starts. It records android.json and fails when it ran fewer cases than the suite holds. .github/workflows/mobile.yml runs it on Linux"
+
+[[test]]
+language = "android"
+path = "packages/android/inillucent/src/androidTest/kotlin/com/blackrainbowlabs/inillucent/DatabaseTest.kt"
+command = "sh packages/android/run-tests.sh"
+requires = ["android-sdk", "emulator"]
+about = "the Android binding on the device: an encrypted file, a reopened file, a transaction rolled back by a throw, text with an emoji and a NUL byte, a cancel from another thread, the rows before a failure. The same script runs both files, so the command is the same as the row above"
+
+[[test]]
+language = "ios"
+path = "packages/swift/Tests/InillucentTests/ConformanceTests.swift"
+command = "sh packages/swift/run-tests.sh"
+requires = ["xcode"]
+about = "the shared conformance suite through the Swift binding, under swift test on the Mac and xcodebuild test on an iOS simulator. It records swift-macos.json and ios.json. Only a Mac runs it, so .github/workflows/mobile.yml runs it on macos-latest"
+
+[[test]]
+language = "ios"
+path = "packages/swift/Tests/InillucentTests/DatabaseTests.swift"
+command = "sh packages/swift/run-tests.sh"
+requires = ["xcode"]
+about = "the Swift binding's behavior tests, the same list as DatabaseTest.kt plus composed and decomposed text staying two values. The same script runs both files"

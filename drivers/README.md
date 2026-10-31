@@ -2,7 +2,7 @@
 
 This page is for a programmer who wants to use inillucent from an application, or who is writing a
 binding for a new language. It covers the Rust driver, the C library over it, and how the Python,
-Node, Go and PHP packages reach the engine. You do not need to read the engine's code.
+Node, Go, PHP, Android and Swift packages reach the engine. You do not need to read the engine's code.
 
 If you are writing a binding, this page and
 [`inillucent-driver-capi/include/inillucent_driver.h`](inillucent-driver-capi/include/inillucent_driver.h)
@@ -33,6 +33,8 @@ flowchart TB
     NODE --> CLI["The inillucent program with --output json"]
     GO["Go"] --> CLI
     PHP["PHP"] --> CLI
+    KT["Android: Kotlin through JNI"] --> CAPI
+    SW["iOS and macOS: Swift"] --> CAPI
     PYRUN["Python: run and query"] --> CLI
     CLI --> DRV
     DRV --> ENG["The engine: inillucent-engine"]
@@ -45,6 +47,8 @@ flowchart TB
 | Python | Both ways. The `Database` class calls the C library. The functions `run` and `query` at the top of the module start the `inillucent` program. |
 | Node | Both ways. The C library is also a Node addon, and the npm package loads it in process for `open()` and for `query`, `exec` and `batch` when no key or root is given. Without the addon, `open()` starts one `inillucent-mcp` process and sends every call to it, and the other calls start `inillucent --output json`. |
 | Go, PHP | They start `inillucent --output json` and parse the JSON it prints. |
+| Kotlin and Java on Android | `packages/android` links the C library and a small JNI layer in C into one `libinillucent_jni.so` for each Android ABI, and the Kotlin classes call it. `packages/android/README.md` has the API. |
+| Swift on iOS and macOS | `packages/swift` links the C library as a static library inside an XCFramework, and Swift imports its header as the module `InillucentFFI`. `packages/swift/README.md` has the API. |
 
 The two routes return values in different forms.
 
@@ -101,6 +105,8 @@ The 57 rows are 43 `yes`, 2 `partial` and 12 `no`. The two `partial` rows are:
 | `abi.toml` | Every C symbol, with its stability and the version it first appeared in. |
 | `conformance/suite.json` | The driver's expected behavior, written as test cases in JSON. |
 | `bindings/python/` | The reference binding. It uses only the Python standard library. |
+| `../packages/android/` | The Android library, in Kotlin and C, with instrumented tests that run this suite on an emulator. |
+| `../packages/swift/` | The Swift package for iOS and macOS, with tests that run this suite on the iOS simulator and on the Mac. |
 
 ## Rust
 

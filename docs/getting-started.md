@@ -333,7 +333,8 @@ The last argument of `query` is the most rows to return.
 The Python `Database` class and the Node package call the same engine through its C library. The
 Go package, the PHP package and the Python functions `run` and `query` start the `inillucent`
 program and read the JSON it prints. The Node package also starts the program for a call that passes
-a `key` or a `root`, and for every command except `query`, `exec` and `batch`. The
+a `key` or a `root`, and for every command except `query`, `exec` and `batch`. On Android and iOS, the Android library in `packages/android` and the Swift package in
+`packages/swift` link the C library into the app. The
 [drivers page](../drivers/README.md) lists the route each language takes. The
 [`inillucent-embed` skill](../agent-skills/inillucent-embed/SKILL.md) shows each language.
 

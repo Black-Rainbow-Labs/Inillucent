@@ -229,6 +229,9 @@ with Database("app.rdb") as database:
 The Go and PHP packages have the same kind of `query` call. The Node, Go and PHP packages, and the
 Python `query` and `run` functions, run the `inillucent` program and read its JSON output. The
 Python `Database` class calls the C library directly, which ships in each archive with its header.
+On a phone, the Android library in `packages/android` and the Swift package in `packages/swift`
+run the engine inside the app through the same C library. Both are built from this repository and
+are not on Maven Central or a Swift package index yet.
 [The driver page](drivers/README.md) documents the C library for anyone writing a new binding. Client libraries for TypeScript, Rust, Java and C#
 are being built in [inillucent-clients](https://github.com/Black-Rainbow-Labs/inillucent-clients)
 and are not on a package registry yet.

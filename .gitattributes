@@ -52,3 +52,7 @@ fuzz/corpus/** -text
 # exactly, so a checkout that turned LF into CRLF would change what the case
 # tests. LF everywhere.
 compat/corpus/usage/** text eol=lf
+# The Gradle wrapper is a shell script with no .sh extension, and Linux runners execute it.
+/packages/android/gradlew text eol=lf
+/packages/android/gradlew.bat text eol=crlf
+*.jar binary

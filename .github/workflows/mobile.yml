@@ -1,0 +1,126 @@
+# The Android and iOS packages, tested on an Android emulator and an iOS simulator.
+#
+# ## Why a workflow of its own
+#
+# Only a Mac runs the iOS simulator, and the development machine is Windows, so
+# this is the only place the Swift package's tests run at all. The Android tests
+# also run on the development machine through `sh packages/android/run-tests.sh`,
+# and here they run on Linux with KVM, which is where a fresh checkout proves the
+# Gradle build needs nothing that machine happens to have.
+#
+# `tests.yml` calls this workflow, so the run `packaging/ci-status.ps1` waits for
+# after a release includes both platforms. It also runs on its own once a night
+# and by hand, which is how a change to either package is checked without the
+# rest of the suite.
+#
+# ## Once a night, and only on the public repository
+#
+# The same rule as `tests.yml`: no `push:` trigger, and every job names
+# Black-Rainbow-Labs/Inillucent in its `if:`.
+
+name: mobile
+
+on:
+  schedule:
+    # 03:30 UTC, after tests.yml and nightly.yml start.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  android:
+    name: Android emulator
+    if: github.repository == 'Black-Rainbow-Labs/Inillucent'
+    runs-on: ubuntu-latest
+    # A cold release build of the C library is about ten minutes on four cores,
+    # the emulator boots in two to five, and the tests take one.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      # The Android Gradle plugin needs Java 17 or later.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The emulator needs /dev/kvm, which a hosted Linux runner has and which
+      # its default user cannot open until this rule says so.
+      - name: KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The NDK the Gradle build names, and one x86_64 system image for the
+      # emulator. The script makes its own AVD from the newest x86_64 image
+      # installed, which here is this one.
+      - name: the NDK, the emulator and a system image
+        run: |
+          manager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$manager" --licenses >/dev/null
+          "$manager" --install "ndk;27.1.12297006" "cmake;3.22.1" "platforms;android-35" "platform-tools" "emulator" "system-images;android-35;google_apis;x86_64" >/dev/null
+          ls "$ANDROID_HOME/system-images"
+
+      - name: the Android tests on an emulator
+        shell: bash
+        env:
+          INILLUCENT_EMULATOR_FLAGS: -no-metrics -memory 4096
+        run: sh packages/android/run-tests.sh
+
+      - name: the conformance record and the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-results
+          path: |
+            _agent_output/conformance/android.json
+            packages/android/inillucent/build/reports/androidTests/
+          if-no-files-found: warn
+
+  ios:
+    name: iOS simulator
+    if: github.repository == 'Black-Rainbow-Labs/Inillucent'
+    runs-on: macos-latest
+    # Five release builds of the C library, one for each Apple target, then
+    # the tests on the Mac and on a simulator.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          rustup show active-toolchain
+          xcodebuild -version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+
+      - name: the Swift tests on the Mac and on an iOS simulator
+        shell: bash
+        run: sh packages/swift/run-tests.sh
+
+      - name: the conformance records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-results
+          path: |
+            _agent_output/conformance/ios.json
+            _agent_output/conformance/swift-macos.json
+          if-no-files-found: warn
