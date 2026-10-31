@@ -68,24 +68,40 @@ if [ -z "$ANDROID_SERIAL" ]; then
   # prefix cannot be cut off it reliably.
   tag_dir=$(dirname "$image")
   package="system-images;$(basename "$(dirname "$tag_dir")");$(basename "$tag_dir");x86_64"
+  # avdmanager and the emulator have disagreed about where AVDs live on Linux: the first CI run made
+  # the AVD with avdmanager, the emulator never found it, and `adb wait-for-device` waited until the
+  # job was cancelled an hour later. Naming the folder for both removes the disagreement. Windows is
+  # left alone, because the variable would reach emulator.exe as an MSYS path it cannot read.
+  if [ -z "$EXE" ] && [ -z "$ANDROID_AVD_HOME" ]; then
+    ANDROID_AVD_HOME="$HOME/.android/avd"
+    export ANDROID_AVD_HOME
+    mkdir -p "$ANDROID_AVD_HOME"
+  fi
   if ! "$EMULATOR" -list-avds | grep -qx inillucent_test; then
     echo "making the AVD inillucent_test from $package"
     echo no | "$AVDMANAGER" create avd -n inillucent_test -k "$package" -d pixel_6 --force >/dev/null
   fi
   ANDROID_SERIAL=emulator-5584
   export ANDROID_SERIAL
+  LOG="${TMPDIR:-/tmp}/inillucent-emulator.log"
   echo "starting inillucent_test as $ANDROID_SERIAL"
   # swiftshader keeps the emulator off the graphics cards, which other work on a machine may be using.
-  "$EMULATOR" -avd inillucent_test -port 5584 -no-window -no-audio -no-boot-anim -no-snapshot \
-    -gpu swiftshader_indirect $INILLUCENT_EMULATOR_FLAGS >"${TMPDIR:-/tmp}/inillucent-emulator.log" 2>&1 &
+  "$EMULATOR" -avd inillucent_test -port 5584 -no-window -no-audio -no-boot-anim -no-snapshot     -gpu swiftshader_indirect $INILLUCENT_EMULATOR_FLAGS >"$LOG" 2>&1 &
+  emulator_pid=$!
   started=$ANDROID_SERIAL
-  "$ADB" -s "$ANDROID_SERIAL" wait-for-device
+  # Every wait is bounded and checks the emulator is still running, so an emulator that exits or
+  # never appears fails the run with its own log instead of waiting forever.
   waited=0
-  until [ "$("$ADB" -s "$ANDROID_SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; do
+  until [ "$("$ADB" -s "$ANDROID_SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '')" = "1" ]; do
+    if ! kill -0 "$emulator_pid" 2>/dev/null; then
+      echo "the emulator exited before it booted; its log:" >&2
+      tail -40 "$LOG" >&2
+      exit 1
+    fi
     waited=$((waited + 5))
     if [ "$waited" -gt 600 ]; then
-      echo "the emulator did not finish booting in ten minutes" >&2
-      tail -20 "${TMPDIR:-/tmp}/inillucent-emulator.log" >&2
+      echo "the emulator did not finish booting in ten minutes; its log:" >&2
+      tail -40 "$LOG" >&2
       exit 1
     fi
     sleep 5
