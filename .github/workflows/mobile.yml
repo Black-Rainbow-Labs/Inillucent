@@ -41,7 +41,7 @@ jobs:
     # the emulator boots in two to five, and the tests take one.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: toolchain
         run: |
@@ -53,7 +53,7 @@ jobs:
           key: android
 
       # The Android Gradle plugin needs Java 17 or later.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -84,7 +84,7 @@ jobs:
 
       - name: the conformance record and the test report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-results
           path: |
@@ -100,7 +100,7 @@ jobs:
     # the tests on the Mac and on a simulator.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: toolchain
         run: |
@@ -117,7 +117,7 @@ jobs:
 
       - name: the conformance records
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ios-results
           path: |
