@@ -1,6 +1,6 @@
 {
   "name": "inillucent-wasm",
-  "version": "2.9.0",
+  "version": "2.10.0",
   "description": "The inillucent embedded SQL database compiled to WebAssembly, with the WASI host it needs in a browser or Node. Full text and vector search, in memory or kept in the browser's origin private file system.",
   "keywords": [
     "database",
