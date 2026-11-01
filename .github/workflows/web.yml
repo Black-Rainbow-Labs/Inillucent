@@ -35,7 +35,11 @@ jobs:
   web:
     name: WebAssembly under Node and in browsers
     if: github.repository == 'Black-Rainbow-Labs/Inillucent'
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 by name and not ubuntu-latest: ubuntu-latest became 26.04, and
+    # Playwright 1.58, the version packages/web pins, refused to install browsers
+    # there ("Playwright does not support chromium on ubuntu26.04-x64"), which
+    # failed the 2.10.0 release run after the Node suites had passed.
+    runs-on: ubuntu-24.04
     # A cold release build of the module with fat LTO is about fifteen minutes
     # on four cores; the tests take two.
     timeout-minutes: 60
