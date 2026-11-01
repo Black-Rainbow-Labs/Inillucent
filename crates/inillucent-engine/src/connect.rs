@@ -443,7 +443,10 @@ fn backup_scratch(destination: &Path) -> std::path::PathBuf {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let mut name = destination.as_os_str().to_os_string();
-    name.push(format!(".backup-{}-{stamp}", std::process::id()));
+    name.push(format!(
+        ".backup-{}-{stamp}",
+        inillucent_base::process::id()
+    ));
     std::path::PathBuf::from(name)
 }
 

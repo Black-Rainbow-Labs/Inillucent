@@ -49,6 +49,7 @@ flowchart TB
 | Go, PHP | They start `inillucent --output json` and parse the JSON it prints. |
 | Kotlin and Java on Android | `packages/android` links the C library and a small JNI layer in C into one `libinillucent_jni.so` for each Android ABI, and the Kotlin classes call it. `packages/android/README.md` has the API. |
 | Swift on iOS and macOS | `packages/swift` links the C library as a static library inside an XCFramework, and Swift imports its header as the module `InillucentFFI`. `packages/swift/README.md` has the API. |
+| JavaScript in a browser | `packages/web` builds the C library for `wasm32-wasip1` and calls its exports from JavaScript, through a WASI host of its own. The `inillucent-web` client is built on it. `docs/web.md` in the repository explains it. |
 
 `docs/mobile.md` covers both phone packages: what runs on a phone, the build,
 search, encryption and threads.
@@ -523,15 +524,16 @@ error wrongly, and both sides would still compile.
 | Stability | Promise |
 |---|---|
 | stable | The signature will not change, and the symbol will not be removed. |
-| provisional | The symbol exists and may change in a minor version. Sixteen symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free`, `inillucent_py_init_threads`, `inillucent_py_stmt_execute`, `inillucent_py_execute` and `napi_register_module_v1` under "Python objects and the Node addon". `inillucent_release_models` drops the loaded embedder and reranker sessions, and is described under "Releasing the embedding model before exit". `inillucent_error_take_rows` hands over the rows a statement produced before it failed, as described under the driver's `Error::partial`. |
+| provisional | The symbol exists and may change in a minor version. Eighteen symbols are provisional. `inillucent_cancel` asks a running statement to stop, and the statement then fails with `INILLUCENT_INTERRUPTED`. `inillucent_rows_json`, `inillucent_bind_json` and `inillucent_stmt_execute_many` are described under "Reading and binding in one call", and `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`, `inillucent_stmt_execute_params`, `inillucent_params_free`, `inillucent_py_init_threads`, `inillucent_py_stmt_execute`, `inillucent_py_execute` and `napi_register_module_v1` under "Python objects and the Node addon". `inillucent_release_models` drops the loaded embedder and reranker sessions, and is described under "Releasing the embedding model before exit". `inillucent_error_take_rows` hands over the rows a statement produced before it failed, as described under the driver's `Error::partial`. `inillucent_buffer_alloc` and `inillucent_buffer_free` give a WebAssembly host memory inside the module to pass strings and bytes in. |
 
-The ABI version is 1.5.0, and `inillucent_abi_version()` returns 1005000. Version 1.1.0 added
+The ABI version is 1.6.0, and `inillucent_abi_version()` returns 1006000. Version 1.1.0 added
 `inillucent_open_with_key`, version 1.2.0 added `inillucent_open_with_timeout`, version 1.3.0
 added `inillucent_rows_json`, `inillucent_bind_json`, `inillucent_stmt_execute_many`,
 `inillucent_py_init`, `inillucent_rows_py`, `inillucent_py_init_params`, `inillucent_py_params`,
 `inillucent_stmt_execute_params`, `inillucent_params_free` and `napi_register_module_v1`, and
 version 1.4.0 added `inillucent_py_init_threads`, `inillucent_py_stmt_execute` and
-`inillucent_py_execute`, and version 1.5.0 added `inillucent_release_models` and `inillucent_error_take_rows`. A binding written against 1.0.0 finds every symbol it calls.
+`inillucent_py_execute`, version 1.5.0 added `inillucent_release_models` and `inillucent_error_take_rows`, and version 1.6.0
+added `inillucent_buffer_alloc` and `inillucent_buffer_free`. A binding written against 1.0.0 finds every symbol it calls.
 
 ## Releasing the embedding model before exit
 

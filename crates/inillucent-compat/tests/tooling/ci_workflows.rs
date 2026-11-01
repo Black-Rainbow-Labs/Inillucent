@@ -178,7 +178,7 @@ fn structural_lines(text: &str) -> Vec<(usize, &str)> {
 fn no_plain_value_holds_a_colon() {
     let mut problems = Vec::new();
     let mut read = 0usize;
-    for name in ["tests.yml", "nightly.yml", "mobile.yml"] {
+    for name in ["tests.yml", "nightly.yml", "mobile.yml", "web.yml"] {
         let text = workflow(name);
         for (number, line) in structural_lines(&text) {
             read += 1;
@@ -304,7 +304,7 @@ fn every_prerequisite_has_an_answer_in_ci() {
 /// push to the mirror's release branch, which `ship.ps1` already starts by hand.
 #[test]
 fn the_workflows_run_only_on_the_mirror_and_never_on_a_push() {
-    for name in ["tests.yml", "nightly.yml", "mobile.yml"] {
+    for name in ["tests.yml", "nightly.yml", "mobile.yml", "web.yml"] {
         let text = workflow(name);
         let structure: Vec<&str> = structural_lines(&text)
             .into_iter()

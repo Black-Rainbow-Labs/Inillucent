@@ -626,7 +626,7 @@ pub(crate) fn fresh_seed() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|held| held.as_nanos() as u64)
         .unwrap_or(0);
-    nanos ^ (u64::from(std::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    nanos ^ (u64::from(inillucent_base::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 /// Builds the entry an index should hold for one table row.

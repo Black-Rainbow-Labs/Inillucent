@@ -36,7 +36,7 @@
     packaging/nightly-evidence.ps1 for the three cases.
 
     This script published to twelve destinations without running a test, for seven releases. The
-    phase sits above `version` rather than below it because the version phase rewrites eight files
+    phase sits above `version` rather than below it because the version phase rewrites nine files
     and the publish phase commits them: a suite that goes red after that has already changed the
     tree. Here, a red suite stops the release with nothing written.
 
@@ -306,6 +306,13 @@ function Get-VersionCarriers {
             Replace = "`${1}$Version`${2}"
             Check   = "const nativeVersion = " + [char]34 + $escaped + [char]34
             What    = 'the Go wrapper pinned release'
+        },
+        @{
+            Path    = Join-Path $root 'packages/web/package.json'
+            Pattern = '(?m)^(  "version": ")[^"]+(")'
+            Replace = "`${1}$Version`${2}"
+            Check   = """version"": ""$escaped"""
+            What    = 'the WebAssembly package'
         },
         @{
             Path    = Join-Path $root 'packages/python/pyproject.toml'
@@ -597,6 +604,28 @@ function Get-Routes {
             Run   = { & (Join-Path $script:Packaging 'release-all.ps1') -Version $Version -Targets all }
         },
         @{
+            # **Built and tested before the tag, like every other artifact.** The module is
+            # `inillucent-driver-capi` for `wasm32-wasip1`, and the two Node suites run it through
+            # the package's own WASI host, the shared conformance suite among them. A failure here
+            # stops nothing else, and the `web` route below refuses to publish a module this run
+            # did not build and pass.
+            Name  = 'wasm'
+            What  = 'the WebAssembly module, built and run through its Node tests'
+            Needs = {
+                if (-not (Test-Tool 'node')) { return 'node is not installed.' }
+                $installed = & rustup target list --installed 2>$null
+                if ($installed -notcontains 'wasm32-wasip1') { return 'the wasm32-wasip1 target is not installed. Run: rustup target add wasm32-wasip1' }
+                $null
+            }
+            Run   = {
+                & node (Join-Path $script:Root 'packages/web/build.mjs')
+                if ($LASTEXITCODE -ne 0) { throw 'building the WebAssembly module failed' }
+                & node --test (Join-Path $script:Root 'packages/web/test/conformance.test.mjs') (Join-Path $script:Root 'packages/web/test/engine.test.mjs')
+                if ($LASTEXITCODE -ne 0) { throw 'the WebAssembly package tests failed' }
+                $script:WasmBuilt = $true
+            }
+        },
+        @{
             Name  = 'linux-packages'
             What  = 'the .deb and the .rpm'
             Needs = {
@@ -767,6 +796,26 @@ function Get-Routes {
                 & node (Join-Path $script:Root 'packages/npm/build.mjs') @publishArguments
             }
             Verify = { Test-Registry -Url "https://registry.npmjs.org/inillucent" -Version $Version }
+        },
+        @{
+            Name   = 'web'
+            What   = 'the WebAssembly package inillucent-wasm on npm'
+            Needs  = {
+                if (-not (Test-Tool 'npm')) { return 'npm is not installed.' }
+                $who = (& npm whoami 2>&1 | Out-String).Trim()
+                if (-not $who -or $who -match 'E401|Unauthorized|ENEEDAUTH') {
+                    return "npm rejected the credential: $($who -replace '\s+', ' ')"
+                }
+                $null
+            }
+            Run    = {
+                if (-not $script:WasmBuilt) { throw 'the wasm route did not build and pass the module in this run, so there is nothing tested to publish' }
+                $publishArguments = @('publish', (Join-Path $script:Root 'packages/web'), '--access', 'public')
+                if ($Otp) { $publishArguments += @('--otp', $Otp) }
+                & npm @publishArguments
+                if ($LASTEXITCODE -ne 0) { throw 'npm publish of inillucent-wasm failed' }
+            }
+            Verify = { Test-Registry -Url "https://registry.npmjs.org/inillucent-wasm" -Version $Version }
         },
         @{
             Name   = 'pypi'

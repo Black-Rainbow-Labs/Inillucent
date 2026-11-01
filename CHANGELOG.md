@@ -8,6 +8,41 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## 2.10.0, 1 November 2026
+
+This release runs inillucent in a web page. The engine compiles to WebAssembly for the
+`wasm32-wasip1` target, and two new npm packages carry it. [docs/web.md](docs/web.md) has the
+details.
+
+**`inillucent-wasm` is the engine as one WebAssembly module.** It is the C library, 6.6 MiB and
+2.4 MiB compressed with gzip, with a WASI host written in JavaScript, because browsers provide no
+WASI functions. Files are kept in memory, or in the browser's origin private file system from a
+worker. It passes the 35 cases of `drivers/conformance/suite.json` under Node, and the OPFS test
+passes in Chromium and Firefox: rows and a full text index survive a page reload, and a second
+worker on the same database is refused with `DatabaseBusyError`.
+
+**`inillucent-web` is the client for a page.** It has the API the other clients have. After one
+`await connect()`, every call is synchronous and the database is in memory; `exportDatabase()`
+returns it as a `.rdb` file. `openPersistent(name)` keeps a database between visits, with calls
+that return promises. It lives in the inillucent-clients repository.
+
+**The C ABI is 1.6.0.** `inillucent_buffer_alloc` and `inillucent_buffer_free` give a
+WebAssembly host memory inside the module to pass SQL text and bytes in. Both are provisional, and
+nothing else in the ABI changed.
+
+**The engine changes are below the SQL.** `inillucent-vfs` has a WASI platform beside Windows and
+POSIX. Its locks are decided inside the instance, which is one process with one thread, and its
+shared memory is on the heap. The stack guard that refuses a statement nesting too deeply with
+`too_big` now finds the stack's ends on WebAssembly; before, it limited nothing there.
+`std::process::id` and `std::env::temp_dir` panic on WASI, so the engine asks
+`inillucent_base::process::id` and uses `/tmp` there.
+
+**Known limits.** `embed()` is not in the WebAssembly build, because the ONNX runtime it needs does
+not build for WebAssembly. A statement with thousands of nested parentheses can run out of the
+JavaScript engine's own call stack before the engine's guard sees it; the instance stops,
+`inillucent-web` swaps in a second one on the same files, and the statement is reported as
+`too_big`. Playwright's WebKit on Windows has no OPFS, so Safari's OPFS path is not tested here.
+
 ## 2.9.0, 30 October 2026
 
 This release fixes the defects found by the eleventh bug hunt. Eight areas were compared with SQLite

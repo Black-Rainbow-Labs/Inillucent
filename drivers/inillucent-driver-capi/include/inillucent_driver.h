@@ -163,6 +163,13 @@ const char *inillucent_version(void);
  * Since ABI 1.5.0. */
 void        inillucent_release_models(void);
 
+/* Memory to hand bytes in through, for a host with no allocator of its own
+ * inside the library's memory: a WebAssembly host. The bytes are not
+ * initialised. Free with the same length. A zero length still answers a
+ * pointer; null means the allocation failed. Since ABI 1.6.0. */
+uint8_t    *inillucent_buffer_alloc(size_t len);
+void        inillucent_buffer_free(uint8_t *buffer, size_t len);
+
 /* How many capabilities this build knows about. */
 size_t inillucent_capability_count(void);
 

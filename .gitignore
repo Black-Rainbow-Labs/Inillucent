@@ -217,3 +217,9 @@ __pycache__/
 /packages/swift/.build/
 /packages/swift/.swiftpm/
 /packages/swift/Tests/InillucentTests/Resources/
+
+# The WebAssembly module packages/web/build.mjs builds, and the test tools
+# npm installs beside it. The module is rebuilt for every release.
+/packages/web/dist/
+/packages/web/node_modules/
+/packages/web/LICENSE

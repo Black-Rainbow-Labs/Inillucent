@@ -11,7 +11,11 @@
 //! path handling, temporary names - is the same code on both, so it lives here
 //! rather than being written twice and drifting.
 
+#[cfg(not(target_os = "wasi"))]
 mod filelock;
+// On WASI nothing takes a kernel byte range lock, so only the lock page
+// arithmetic below reads these constants.
+#[cfg_attr(target_os = "wasi", allow(dead_code))]
 mod ranges;
 
 #[cfg(unix)]
@@ -20,6 +24,12 @@ mod platform;
 
 #[cfg(windows)]
 #[path = "windows.rs"]
+mod platform;
+
+// A WebAssembly module under WASI preview 1: one process, one thread, no
+// byte range locks and no memory mapping. See `wasi.rs`.
+#[cfg(target_os = "wasi")]
+#[path = "wasi.rs"]
 mod platform;
 
 #[cfg(windows)]
@@ -420,7 +430,7 @@ impl Vfs for OsVfs {
         // than confining it.
         let directory = match crate::confine::process_root() {
             Some(root) => root.directory().to_path_buf(),
-            None => std::env::temp_dir(),
+            None => temp_directory(),
         };
         for _ in 0..10_000 {
             let counter = self.temp_counter.fetch_add(1, Ordering::Relaxed);
@@ -442,6 +452,22 @@ impl Vfs for OsVfs {
     fn sleep(&self, micros: u64) -> VfsResult<()> {
         std::thread::sleep(std::time::Duration::from_micros(micros));
         Ok(())
+    }
+}
+
+/// Returns the folder temporary files go in.
+///
+/// `std::env::temp_dir` panics on WASI, which has no such folder of its own; the
+/// web package's file systems keep `/tmp`, and `TMPDIR` overrides it as it does
+/// on a POSIX system.
+fn temp_directory() -> PathBuf {
+    #[cfg(target_os = "wasi")]
+    {
+        std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        std::env::temp_dir()
     }
 }
 

@@ -141,3 +141,24 @@ path = "packages/swift/Tests/InillucentTests/DatabaseTests.swift"
 command = "sh packages/swift/run-tests.sh"
 requires = ["xcode"]
 about = "the Swift binding's behavior tests, the same list as DatabaseTest.kt plus composed and decomposed text staying two values. The same script runs both files"
+
+[[test]]
+language = "web"
+path = "packages/web/test/conformance.test.mjs"
+command = "node --test packages/web/test/conformance.test.mjs"
+requires = ["node", "wasm"]
+about = "the shared conformance suite through the WebAssembly build, its JavaScript WASI host and the memory file system, under Node. It records web.json. It needs the module built with node packages/web/build.mjs"
+
+[[test]]
+language = "web"
+path = "packages/web/test/engine.test.mjs"
+command = "node --test packages/web/test/engine.test.mjs"
+requires = ["node", "wasm"]
+about = "what the WebAssembly build does beyond the suite: an export imported into a second engine, a reopened file, a held transaction, vector and full text search, nesting refused with too_big, an instance stopped by the JavaScript call stack and recovered on the same files, and the module's WASI imports"
+
+[[test]]
+language = "web"
+path = "packages/web/test/browser/opfs.test.mjs"
+command = "node --test packages/web/test/browser/opfs.test.mjs"
+requires = ["node", "wasm", "playwright"]
+about = "the OPFS file system in Chromium, Firefox and WebKit through Playwright: rows and an FTS5 index survive a reload, and a second worker on the same database is refused by name. A browser with no OPFS sync access handles is a named skip. It needs npm install in packages/web"

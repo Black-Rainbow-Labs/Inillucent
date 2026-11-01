@@ -1854,6 +1854,10 @@
       "lacks": [],
       "why": "packages/swift links the C ABI as a static library and holds a connection. It runs on the iOS simulator, which only a Mac has, so it is graded by .github/workflows/mobile.yml."
     },
+    "web": {
+      "lacks": [],
+      "why": "packages/web runs the C ABI compiled to WebAssembly and holds a connection. Its runner is packages/web/test/conformance.test.mjs under Node, which needs the module built first, so it is graded by tools/run-package-tests.sh and not by the tooling guard."
+    },
     "swift-macos": {
       "lacks": [],
       "why": "the same Swift package under swift test on the Mac, in the same workflow."

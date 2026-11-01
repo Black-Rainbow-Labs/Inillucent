@@ -132,6 +132,17 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, output: &mut [u8]) -> io::
         }
         Ok(())
     }
+    // WASI preview 1 has a positional read only behind an unstable standard
+    // library feature, so this seeks and reads. That moves the cursor every
+    // handle on the file shares, which is safe only because a WASI module runs
+    // one thread: nothing else can read between the seek and the read.
+    #[cfg(target_os = "wasi")]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut handle = file;
+        handle.seek(SeekFrom::Start(offset))?;
+        handle.read_exact(output)
+    }
 }
 
 /// Reads `count` vectors starting at ordinal `first` into `output`.

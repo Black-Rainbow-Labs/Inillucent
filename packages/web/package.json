@@ -1,0 +1,49 @@
+{
+  "name": "inillucent-wasm",
+  "version": "2.9.0",
+  "description": "The inillucent embedded SQL database compiled to WebAssembly, with the WASI host it needs in a browser or Node. Full text and vector search, in memory or kept in the browser's origin private file system.",
+  "keywords": [
+    "database",
+    "sql",
+    "sqlite",
+    "wasm",
+    "webassembly",
+    "browser",
+    "opfs",
+    "vector",
+    "search"
+  ],
+  "homepage": "https://github.com/Black-Rainbow-Labs/Inillucent/tree/main/packages/web#readme",
+  "bugs": "https://github.com/Black-Rainbow-Labs/Inillucent/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Black-Rainbow-Labs/Inillucent.git",
+    "directory": "packages/web"
+  },
+  "license": "MIT",
+  "author": "Black Rainbow Labs",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./inillucent.wasm": "./dist/inillucent.wasm"
+  },
+  "files": [
+    "src",
+    "dist/inillucent.wasm",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/conformance.test.mjs test/engine.test.mjs",
+    "test:browser": "node --test test/browser/opfs.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.58.0"
+  }
+}

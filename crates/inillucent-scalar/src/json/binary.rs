@@ -122,13 +122,16 @@ pub fn encoded_len(node: &Node) -> usize {
 ///
 /// @param size - the payload size in bytes
 pub fn header_len(size: usize) -> usize {
+    // Compared as a `u64`, because on a 32 bit target (WebAssembly) every
+    // `usize` is at most `0xffff_ffff` and the comparison would be always true.
+    let wide = u64::try_from(size).unwrap_or(u64::MAX);
     if size <= 11 {
         1
     } else if size <= 0xff {
         2
     } else if size <= 0xffff {
         3
-    } else if size <= 0xffff_ffff {
+    } else if wide <= 0xffff_ffff {
         5
     } else {
         9
@@ -151,6 +154,8 @@ fn payload(kind: u8, body: &[u8], out: &mut Vec<u8>) {
 /// Writes the smallest header that can describe a payload of this size.
 fn header(kind: u8, size: usize, out: &mut Vec<u8>) {
     let kind = kind & 0x0f;
+    // See `header_len` for why this is a `u64`.
+    let wide = u64::try_from(size).unwrap_or(u64::MAX);
     if size <= 11 {
         out.push(((size as u8) << 4) | kind);
     } else if size <= 0xff {
@@ -159,12 +164,12 @@ fn header(kind: u8, size: usize, out: &mut Vec<u8>) {
     } else if size <= 0xffff {
         out.push(0xd0 | kind);
         out.extend_from_slice(&(size as u16).to_be_bytes());
-    } else if size <= 0xffff_ffff {
+    } else if wide <= 0xffff_ffff {
         out.push(0xe0 | kind);
         out.extend_from_slice(&(size as u32).to_be_bytes());
     } else {
         out.push(0xf0 | kind);
-        out.extend_from_slice(&(size as u64).to_be_bytes());
+        out.extend_from_slice(&wide.to_be_bytes());
     }
 }
 

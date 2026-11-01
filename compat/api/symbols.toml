@@ -5,7 +5,7 @@
 # `inillucent-compat::obligations::the_registers_match_the_engine` fails if
 # this file and the engine disagree.
 
-count = 70
+count = 72
 profile = "default"
 
 [[symbol]]
@@ -39,6 +39,14 @@ signature = "inillucent_bind_real( stmt: *mut inillucent_stmt, index: u32, value
 [[symbol]]
 name = "inillucent_bind_text"
 signature = "inillucent_bind_text( stmt: *mut inillucent_stmt, index: u32, value: *const c_char, len: usize, ) -> i32"
+
+[[symbol]]
+name = "inillucent_buffer_alloc"
+signature = "inillucent_buffer_alloc(len: usize) -> *mut u8"
+
+[[symbol]]
+name = "inillucent_buffer_free"
+signature = "inillucent_buffer_free(buffer: *mut u8, len: usize)"
 
 [[symbol]]
 name = "inillucent_cancel"

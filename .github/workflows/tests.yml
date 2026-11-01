@@ -353,3 +353,9 @@ jobs:
   mobile:
     name: mobile
     uses: ./.github/workflows/mobile.yml
+
+  # The WebAssembly package, built for wasm32-wasip1 and run under Node and in
+  # Chromium and Firefox. Called here for the same reason as mobile.
+  web:
+    name: web
+    uses: ./.github/workflows/web.yml

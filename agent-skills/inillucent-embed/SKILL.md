@@ -1,6 +1,6 @@
 ---
 name: inillucent-embed
-description: Put inillucent inside an application. Covers the Rust driver, the C library, the Python, Node, Go and PHP packages, and the Swift package and Android library for iOS and Android apps. Use when asked to add inillucent to a codebase, write or fix a language binding, or replace SQLite or another embedded database in an application.
+description: Put inillucent inside an application. Covers the Rust driver, the C library, the Python, Node, Go and PHP packages, the Swift package and Android library for iOS and Android apps, and the WebAssembly build for web pages. Use when asked to add inillucent to a codebase or a web page, write or fix a language binding, or replace SQLite or another embedded database in an application.
 ---
 
 # Embedding inillucent in an application
@@ -31,6 +31,7 @@ release archive, has the full contract.
 | PHP | `composer require black-rainbow-labs/inillucent` | starts `inillucent --output json` and parses the JSON |
 | Swift on iOS and macOS | `packages/swift`, built from the repository | links the C library as a static library inside an XCFramework, in the app's process |
 | Kotlin and Java on Android | `packages/android`, built from the repository | links the C library and a JNI layer into one `libinillucent_jni.so` for each Android ABI, in the app's process |
+| JavaScript in a browser | `npm install inillucent-web` | runs the C library compiled to WebAssembly in the page, through `inillucent-wasm` |
 
 The Swift package and the Android library are not on a package index yet. Build them from a checkout of the repository. `docs/mobile.md` covers both: what runs on a phone, the build, search, encryption and threads. `embed(TEXT)` is not built into either, so a phone app stores vectors its own model computed.
 
@@ -40,6 +41,15 @@ and the four programs, so it needs no compiler.
 A package that starts the program gets JSON. A blob comes back as `{"blob": "<hex>"}`. An integer
 larger than 2^53 is rounded by JavaScript's `JSON.parse`, and by Go's `encoding/json` unless the
 decoder calls `UseNumber()`.
+
+## A web page
+
+`inillucent-web` runs the engine as WebAssembly. `await connect('app.rdb')` once, then every call
+is synchronous and the database is in the page's memory; `exportDatabase()` returns it as a `.rdb`
+file. `await openPersistent('app')` keeps the database in the browser's origin private file system
+between visits: the engine runs in a worker the package starts, and every call returns a promise. A
+browser lets one worker hold a persistent database, so a second tab gets `DatabaseBusyError`. There
+is no `embed()` in the WebAssembly build. [docs/web.md](../../docs/web.md) has the rest.
 
 ## Design for `unsupported`
 

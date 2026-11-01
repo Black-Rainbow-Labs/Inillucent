@@ -44,15 +44,16 @@ this index.
 | 15 | [Migrating](migrating.md) | Copying a SQLite file, a PostgreSQL database or a MySQL database into inillucent |
 | 16 | [Encryption at rest](encryption.md) | Keys, what is encrypted, how to encrypt a database you already have, and what it costs |
 | 17 | [iOS and Android](mobile.md) | The Swift package and the Android library: what runs on a phone, building them, a first database, search, encryption, threads and the tests |
+| 18 | [In a web page](web.md) | Running inillucent in a browser as WebAssembly: a database in memory, one the browser keeps between visits, and what differs from the native library |
 
 ## Measurements
 
 | | Page | What it covers |
 |---|---|---|
-| 18 | [Performance](performance.md) | Current speed, processor time, memory and file size against SQLite 3.53.4, overall and by category, and the workloads that are slower. Every earlier run and each hill climb is in [Performance history](performance-history.md) |
-| 19 | [Feature comparison](feature-comparison.md) | The full 416 case differential probe against SQLite, feature by feature, and the retrieval engine against pgvector |
-| 20 | [Retrieval quality](retrieval-quality.md) | The 17 graded comparisons with PostgreSQL and pgvector, and how a measurement becomes a verdict |
-| 21 | [Synthetic corpus](../tests/synthetic-corpus.md) | How to build the public corpus that every retrieval number is measured on |
+| 19 | [Performance](performance.md) | Current speed, processor time, memory and file size against SQLite 3.53.4, overall and by category, and the workloads that are slower. Every earlier run and each hill climb is in [Performance history](performance-history.md) |
+| 20 | [Feature comparison](feature-comparison.md) | The full 416 case differential probe against SQLite, feature by feature, and the retrieval engine against pgvector |
+| 21 | [Retrieval quality](retrieval-quality.md) | The 17 graded comparisons with PostgreSQL and pgvector, and how a measurement becomes a verdict |
+| 22 | [Synthetic corpus](../tests/synthetic-corpus.md) | How to build the public corpus that every retrieval number is measured on |
 
 `inillucent-scorecard.md` in the repository root is the full score card from the grading run. It has
 every interval, every p-value and every diagnostic. `inillucent-bench grade` writes
@@ -67,19 +68,19 @@ of each result. The same studies are at [inillucent.com/research](https://inillu
 
 | | Page | What it covers |
 |---|---|---|
-| 22 | [Research](research/README.md) | The list of studies, newest first |
-| 23 | [Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md) | Chunking, headings, embedding models, fusion, rerankers and language model helpers, measured on 67,369 emails, and the features each result led to |
-| 24 | [How inillucent was made faster than SQLite](research/performance-hill-climbing.md) | The hill climbs that took the engine from 432% slower than SQLite to 505% faster, how each benchmark was made trustworthy, the changes that moved the numbers most, and the advice taken and not taken |
+| 23 | [Research](research/README.md) | The list of studies, newest first |
+| 24 | [Which retrieval techniques find the right text for RAG](research/rag-retrieval-study.md) | Chunking, headings, embedding models, fusion, rerankers and language model helpers, measured on 67,369 emails, and the features each result led to |
+| 25 | [How inillucent was made faster than SQLite](research/performance-hill-climbing.md) | The hill climbs that took the engine from 432% slower than SQLite to 505% faster, how each benchmark was made trustworthy, the changes that moved the numbers most, and the advice taken and not taken |
 
 ## Working on it
 
 | | Page | What it covers |
 |---|---|---|
-| 25 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
-| 26 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
-| 27 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
-| 28 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
-| 29 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
+| 26 | [Repository and building](repository.md) | The crates and what each one does, building, running the tests, and the test coverage table |
+| 27 | [Dependency policy](dependency-policy.md) | Which crates a production crate may use, and why the allowed list is short |
+| 28 | [Writing style](writing-style.md) | How to write and check a page in this folder or a chapter on inillucent.com |
+| 29 | [Roadmap](roadmap.md) | What is not built yet, in the order it is being worked on |
+| 30 | [Closed items](closed-items.md) | What came off the roadmap, and the measurement that closed each item |
 | | [`AGENTS.md`](../AGENTS.md) | The starting page for an AI agent that uses or changes this repository |
 | | [`agent-skills/`](../agent-skills/README.md) | One page for each common job, readable by any AI agent |
 

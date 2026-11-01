@@ -24,7 +24,7 @@
 # decision somebody made rather than a line somebody edited.
 
 schema_version = 1
-abi_version = "1.5.0"
+abi_version = "1.6.0"
 
 [[symbol]]
 name = "inillucent_abi_version"
@@ -263,6 +263,19 @@ since = "1.5.0"
 name = "inillucent_error_take_rows"
 stability = "provisional"
 since = "1.5.0"
+
+# Memory a host borrows from the library to hand bytes in. A WebAssembly host has no allocator
+# inside the module's memory, so the web package needs these to pass SQL text and blobs. Provisional
+# until the web package has shipped a release.
+[[symbol]]
+name = "inillucent_buffer_alloc"
+stability = "provisional"
+since = "1.6.0"
+
+[[symbol]]
+name = "inillucent_buffer_free"
+stability = "provisional"
+since = "1.6.0"
 
 # The Node addon's entry point, which Node calls when it loads the library
 # (task-2191). Provisional with the rest of 1.3.0.

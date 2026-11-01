@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 29] = [
+const UNSAFE_ALLOWED: [&str; 30] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -129,6 +129,13 @@ const UNSAFE_ALLOWED: [&str; 29] = [
     // `pthread_get_stackaddr_np`), each writing integers on the caller's frame and keeping nothing,
     // each with its SAFETY note.
     "crates/inillucent-base/src/stack.rs",
+    // **The WASI platform of the operating-system VFS, for the WebAssembly build.** Positional
+    // reads and writes, a file's size and number, and randomness are four calls into the WASI
+    // host (`fd_pread`, `fd_pwrite`, `fd_filestat_get`, `random_get`), because the standard
+    // library has the first two only behind the unstable `wasi_ext` feature and the others not at
+    // all. Each call is handed a pointer and length that a Rust slice or a local owns for the
+    // call, and each carries its SAFETY note. The engine's conformance suite runs through it.
+    "crates/inillucent-vfs/src/os/wasi.rs",
     // **The AVX2 dot product, added by task-2000's design 9.** It is the one place
     // in the engine where safe Rust cannot express the thing that has to happen: a
     // 256-bit fused multiply-add is an intrinsic, every intrinsic in

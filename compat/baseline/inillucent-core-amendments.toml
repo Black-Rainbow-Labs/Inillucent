@@ -314,9 +314,9 @@ sha256 = "689184215601d4c4541bf2d612c06a5e93e26e3adcf0539051562c9ff6502cd8"
 
 [[amendment]]
 path = "crates/inillucent-core/src/vectors.rs"
-ticket = "task-2367"
-reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
-sha256 = "cf9489f4533ea8f5d95a86c9e026148ee6beaea973b52af9e72b981f207c58e6"
+ticket = "task-2448"
+reason = "read_exact_at gains a branch for target_os = wasi, a seek and a read, so the retrieval engine builds for WebAssembly. Only a wasm32-wasip1 build compiles the new branch; the unix and windows branches are unchanged."
+sha256 = "15bad8e7016ccf50a995800f38e517db9c930b2e808f826aac332f58637da676"
 
 [[amendment]]
 path = "inillucent-scorecard.json"

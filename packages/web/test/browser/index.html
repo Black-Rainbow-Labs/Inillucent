@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>inillucent-wasm browser test</title>
+<script type="module">
+  // Starts a worker and sends it one request, answering its reply.
+  window.ask = (request) => new Promise((resolve) => {
+    const worker = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
+    worker.onmessage = (event) => {
+      resolve(event.data);
+      if (request.keepOpen) window.holder = worker;
+      else worker.terminate();
+    };
+    worker.onerror = (event) => resolve({ ok: false, name: 'WorkerError', message: event.message });
+    worker.postMessage(request);
+  });
+  // Tells the worker holding a database open to close it.
+  window.release = () => new Promise((resolve) => {
+    window.holder.onmessage = (event) => resolve(event.data);
+    window.holder.postMessage({ release: true });
+  });
+  window.ready = true;
+</script>

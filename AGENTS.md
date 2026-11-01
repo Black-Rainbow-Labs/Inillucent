@@ -73,6 +73,7 @@ inillucent help migrate         # one command and every parameter it takes
 | How do I search by meaning or by keyword? | [`docs/vector-search.md`](docs/vector-search.md) |
 | How do I use it from Python, Node, Go, PHP or C? | [`drivers/README.md`](drivers/README.md) |
 | How do I use it in an iOS or Android app? | [`docs/mobile.md`](docs/mobile.md) |
+| How do I run it in a web page? | [`docs/web.md`](docs/web.md) |
 | How does the retrieval engine work? | [`docs/architecture.md`](docs/architecture.md) |
 | How does the SQL engine work? | [`docs/relational-architecture.md`](docs/relational-architecture.md) |
 | How do the two engines fit together? | [`docs/architecture-overview.md`](docs/architecture-overview.md) |
@@ -481,11 +482,12 @@ packaging/tests`.
 
 ### The routes
 
-`ship.ps1` publishes through fourteen routes, named as the plan prints them:
+`ship.ps1` publishes through sixteen routes, named as the plan prints them:
 
 | Route | What it publishes |
 |---|---|
 | `build` | the five targets: Windows x86-64, Linux x86-64 and aarch64, macOS aarch64 and x86-64 |
+| `wasm` | nothing yet: it builds the WebAssembly module and runs `packages/web`'s Node tests, before the tag |
 | `linux-packages` | the `.deb` and the `.rpm` |
 | `signature` | the minisign signature over `SHA256SUMS` |
 | `tag` | the commit, the tag and the push to `origin` |
@@ -494,6 +496,7 @@ packaging/tests`.
 | `site` | inillucent.com: the files, then the links |
 | `crates` | crates.io |
 | `npm` | the npm wrapper and its four platform packages |
+| `web` | `inillucent-wasm` on npm, only when `wasm` built and passed the module in the same run |
 | `pypi` | the Python wheel |
 | `go` | the Go module tag |
 | `packagist` | Composer, which reads the tags again |
@@ -534,8 +537,8 @@ Installer.app or a macOS binary. If that matters, say so in those words after th
   serve the previous release's source under the new version, permanently. So `tag` runs before
   `github`, and `packagist` runs after both. inillucent's Go module at v0.1.5 and Composer package
   at v0.1.6 are wrong for this reason.
-- **The version is written in eight files.** `Get-VersionCarriers` in `ship.ps1` lists them. If you
-  add a file that carries the version, add it there. Two of the eight carry the version in code: the
+- **The version is written in nine files.** `Get-VersionCarriers` in `ship.ps1` lists them. If you
+  add a file that carries the version, add it there. Two of the nine carry the version in code: the
   PHP installer's `NATIVE_VERSION` and the Go wrapper's `nativeVersion`. The scan for leftover
   version numbers cannot see the Go one, because `packages/go/` names old versions in test data.
 - **A published version is permanent.** npm, crates.io and PyPI refuse to replace one, and npm never

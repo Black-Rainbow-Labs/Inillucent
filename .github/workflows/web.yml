@@ -1,0 +1,78 @@
+# The WebAssembly package: the module built for wasm32-wasip1, run under Node and in browsers.
+#
+# ## Why a workflow of its own
+#
+# The package's tests are Node and Playwright programs, not cargo targets, so
+# `inillucent-testrun` does not run them. They need the module built for a
+# target the main suite never builds, and two browsers Playwright downloads.
+# On the development machine they run through `sh tools/run-package-tests.sh`
+# and the `wasm` route of `packaging/ship.ps1`.
+#
+# `tests.yml` calls this workflow, so the run `packaging/ci-status.ps1` waits
+# for after a release includes it. It also runs on its own once a night and by
+# hand.
+#
+# ## Once a night, and only on the public repository
+#
+# The same rule as `tests.yml`: no push trigger, and the job names
+# Black-Rainbow-Labs/Inillucent in its `if:`.
+
+name: web
+
+on:
+  schedule:
+    # 03:45 UTC, after tests.yml, nightly.yml and mobile.yml start.
+    - cron: "45 3 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  web:
+    name: WebAssembly under Node and in browsers
+    if: github.repository == 'Black-Rainbow-Labs/Inillucent'
+    runs-on: ubuntu-latest
+    # A cold release build of the module with fat LTO is about fifteen minutes
+    # on four cores; the tests take two.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add wasm32-wasip1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: the module
+        run: node packages/web/build.mjs
+
+      - name: the conformance suite and the engine tests under Node
+        run: node --test packages/web/test/conformance.test.mjs packages/web/test/engine.test.mjs
+
+      - name: Playwright and its browsers
+        run: |
+          npm --prefix packages/web install --no-audit --no-fund
+          npx --prefix packages/web playwright install --with-deps chromium firefox
+
+      - name: OPFS in Chromium and Firefox
+        run: node --test packages/web/test/browser/opfs.test.mjs
+
+      - name: the conformance record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-results
+          path: _agent_output/conformance/web.json
+          if-no-files-found: warn

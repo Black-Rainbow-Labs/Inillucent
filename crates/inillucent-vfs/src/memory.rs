@@ -452,7 +452,7 @@ impl Drop for MemoryFile {
 
 /// The shared-memory file behind an in-memory WAL index.
 #[derive(Debug, Default)]
-struct MemoryShm {
+pub(crate) struct MemoryShm {
     regions: Mutex<Vec<Arc<MemoryShmRegion>>>,
     locks: Mutex<ShmLockTable>,
 }

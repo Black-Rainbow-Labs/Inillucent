@@ -167,10 +167,33 @@ fn stack_bounds() -> Option<(usize, usize)> {
     windows,
     target_os = "linux",
     target_os = "android",
-    target_os = "macos"
+    target_os = "macos",
+    target_family = "wasm"
 )))]
 fn stack_bounds() -> Option<(usize, usize)> {
     None
+}
+
+/// Asks the linker where the WebAssembly module's stack lies.
+///
+/// A WebAssembly module keeps its Rust stack in its own linear memory, below the static data,
+/// and `wasm-ld` names both ends with `__stack_low` and `__stack_high`. Answering nothing here
+/// would leave the guard limiting nothing, and a statement that nests past the stack would then
+/// trap the whole module with an out of bounds access instead of being refused with `too_big`.
+/// The stack is placed first in memory, so its low end is address 0, and [`room`] reads a low end
+/// of 0 or 1 as "not known". It is raised to 1024, which under-reports the room by one kilobyte.
+#[cfg(target_family = "wasm")]
+#[allow(unsafe_code)]
+fn stack_bounds() -> Option<(usize, usize)> {
+    extern "C" {
+        static __stack_low: u8;
+        static __stack_high: u8;
+    }
+    // Only the addresses of the two linker symbols are taken, which needs no
+    // `unsafe`; neither symbol is read.
+    let low = std::ptr::addr_of!(__stack_low) as usize;
+    let high = std::ptr::addr_of!(__stack_high) as usize;
+    Some((low.max(1024), high))
 }
 
 #[cfg(test)]

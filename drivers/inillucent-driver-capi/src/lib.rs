@@ -80,8 +80,10 @@ use inillucent_driver::Value;
 // was, and the C symbols never depended on the module: `#[no_mangle]` exports
 // from wherever the function is written.
 mod capi;
+pub use capi::buffer::*;
 pub use capi::db::*;
 pub use capi::error::*;
+#[cfg(any(unix, windows))]
 pub use capi::node::*;
 pub use capi::params::*;
 pub use capi::python::*;
@@ -97,9 +99,10 @@ pub use capi::value::*;
 /// `inillucent_open_with_timeout`, 1.3.0 added `inillucent_rows_json`,
 /// `inillucent_bind_json` and `inillucent_stmt_execute_many`, and 1.4.0 added
 /// `inillucent_py_stmt_execute`, `inillucent_py_execute` and
-/// `inillucent_py_init_threads`, and 1.5.0 added `inillucent_release_models`. A new symbol is a minor version: a binding
+/// `inillucent_py_init_threads`, and 1.5.0 added `inillucent_release_models`, and 1.6.0 added `inillucent_buffer_alloc` and
+/// `inillucent_buffer_free` for the WebAssembly build. A new symbol is a minor version: a binding
 /// written against 1.0.0 still finds every symbol it calls.
-pub const ABI_VERSION: u32 = 1_005_000;
+pub const ABI_VERSION: u32 = 1_006_000;
 
 // —— status codes, which the header freezes ————————————————————————
 

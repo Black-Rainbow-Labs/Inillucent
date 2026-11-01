@@ -313,11 +313,15 @@ fn every_stability_is_one_of_the_two_that_mean_something() {
         .collect();
     // The three JSON calls arrived in 1.3.0 and stay provisional until a second
     // binding has used them (task-2191). The three one call Python calls of
-    // 1.4.0 are provisional with the rest of the Python calls (task-2197).
+    // 1.4.0 are provisional with the rest of the Python calls (task-2197). The
+    // two buffer calls of 1.6.0 are provisional until the web package that
+    // needs them has shipped a release.
     assert_eq!(
         provisional,
         vec![
             "inillucent_bind_json",
+            "inillucent_buffer_alloc",
+            "inillucent_buffer_free",
             "inillucent_cancel",
             "inillucent_error_take_rows",
             "inillucent_params_free",

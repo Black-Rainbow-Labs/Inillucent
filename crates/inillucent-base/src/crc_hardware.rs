@@ -22,6 +22,7 @@
 //! buffer, gets `None` and the caller uses the table.
 
 /// Below this, the table implementation's setup is cheaper than the folding's.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const SHORTEST: usize = 64;
 
 /// CRC-32 of `data` continued from `previous`, by the processor, or `None` when
