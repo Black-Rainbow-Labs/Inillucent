@@ -51,7 +51,10 @@ done
 (cd "$ROOT" && rustup target add $TARGETS >/dev/null)
 for target in $TARGETS; do
   echo "cargo build --target $target"
-  cargo build --manifest-path "$ROOT/Cargo.toml" -p inillucent-driver-capi --release --locked --target "$target"
+  # From the repository root, so rustup reads rust-toolchain.toml and builds with the toolchain the
+  # targets were just added to. Run from anywhere else, cargo used the caller's default toolchain,
+  # which may not have the Apple targets (task-2445, from the Meditation app's checkout).
+  (cd "$ROOT" && cargo build -p inillucent-driver-capi --release --locked --target "$target")
 done
 
 rm -rf "$STAGE" "$OUT"
