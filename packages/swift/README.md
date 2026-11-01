@@ -42,6 +42,15 @@ and writes `packages/swift/InillucentFFI.xcframework` with three slices:
 | `ios-arm64_x86_64-simulator` | `aarch64-apple-ios-sim`, `x86_64-apple-ios` |
 | `macos-arm64_x86_64` | `aarch64-apple-darwin`, `x86_64-apple-darwin` |
 
+`INILLUCENT_APPLE_PLATFORMS` picks the slices, out of `ios`, `simulator` and `macos`. An iPhone app
+that calls the C library directly needs only the first two, and skips two of the five builds:
+
+```sh
+INILLUCENT_APPLE_PLATFORMS="ios simulator" sh packages/swift/build-xcframework.sh
+```
+
+The Swift package's own tests run on the Mac too, so they need all three.
+
 Then add the package to an app with Xcode's "Add Package Dependencies" and its "Add Local" button,
 or with a path dependency in another package:
 

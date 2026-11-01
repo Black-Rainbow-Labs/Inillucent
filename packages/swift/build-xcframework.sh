@@ -14,7 +14,10 @@
 #   ios-arm64_x86_64-simulator   aarch64-apple-ios-sim + x86_64-apple-ios
 #   macos-arm64_x86_64           aarch64-apple-darwin + x86_64-apple-darwin
 #
-# Environment it reads, all optional: CARGO_TARGET_DIR.
+# Environment it reads, all optional: CARGO_TARGET_DIR, and INILLUCENT_APPLE_PLATFORMS, the slices to
+# build out of "ios simulator macos" (the default is all three). An iPhone app that uses only the C
+# library, such as the Meditation app's React Native bridge, sets it to "ios simulator" and skips the
+# two Mac builds.
 
 set -e
 
@@ -35,7 +38,16 @@ fi
 export IPHONEOS_DEPLOYMENT_TARGET=13.0
 export MACOSX_DEPLOYMENT_TARGET=11.0
 
-TARGETS="aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin"
+PLATFORMS="${INILLUCENT_APPLE_PLATFORMS:-ios simulator macos}"
+TARGETS=""
+for platform in $PLATFORMS; do
+  case "$platform" in
+    ios) TARGETS="$TARGETS aarch64-apple-ios" ;;
+    simulator) TARGETS="$TARGETS aarch64-apple-ios-sim x86_64-apple-ios" ;;
+    macos) TARGETS="$TARGETS aarch64-apple-darwin x86_64-apple-darwin" ;;
+    *) echo "INILLUCENT_APPLE_PLATFORMS: unknown platform '$platform'; use ios, simulator and macos" >&2; exit 1 ;;
+  esac
+done
 (cd "$ROOT" && rustup target add $TARGETS >/dev/null)
 for target in $TARGETS; do
   echo "cargo build --target $target"
@@ -44,9 +56,15 @@ done
 
 rm -rf "$STAGE" "$OUT"
 mkdir -p "$STAGE/ios" "$STAGE/simulator" "$STAGE/macos" "$STAGE/headers"
-cp "$TARGET_DIR/aarch64-apple-ios/release/$LIB" "$STAGE/ios/$LIB"
-lipo -create "$TARGET_DIR/aarch64-apple-ios-sim/release/$LIB" "$TARGET_DIR/x86_64-apple-ios/release/$LIB" -output "$STAGE/simulator/$LIB"
-lipo -create "$TARGET_DIR/aarch64-apple-darwin/release/$LIB" "$TARGET_DIR/x86_64-apple-darwin/release/$LIB" -output "$STAGE/macos/$LIB"
+set --
+for platform in $PLATFORMS; do
+  case "$platform" in
+    ios) cp "$TARGET_DIR/aarch64-apple-ios/release/$LIB" "$STAGE/ios/$LIB" ;;
+    simulator) lipo -create "$TARGET_DIR/aarch64-apple-ios-sim/release/$LIB" "$TARGET_DIR/x86_64-apple-ios/release/$LIB" -output "$STAGE/simulator/$LIB" ;;
+    macos) lipo -create "$TARGET_DIR/aarch64-apple-darwin/release/$LIB" "$TARGET_DIR/x86_64-apple-darwin/release/$LIB" -output "$STAGE/macos/$LIB" ;;
+  esac
+  set -- "$@" -library "$STAGE/$platform/$LIB" -headers "$STAGE/headers"
+done
 
 cp "$ROOT/drivers/inillucent-driver-capi/include/inillucent_driver.h" "$STAGE/headers/"
 cat >"$STAGE/headers/module.modulemap" <<'EOF'
@@ -56,11 +74,8 @@ module InillucentFFI {
 }
 EOF
 
-xcodebuild -create-xcframework \
-  -library "$STAGE/ios/$LIB" -headers "$STAGE/headers" \
-  -library "$STAGE/simulator/$LIB" -headers "$STAGE/headers" \
-  -library "$STAGE/macos/$LIB" -headers "$STAGE/headers" \
-  -output "$OUT"
+# "$@" holds one -library and -headers pair for each platform built above.
+xcodebuild -create-xcframework "$@" -output "$OUT"
 
 echo "wrote $OUT"
 ls "$OUT"
