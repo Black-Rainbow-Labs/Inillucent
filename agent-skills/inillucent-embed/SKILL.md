@@ -1,6 +1,6 @@
 ---
 name: inillucent-embed
-description: Put inillucent inside an application. Covers the Rust driver, the C library, and the Python, Node, Go and PHP packages. Use when asked to add inillucent to a codebase, write or fix a language binding, or replace SQLite or another embedded database in an application.
+description: Put inillucent inside an application. Covers the Rust driver, the C library, the Python, Node, Go and PHP packages, and the Swift package and Android library for iOS and Android apps. Use when asked to add inillucent to a codebase, write or fix a language binding, or replace SQLite or another embedded database in an application.
 ---
 
 # Embedding inillucent in an application
@@ -29,8 +29,12 @@ release archive, has the full contract.
 | Node | `npm install inillucent` | loads the C library as a Node addon for `query()`, `exec`, `batch` and `open(db)`, in process. Other commands, and calls with `key` or `root`, start `inillucent --output json` or one `inillucent-mcp` process |
 | Go | `go get github.com/Black-Rainbow-Labs/Inillucent/packages/go/v2` | starts `inillucent --output json` and parses the JSON |
 | PHP | `composer require black-rainbow-labs/inillucent` | starts `inillucent --output json` and parses the JSON |
+| Swift on iOS and macOS | `packages/swift`, built from the repository | links the C library as a static library inside an XCFramework, in the app's process |
+| Kotlin and Java on Android | `packages/android`, built from the repository | links the C library and a JNI layer into one `libinillucent_jni.so` for each Android ABI, in the app's process |
 
-All four language packages are published at version 1.0.32. The Python wheel holds the C library
+The Swift package and the Android library are not on a package index yet. Build them from a checkout of the repository. `docs/mobile.md` covers both: what runs on a phone, the build, search, encryption and threads. `embed(TEXT)` is not built into either, so a phone app stores vectors its own model computed.
+
+All four desktop language packages are published at version 1.0.32. The Python wheel holds the C library
 and the four programs, so it needs no compiler.
 
 A package that starts the program gets JSON. A blob comes back as `{"blob": "<hex>"}`. An integer

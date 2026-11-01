@@ -50,6 +50,9 @@ flowchart TB
 | Kotlin and Java on Android | `packages/android` links the C library and a small JNI layer in C into one `libinillucent_jni.so` for each Android ABI, and the Kotlin classes call it. `packages/android/README.md` has the API. |
 | Swift on iOS and macOS | `packages/swift` links the C library as a static library inside an XCFramework, and Swift imports its header as the module `InillucentFFI`. `packages/swift/README.md` has the API. |
 
+[iOS and Android](../docs/mobile.md) covers both phone packages: what runs on a phone, the build,
+search, encryption and threads.
+
 The two routes return values in different forms.
 
 - A binding on the C library gets typed values. A blob is bytes. An integer is a 64 bit integer.

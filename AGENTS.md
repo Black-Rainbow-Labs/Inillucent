@@ -72,6 +72,7 @@ inillucent help migrate         # one command and every parameter it takes
 | How does its search compare with pgvector? | [`docs/retrieval-quality.md`](docs/retrieval-quality.md) |
 | How do I search by meaning or by keyword? | [`docs/vector-search.md`](docs/vector-search.md) |
 | How do I use it from Python, Node, Go, PHP or C? | [`drivers/README.md`](drivers/README.md) |
+| How do I use it in an iOS or Android app? | [`docs/mobile.md`](docs/mobile.md) |
 | How does the retrieval engine work? | [`docs/architecture.md`](docs/architecture.md) |
 | How does the SQL engine work? | [`docs/relational-architecture.md`](docs/relational-architecture.md) |
 | How do the two engines fit together? | [`docs/architecture-overview.md`](docs/architecture-overview.md) |

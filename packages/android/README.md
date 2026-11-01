@@ -131,6 +131,10 @@ It then checks that every native library it built is aligned to 16 KB, and copie
 record to `_agent_output/conformance/android.json`. It prints a line that ends in `; skipping` when
 the machine has no Android SDK, no emulator or no `x86_64` system image.
 
+On Windows, Git's `sh` puts its own `/usr/bin/link` ahead of the MSVC linker, and cargo fails to
+link its build scripts with `link: extra operand`. Set `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER`
+to the full path of the MSVC `link.exe` before you run the script.
+
 The emulator is an AVD named `inillucent_test`, made from the newest `x86_64` system image
 installed. Set `ANDROID_SERIAL` to run the tests on a device that is already running instead.
 `.github/workflows/mobile.yml` runs the same script on Linux.

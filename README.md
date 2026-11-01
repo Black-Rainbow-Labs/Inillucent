@@ -231,7 +231,8 @@ Python `query` and `run` functions, run the `inillucent` program and read its JS
 Python `Database` class calls the C library directly, which ships in each archive with its header.
 On a phone, the Android library in `packages/android` and the Swift package in `packages/swift`
 run the engine inside the app through the same C library. Both are built from this repository and
-are not on Maven Central or a Swift package index yet.
+are not on Maven Central or a Swift package index yet. [iOS and Android](docs/mobile.md) covers what
+runs on a phone, the build, search, encryption and threads.
 [The driver page](drivers/README.md) documents the C library for anyone writing a new binding. Client libraries for TypeScript, Rust, Java and C#
 are being built in [inillucent-clients](https://github.com/Black-Rainbow-Labs/inillucent-clients)
 and are not on a package registry yet.
