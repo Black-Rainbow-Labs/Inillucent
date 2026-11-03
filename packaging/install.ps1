@@ -47,6 +47,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 redraws its progress bar for every block it reads, which
+# makes a 27 MB download take minutes and look like the script has stopped.
+$ProgressPreference = 'SilentlyContinue'
+# Older Windows 10 installs of .NET Framework default to TLS 1.0, which the site
+# refuses. Add TLS 1.2 to whatever is already enabled.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
 if (-not $Prefix) { $Prefix = Join-Path $env:LOCALAPPDATA 'Programs\inillucent' }
 $binaries = Join-Path $Prefix 'bin'
 
@@ -122,6 +130,72 @@ function Get-LatestVersion {
     return ((Invoke-WebRequest -Uri "$BaseUrl/VERSION" -UseBasicParsing).Content).Trim()
 }
 
+function Get-Sha256 {
+    <#
+    .SYNOPSIS
+        Returns a file's SHA-256 as lowercase hex, using .NET directly.
+
+    .DESCRIPTION
+        Get-FileHash lives in a module, and Windows PowerShell 5.1 started from
+        PowerShell 7 or from a Command Prompt that PowerShell 7 opened inherits
+        PowerShell 7's module path and reports Get-FileHash as not found. The
+        .NET class is always there.
+
+    .PARAMETER Path
+        The file to hash.
+    #>
+    param([string] $Path)
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash($stream)
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+    return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLower()
+}
+
+function Expand-Zip {
+    <#
+    .SYNOPSIS
+        Unpacks a zip with .NET, for the same reason Get-Sha256 avoids Get-FileHash.
+
+    .PARAMETER Archive
+        The zip file.
+
+    .PARAMETER Destination
+        The directory to unpack into. It must not exist yet.
+    #>
+    param([string] $Archive, [string] $Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($Archive, $Destination)
+}
+
+function Assert-NotRunning {
+    <#
+    .SYNOPSIS
+        Stops with a clear message when a program from the install directory is running.
+
+    .DESCRIPTION
+        Windows will not delete a running .exe. An agent that registered
+        inillucent-mcp keeps it running, and an upgrade then failed halfway
+        through with "Access to the path is denied".
+
+    .PARAMETER Directory
+        The install directory.
+    #>
+    param([string] $Directory)
+    $prefixPath = [System.IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
+    $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and $_.Path.StartsWith($prefixPath, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($running.Count -gt 0) {
+        $names = ($running | ForEach-Object { "$($_.ProcessName) (pid $($_.Id))" }) -join ', '
+        throw "inillucent is running from $Directory, so it cannot be replaced: $names. Close the agent or terminal using it, or run: Stop-Process -Id $(($running | ForEach-Object { $_.Id }) -join ',')"
+    }
+}
+
 function Assert-Checksum {
     <#
     .SYNOPSIS
@@ -146,7 +220,7 @@ function Assert-Checksum {
         if ($fields.Count -ge 2 -and $fields[-1] -eq $name) { $expected = $fields[0].ToLower() }
     }
     if (-not $expected) { throw "SHA256SUMS does not list $name" }
-    $actual = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLower()
+    $actual = Get-Sha256 -Path $Archive
     if ($actual -ne $expected) {
         throw "$name does not match its published checksum.`n  expected $expected`n  got      $actual"
     }
@@ -155,6 +229,7 @@ function Assert-Checksum {
 
 if ($Uninstall) {
     if (Test-Path -LiteralPath $Prefix) {
+        Assert-NotRunning -Directory $Prefix
         Remove-Item -LiteralPath $Prefix -Recurse -Force -Confirm:$false
         Write-Host "removed $Prefix"
     } else {
@@ -191,20 +266,23 @@ try {
         $base = $BaseUrl.TrimEnd('/')
         $archive = Join-Path $temporary "inillucent-$Version-$target.zip"
         Write-Host "downloading inillucent $Version for $target..."
-        Invoke-WebRequest -Uri "$base/inillucent-$Version-$target.zip" -OutFile $archive
+        Invoke-WebRequest -Uri "$base/inillucent-$Version-$target.zip" -OutFile $archive -UseBasicParsing
         $sums = (Invoke-WebRequest -Uri "$base/SHA256SUMS" -UseBasicParsing).Content
         Assert-Checksum -Archive $archive -Sums $sums
     }
 
     $unpacked = Join-Path $temporary 'unpacked'
-    Expand-Archive -LiteralPath $archive -DestinationPath $unpacked -Force
+    Expand-Zip -Archive $archive -Destination $unpacked
     # The archive holds one directory named after the release; the layout under
     # it is what gets installed, so the prefix does not gain a version in its
     # path and an upgrade replaces rather than accumulating.
     $inner = Get-ChildItem -Path $unpacked -Directory | Select-Object -First 1
     if (-not $inner) { throw 'the archive is not shaped as expected: no directory inside it' }
 
-    if (Test-Path -LiteralPath $Prefix) { Remove-Item -LiteralPath $Prefix -Recurse -Force -Confirm:$false }
+    if (Test-Path -LiteralPath $Prefix) {
+        Assert-NotRunning -Directory $Prefix
+        Remove-Item -LiteralPath $Prefix -Recurse -Force -Confirm:$false
+    }
     New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
     Copy-Item -Path (Join-Path $inner.FullName '*') -Destination $Prefix -Recurse -Force
 

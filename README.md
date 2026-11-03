@@ -50,10 +50,10 @@ repository are listed in [docs/README.md](docs/README.md). Good places to start:
 
 ## Install
 
-**Windows**
+**Windows**, in PowerShell or Command Prompt
 
-```powershell
-irm https://inillucent.com/downloads/install.ps1 | iex
+```bat
+powershell -ExecutionPolicy ByPass -c "irm https://inillucent.com/downloads/install.ps1 | iex"
 ```
 
 **macOS and Linux**
