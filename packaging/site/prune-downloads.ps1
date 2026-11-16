@@ -52,7 +52,9 @@ function Invoke-SiteDownloadsPrune {
     param([string] $SitePath, [string] $Version, [bool] $WhatIf)
     $script = Get-SitePruneScript -SitePath $SitePath
     $downloads = Join-Path $SitePath 'public/downloads'
-    $arguments = @($script, '--site-dir', $SitePath, '--keep', (Get-SitePruneKeep -Downloads $downloads -Version $Version))
+    # --current counts this release as the newest version even before its files are staged, which
+    # is the case under ship.ps1 -WhatIf, so the preview deletes what the release will.
+    $arguments = @($script, '--site-dir', $SitePath, '--current', $Version)
     if ($WhatIf) { $arguments += '--dry-run' }
     $sumsBefore = Get-FileText -Path (Join-Path $downloads 'SHA256SUMS')
     & node @arguments
@@ -65,30 +67,6 @@ function Invoke-SiteDownloadsPrune {
     $problem = Test-SiteSums -Downloads $downloads
     if ($problem) { throw $problem }
     Write-Host '   SHA256SUMS matches every file it names in public/downloads'
-}
-
-function Get-SitePruneKeep {
-    <#
-    .SYNOPSIS
-        How many versions the prune keeps: 4, or 3 when this release is not in the folder yet.
-
-    .DESCRIPTION
-        The prune counts the versions it finds in the folder. Under `ship.ps1 -WhatIf` nothing has
-        been staged, so the release being cut is not among them, and keeping 4 would show a
-        preview that deletes one version fewer than the release will. Keeping 3 of what is there
-        leaves room for the one about to be staged, so the preview and the release agree.
-
-    .PARAMETER Downloads
-        The site's `public/downloads` folder.
-
-    .PARAMETER Version
-        The version being released.
-    #>
-    param([string] $Downloads, [string] $Version)
-    $staged = @(Get-ChildItem -LiteralPath $Downloads -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match "(^|[-_.])$([regex]::Escape($Version))([-_.]|$)" })
-    if ($staged.Count -gt 0) { return '4' }
-    return '3'
 }
 
 function Get-FileText {

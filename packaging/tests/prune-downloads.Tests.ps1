@@ -4,8 +4,8 @@
 
 .DESCRIPTION
     `packaging/site/prune-downloads.ps1` runs the sites repository's prune and then checks
-    `SHA256SUMS` against the files left. These cases cover the two decisions it makes without the
-    sites repository: how many versions to keep, and whether `SHA256SUMS` still matches.
+    `SHA256SUMS` against the files left. These cases cover that check, which needs no sites
+    repository.
 
     Written for Pester 3.4, the version Windows ships:
 
@@ -30,24 +30,6 @@ function New-DownloadsFixture {
     }
     Set-Content -LiteralPath (Join-Path $folder 'SHA256SUMS') -Value $lines
     return $folder
-}
-
-Describe 'Get-SitePruneKeep' {
-    $folder = New-DownloadsFixture
-
-    It 'keeps 4 when the release being cut is already staged' {
-        Get-SitePruneKeep -Downloads $folder -Version '2.10.0' | Should Be '4'
-    }
-
-    It 'keeps 3 when it is not, so a -WhatIf preview deletes what the release will' {
-        Get-SitePruneKeep -Downloads $folder -Version '2.11.0' | Should Be '3'
-    }
-
-    It 'does not read 2.1.0 as staged because 2.10.0 is' {
-        Get-SitePruneKeep -Downloads $folder -Version '2.1.0' | Should Be '3'
-    }
-
-    Remove-Item -LiteralPath $folder -Recurse -Force -Confirm:$false
 }
 
 Describe 'Test-SiteSums' {
