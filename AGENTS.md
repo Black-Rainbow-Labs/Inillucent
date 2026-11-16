@@ -491,9 +491,9 @@ packaging/tests`.
 | `linux-packages` | the `.deb` and the `.rpm` |
 | `signature` | the minisign signature over `SHA256SUMS` |
 | `tag` | the commit, the tag and the push to `origin` |
-| `github` | the GitHub release with every asset |
+| `github` | the GitHub release with every asset, then deletes the earlier versions in `dist/` that GitHub holds |
 | `interop` | `tests/interop/<version>`, built by the binary this release publishes |
-| `site` | inillucent.com: the files, then the links |
+| `site` | inillucent.com: the files, then the links. The downloads folder keeps this release, the three before it, and the linked one |
 | `crates` | crates.io |
 | `npm` | the npm wrapper and its four platform packages |
 | `web` | `inillucent-wasm` on npm, only when `wasm` built and passed the module in the same run |

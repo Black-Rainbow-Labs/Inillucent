@@ -51,6 +51,19 @@ $count = @(Get-ChildItem -Path $exported -File -ErrorAction SilentlyContinue).Co
 if ($count -lt 1) { throw "$exported is empty after the build, so nothing would be served." }
 Write-Host "  $count files in out/downloads"
 
+# **And it carries nothing else (task-2722).** The release prunes public/downloads to four releases,
+# and an export that kept the old files in out/downloads would still upload every installer ever
+# made. The sites build empties the old ones out; this checks it did, by name.
+$public = @(Get-ChildItem -LiteralPath (Join-Path $SitePath 'public/downloads') -File | ForEach-Object { $_.Name } | Sort-Object)
+$out = @(Get-ChildItem -LiteralPath $exported -File | ForEach-Object { $_.Name } | Sort-Object)
+$difference = @(Compare-Object -ReferenceObject $public -DifferenceObject $out)
+if ($difference.Count -gt 0) {
+    $extra = @($difference | Where-Object { $_.SideIndicator -eq '=>' } | ForEach-Object { $_.InputObject })
+    $lost = @($difference | Where-Object { $_.SideIndicator -eq '<=' } | ForEach-Object { $_.InputObject })
+    throw "out/downloads does not match public/downloads. Only in out: $($extra -join ', '). Only in public: $($lost -join ', ')."
+}
+Write-Host '  out/downloads names the same files as public/downloads'
+
 Write-Host "deploying with $deploy"
 & node $deploy inillucent --skip-build
 if ($LASTEXITCODE -ne 0) { throw "tools/deploy.mjs failed with $LASTEXITCODE. The site is built; run 'node $deploy inillucent --skip-build' again." }

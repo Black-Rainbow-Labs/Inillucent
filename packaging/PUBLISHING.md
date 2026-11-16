@@ -155,7 +155,8 @@ current build, which checks that the engine still reads files written by each ea
 `ship.ps1` route: `site`.
 
 ```powershell
-pwsh packaging/publish-site.ps1 -Version 1.0.30 -Stage   # copy the files, link nothing
+pwsh packaging/publish-site.ps1 -Version 1.0.30 -Stage   # copy the files, prune old ones, link nothing
+pwsh packaging/publish-site.ps1 -Version 1.0.30 -Stage -WhatIf   # print what the prune would delete
 pwsh packaging/publish-site.ps1 -Version 1.0.30 -Link    # add the download links
 pwsh packaging/deploy-site.ps1                           # build the site and restart it
 ```
@@ -166,9 +167,29 @@ formula, the Go `cmd/inillucent-install` and the PHP `bin/inillucent-install` al
 
 - `-Stage` copies the archives, `SHA256SUMS`, its signature, the public key and `VERSION` into the
   site checkout's `public/downloads/`. The files can then be downloaded, and no page links to them.
+- `-Stage` then deletes old installers from `public/downloads/`. It keeps this release, the three
+  releases before it, and the release `src/data/content.ts` links. Files with no version in their
+  name, such as `SHA256SUMS`, `VERSION` and `install.sh`, are never deleted. The prune is
+  `sites/scripts/prune-downloads.mjs` in the sites repository, called through
+  `packaging/site/prune-downloads.ps1`. Afterwards every line of `SHA256SUMS` is checked against the
+  file it names. If the prune rewrote `SHA256SUMS`, `sign-sums.ps1` signs it again with the release
+  key.
 - `-Link` rewrites the download section of the site so the links appear.
 - `deploy-site.ps1` builds the site's static export and restarts the service that serves it.
-  `public/downloads/` is not in git, so the files reach the live site only through that build.
+  `public/downloads/` is not in git, so the files reach the live site only through that build. It
+  fails when `out/downloads/` and `public/downloads/` do not name the same files, so a pruned
+  installer cannot stay in the export.
+
+`ship.ps1 -WhatIf` prints what the prune would delete from `public/downloads/`.
+
+## dist/
+
+`release-all.ps1` writes every artifact into `dist/` and never removes one. After the `github`
+route publishes, `ship.ps1` deletes the `dist/` entries of earlier versions whose GitHub release
+lists them, together with their staging folders and the notary's `-apple-darwin.zip`. This
+release's files stay, so a rerun with `-Only` still has them. An earlier version that GitHub has no
+release for is kept and named. `ship.ps1 -WhatIf` prints what would be deleted.
+`packaging/dist-prune.ps1` has the rules, and `packaging/tests/dist-prune.Tests.ps1` has the cases.
 
 Staging before linking lets `verify-macos.sh` run against the published bytes before any reader can
 find them.

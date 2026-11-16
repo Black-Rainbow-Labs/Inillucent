@@ -12,7 +12,9 @@
 
         -Stage   copies the artifacts, SHA256SUMS, its signature, the public key
                  and VERSION into the site's downloads directory. The files are
-                 then fetchable, but nothing on the site links to them.
+                 then fetchable, but nothing on the site links to them. It then
+                 deletes the installers older than the three releases before this
+                 one (packaging/site/prune-downloads.ps1).
         -Link    rewrites the download section of the site's content so the
                  links appear.
 
@@ -30,6 +32,9 @@
 .PARAMETER Link
     Rewrite the site's download entries to point at this version.
 
+.PARAMETER WhatIf
+    Copy and rewrite nothing. With -Stage, print what the downloads prune would delete.
+
 .PARAMETER SitePath
     The site folder. Defaults to `black-rainbow-labs-sites/sites/inillucent` beside this repository
     (task-2128 moved the site there).
@@ -44,7 +49,8 @@ param(
     [string] $Version,
     [switch] $Stage,
     [switch] $Link,
-    [string] $SitePath
+    [string] $SitePath,
+    [switch] $WhatIf
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +84,7 @@ if (-not (Test-Path -LiteralPath $SitePath)) {
 }
 
 $dist = Join-Path $root 'dist'
+. (Join-Path $PSScriptRoot 'site/prune-downloads.ps1')
 $downloads = Join-Path $SitePath 'public/downloads'
 
 # What the site serves, and the label the download section shows for each. A
@@ -109,6 +116,15 @@ function Get-Sha256 {
     #>
     param([string] $Path)
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+}
+
+if ($WhatIf) {
+    if ($Stage) {
+        Write-Host "would stage inillucent $Version into $downloads, then prune it:"
+        Invoke-SiteDownloadsPrune -SitePath $SitePath -Version $Version -WhatIf $true
+    }
+    if ($Link) { Write-Host "would link inillucent $Version in $(Join-Path $SitePath 'src/data/content.ts')" }
+    return
 }
 
 if ($Stage) {
@@ -188,6 +204,15 @@ if ($Stage) {
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'macos/verify-macos.sh') -Destination $downloads -Force
     Write-Host '  verify-macos.sh'
+
+    # **The folder keeps four releases (task-2722).** Nothing removed an old installer, and the
+    # folder reached 11.9 GB, doubled again by the static export in out/downloads. The prune runs
+    # here, in the step that adds a release, so the folder cannot grow between releases. It keeps
+    # this version, the three before it and the version content.ts links, and it leaves every file
+    # with no version in its name alone.
+    Write-Host ''
+    Write-Host 'pruning installers older than the three releases before this one'
+    Invoke-SiteDownloadsPrune -SitePath $SitePath -Version $Version -WhatIf $false
 
     if ($missing.Count -gt 0) {
         Write-Host ''

@@ -247,8 +247,10 @@ tagged and left half published for four days, with its GitHub release still a dr
 | `macos/release-macos.ps1` | Builds, signs and notarises the macOS half |
 | `linux/package-linux.ps1` | Builds the `.deb` and `.rpm` files with `nfpm` and signs them |
 | `sign-sums.ps1` | Signs `SHA256SUMS` with minisign |
+| `dist-prune.ps1` | Which `dist/` entries of earlier versions GitHub already holds. `ship.ps1` deletes them after the `github` route. `tests/dist-prune.Tests.ps1` tests it |
+| `site/prune-downloads.ps1` | Runs the sites repository's downloads prune from `publish-site.ps1 -Stage` and `ship.ps1 -WhatIf`, then checks `SHA256SUMS` against the files left |
 | `mirror-github.ps1` | No longer called by `ship.ps1`. Only checks old release tags with `-Verify` |
-| `publish-site.ps1` | `-Stage` copies the downloads to the site, `-Link` adds the links |
+| `publish-site.ps1` | `-Stage` copies the downloads to the site and prunes them to four releases, `-Link` adds the links |
 | `deploy-site.ps1` | Builds the site and deploys it to Cloudflare and the `brl-sites` origin with `tools/deploy.mjs` from the `black-rainbow-labs-sites` repository |
 | `cargo-publish.ps1` | Publishes the workspace to crates.io. Without `-Execute` it is a dry run |
 | `homebrew/update.sh` | Writes the formula with the checksums from `dist/SHA256SUMS` |

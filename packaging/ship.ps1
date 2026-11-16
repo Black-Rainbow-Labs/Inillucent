@@ -139,6 +139,8 @@ Enter-ProcessorShare
 . (Join-Path $PSScriptRoot 'site/install-page.ps1')
 . (Join-Path $PSScriptRoot 'github-token.ps1')
 . (Join-Path $PSScriptRoot 'ci-evidence.ps1')
+. (Join-Path $PSScriptRoot 'dist-prune.ps1')
+. (Join-Path $PSScriptRoot 'site/prune-downloads.ps1')
 # The DPAPI sealing helpers live in apple-credentials.ps1 because that is where sealing was first
 # needed. Nothing about `Protect-AppleSecret` is Apple-specific: it is `ConvertFrom-SecureString`,
 # which encrypts under one Windows account, and the project's minisign and OpenPGP keys want exactly
@@ -1549,6 +1551,34 @@ function Test-Registry {
     }
 }
 
+function Invoke-ReleaseCleanupPreview {
+    <#
+    .SYNOPSIS
+        Under -WhatIf, prints what the release would delete: old installers in the site's downloads
+        and earlier releases in dist/ that GitHub already holds.
+
+    .DESCRIPTION
+        Both deletions happen in a real run, in the site route and after the GitHub route. A plan
+        that left them out would not say what the release does, so -WhatIf asks the same two
+        questions and deletes nothing. A lookup that fails keeps the entry, so a preview without
+        `gh` or the site checkout shows less, never more.
+
+    .PARAMETER Version
+        The version being released.
+    #>
+    param([string] $Version)
+    Write-Phase 'site downloads (preview)'
+    if (Test-Path -LiteralPath $script:SitePath) {
+        Invoke-SiteDownloadsPrune -SitePath $script:SitePath -Version $Version -WhatIf $true
+    } else {
+        Write-Host "   $script:SitePath does not exist, so there is nothing to prune"
+    }
+    Write-Phase 'dist (preview)'
+    $null = Invoke-DistPrune -Dist $script:Dist -Version $Version -WhatIf $true -ReleaseAssets {
+        param($v) Get-GitHubReleaseAssets -Version $v -Repo (Get-PublicRepo)
+    }
+}
+
 # ---------------------------------------------------------------------------
 # The release.
 # ---------------------------------------------------------------------------
@@ -1607,6 +1637,7 @@ $script:TestNote = Invoke-ReleaseTests -Root $root -Skip ([bool]$SkipTests) -Wha
 if ($WhatIf) {
     Write-Phase 'version'
     Set-ReleaseVersion -Version $Version -Previous $current
+    Invoke-ReleaseCleanupPreview -Version $Version
     Remove-SigningSecrets
     Write-Host ''
     Write-Host 'nothing was written.' -ForegroundColor Yellow
@@ -1635,6 +1666,18 @@ foreach ($entry in $plan) {
     } catch {
         $script:Outcomes[$route.Name] = @{ State = 'failed'; Why = $_.Exception.Message }
         Write-Warning "$($route.Name): $($_.Exception.Message)"
+    }
+}
+
+# **dist/ keeps one release (task-2722).** release-all.ps1 never removes an artifact, so every
+# release added about 600 MB beside the last. Only after the GitHub route has published, because the
+# GitHub release is the copy that is kept, and only the earlier versions GitHub lists: this
+# release's own files stay for an -Only rerun. Before Remove-SigningSecrets, which clears the GH_TOKEN
+# the lookup needs.
+if ($script:Outcomes['github'] -and $script:Outcomes['github'].State -eq 'published') {
+    Write-Phase 'dist'
+    $null = Invoke-DistPrune -Dist $script:Dist -Version $Version -WhatIf $false -ReleaseAssets {
+        param($v) Get-GitHubReleaseAssets -Version $v -Repo (Get-PublicRepo)
     }
 }
 
