@@ -508,11 +508,33 @@ pub(crate) fn build_probed_outer<'t>(
         .get(..end)
         .map(<[StaticType]>::to_vec)
         .unwrap_or_else(|| space.types.to_vec());
-    let translated = translate_scan(condition, space, params)?;
-    let test = compile(&translated, &joined_types)?;
+    // **The `ON` is compiled by `join_condition`, which answers its correlated
+    // subqueries.** This used to translate the `ON` directly, which reads a
+    // subquery's value from the operator above every join, and the probe has no
+    // column for it there: `t1 LEFT JOIN t2 ON EXISTS (SELECT 1 FROM u WHERE
+    // u.k = t1.a)` was refused as "a correlated subquery used as a value" when
+    // `t2` was read through an index, and ran when it was scanned. So each
+    // joined row the probe finds gets its answers appended, as a nested loop
+    // join's pair does, before the `ON` is tested.
+    let (test, correlated) =
+        join_condition(Some(condition), catalog, space, params, &joined_types)?;
+    // Unreachable while an `ON` is passed in; named apart from the check above
+    // so a report says which step lost the condition.
+    let test = test.ok_or_else(|| misuse("a probed left join's ON compiled to no test"))?;
     let found = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let collect = Box::new(CollectInto::new(std::rc::Rc::clone(&found)));
-    let mut probe: Box<dyn Sink + 't> = Box::new(crate::ops::Filter::new(test, collect));
+    let mut probe: Box<dyn Sink + 't> = if correlated.is_empty() {
+        Box::new(crate::ops::Filter::new(test, collect))
+    } else {
+        Box::new(
+            super::chain::HeldBefore::new(std::rc::Rc::from(test), collect).with_correlations(
+                correlated,
+                catalog,
+                params,
+                joined_types.len(),
+            ),
+        )
+    };
     for index in (first..=last).rev() {
         let stage = stages
             .get(index)

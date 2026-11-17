@@ -1875,6 +1875,9 @@ fn rows_entering_term(
 ///
 /// [`Filter`] owns a `'static` sink, and a join reads trees it borrows, so the
 /// filter that goes in front of a `RIGHT` or `FULL` join cannot be one.
+///
+/// `build_probed_outer` uses it too, as the `ON` test inside a probed left
+/// join, when that `ON` holds a subquery that reads the joined row.
 pub(crate) struct HeldBefore<'t> {
     /// The compiled terms, over the rows entering the join.
     predicate: std::rc::Rc<dyn crate::expr::Eval>,
