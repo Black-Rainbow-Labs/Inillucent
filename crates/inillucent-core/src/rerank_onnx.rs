@@ -145,10 +145,13 @@ impl OnnxReranker {
             .fetch_add(lengths.iter().sum::<usize>(), Ordering::Relaxed);
 
         let mut scores = vec![0f32; passages.len()];
+        // Padding stays allowed here: nothing promises that a score from a batch equals the score
+        // `rerank()` gives one pair, byte for byte, as `embed` promises for a vector.
         for batch in plan_batches(
             &lengths,
             self.options.batch_size,
             self.options.max_batch_cells,
+            false,
         ) {
             let logits = self.run_batch(&batch, &encodings)?;
             for (slot, logit) in batch.iter().zip(logits) {

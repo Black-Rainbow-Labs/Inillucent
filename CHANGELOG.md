@@ -8,6 +8,17 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## Unreleased
+
+**`inillucent embed` on the processor writes the same bytes as `embed()` again.** On an Apple M4 Pro,
+114 of 295 vectors the command wrote at the default batch size differed from `embed(prefix || text)`
+in their last bits, though [Embeddings](docs/embeddings.md#embedding-a-whole-table) promised they
+were equal byte for byte. The command padded the shorter texts in a batch to the longest one, and
+on that processor a padded text rounds differently from the same text alone. On the processor a
+batch now holds only texts with the same number of tokens, so nothing is padded. The 2,661 passages
+of the example corpus took 339 s and 295 s that way, against 358 s and 319 s before. A graphics
+card still pads. The test that checks the promise had only run on the Windows development machine.
+
 ## 2.10.0, 1 November 2026
 
 This release runs inillucent in a web page. The engine compiles to WebAssembly for the

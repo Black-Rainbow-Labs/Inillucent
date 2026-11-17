@@ -363,3 +363,14 @@ held_by = [
   "inillucent-compat::new_engine_long_keys::three_keys_of_seventeen_thousand_bytes_inserted_small_large_large",
   "inillucent-compat::long_keys_at_every_page_size::a_thousand_keys_of_twenty_kilobytes_are_stored_found_and_given_back",
 ]
+
+[[escape]]
+ref = "2.10.0, inillucent embed on Apple silicon"
+surface = "inillucent embed, batching on the processor"
+what = "on an Apple M4 Pro, 72 of 100 vectors `inillucent embed` wrote at the default batch size differed from `embed(prefix || text)` in their last bits, by a cosine distance of at most 4e-13, and 114 of 295 sampled from the example corpus, though docs/embeddings.md promised them equal byte for byte. A batch padded its shorter texts to the longest, and on that processor a padded text rounds differently from the same text alone"
+found_by = "running the bulk embedding suite on a Mac; CI declares `embed` absent on every runner, so the suite had only run on the Windows development machine, where the vectors it measured matched. The two tests that need the model can fail only where the weights are installed and padding moves a bit, such as an arm64 Mac; the planner test fails on any machine if the planner stops splitting batches by token count"
+held_by = [
+  "inillucent-core::lib::on_the_processor_a_batched_vector_equals_the_text_alone_byte_for_byte",
+  "inillucent-core::lib::a_processor_batch_holds_texts_of_one_token_count",
+  "inillucent-compat::bulk_embed::a_bulk_vector_equals_embed_byte_for_byte_on_the_processor",
+]

@@ -522,11 +522,21 @@ impl OnnxEmbedder {
                 .fetch_add(lengths.iter().sum::<usize>(), Relaxed);
         }
 
+        // On the processor a batch holds texts of one token count only, so nothing is padded. A
+        // padded row is the same vector to within rounding, not the same bytes: on an Apple M4 Pro
+        // with ONNX Runtime 1.22.0, 114 of 295 passages embedded 16 to a padded batch differed from
+        // `embed()` in their low bits. Batched without padding, none differed there, and the 2,661
+        // passages of the example corpus ran slightly faster (339 s against 358 s). The test
+        // `on_the_processor_a_batched_vector_equals_the_text_alone_byte_for_byte` checks the
+        // equality on any machine with the weights. A card is left to pad, because its speed
+        // comes from full batches and it is promised only a cosine similarity of 0.99999.
+        let same_length = self.options.device == Device::Cpu;
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
         for batch in plan_batches(
             &lengths,
             self.options.batch_size,
             self.options.max_batch_cells,
+            same_length,
         ) {
             self.run_group(&batch, &encodings, &mut out)?;
         }
@@ -560,16 +570,15 @@ impl OnnxEmbedder {
         Ok(())
     }
 
-    /// Tokenizes and runs one batch with no length grouping. Kept for the tests,
-    /// which hand it a handful of short strings where grouping changes nothing.
+    /// Tokenizes and runs the texts as one batch, padded to the longest of them.
     ///
-    /// Nothing calls it today. It stays because it is the one path that runs the
-    /// model without the length grouping, so a test that suspects the grouping
-    /// has something to compare against; `allow` rather than deletion says that
-    /// deliberately.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn run_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// On the processor `embed_prefixed_counted` never pads, so this is how a
+    /// test that checks the attention mask still puts a short text in a padded
+    /// batch, as a card does. The tests here and the model arms' tests in
+    /// `inillucent-bench` call it; nothing else should.
+    /// @param texts - the texts, with any task prefix already on them
+    #[doc(hidden)]
+    pub fn embed_padded_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), true)
@@ -1124,13 +1133,19 @@ fn empty_cache_tensor(input: &ort::value::Outlet, batch: usize) -> Result<Value>
 /// A batch that would exceed the cell budget is closed early. A single text that
 /// exceeds it on its own is still run: refusing it would drop a chunk from the
 /// corpus, and one long sequence alone is the smallest that allocation can be.
+///
+/// With `same_length`, a batch is also closed where the token count changes, so
+/// no text in it is padded. A padded row is computed over a wider tensor than the
+/// same text alone, and on some processors that changes the low bits of the sums.
 /// @param lengths - token count per text, already truncated to the model bound
 /// @param batch_size - most texts in one batch
 /// @param max_cells - ceiling on `texts in the batch x longest, squared`
+/// @param same_length - whether every text in a batch must have the same token count
 pub(crate) fn plan_batches(
     lengths: &[usize],
     batch_size: usize,
     max_cells: usize,
+    same_length: bool,
 ) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..lengths.len()).collect();
     order.sort_by_key(|&i| lengths.get(i).copied().unwrap_or(0));
@@ -1139,16 +1154,20 @@ pub(crate) fn plan_batches(
     let mut batch: Vec<usize> = Vec::with_capacity(batch_size.max(1));
     let mut widest = 0usize;
     for &i in &order {
-        let width = widest.max(lengths.get(i).copied().unwrap_or(0));
+        let length = lengths.get(i).copied().unwrap_or(0);
+        let width = widest.max(length);
         let cells = (batch.len() + 1)
             .saturating_mul(width)
             .saturating_mul(width);
-        let full = batch.len() >= batch_size.max(1) || (!batch.is_empty() && cells > max_cells);
+        // `order` is sorted by length, so a batch of one length ends where the length changes.
+        let new_length = same_length && length != widest;
+        let full = !batch.is_empty()
+            && (batch.len() >= batch_size.max(1) || cells > max_cells || new_length);
         if full {
             batches.push(std::mem::take(&mut batch));
             widest = 0;
         }
-        widest = widest.max(lengths.get(i).copied().unwrap_or(0));
+        widest = widest.max(length);
         batch.push(i);
     }
     if !batch.is_empty() {
@@ -1469,15 +1488,54 @@ mod tests {
         }
     }
 
+    /// On the processor a vector from a batch is the vector of the same text alone, byte for byte.
+    ///
+    /// The 40 texts have ten token counts, four texts to each, so at the default batch size a
+    /// batch holds several texts. Before a processor batch was limited to one token count, the
+    /// shorter texts in a batch were padded, and on an Apple M4 Pro with ONNX Runtime 1.22.0 this
+    /// failed with 20 of the 40 vectors different from the text alone in their low bits.
+    #[test]
+    fn on_the_processor_a_batched_vector_equals_the_text_alone_byte_for_byte() {
+        let e = embedder_or_skip!(OnnxOptions::default());
+        let texts: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    "note {} {}",
+                    i % 4,
+                    "cats sleep on warm mats. ".repeat(i / 4 + 1)
+                )
+            })
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        let batched = e.embed_documents(&texts).unwrap();
+        assert_eq!(batched.len(), texts.len());
+        let different: Vec<usize> = texts
+            .iter()
+            .enumerate()
+            .filter(|(i, text)| {
+                let alone = e.embed_documents(std::slice::from_ref(*text)).unwrap();
+                bits(&batched[*i]) != bits(&alone[0])
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            different,
+            Vec::<usize>::new(),
+            "these texts embedded in a batch differ from the text alone"
+        );
+    }
+
     /// Padding shorter texts up to the longest in the batch must not leak into
-    /// the pooled vector, which is what the attention mask is for.
+    /// the pooled vector, which is what the attention mask is for. A card still
+    /// pads, and on the processor `embed_documents` no longer does, so the
+    /// padded batch is built with `embed_padded_batch`.
     #[test]
     fn a_short_text_is_unaffected_by_a_long_one_in_the_same_batch() {
         let e = embedder_or_skip!(OnnxOptions::default());
         let short = "offer".to_string();
         let long = "offer ".repeat(200);
-        let together = e.embed_documents(&[short.clone(), long]).unwrap();
-        let alone = e.embed_documents(&[short]).unwrap();
+        let together = e.embed_padded_batch(&[short.clone(), long]).unwrap();
+        let alone = e.embed_padded_batch(&[short]).unwrap();
         let agreement = dot(&together[0], &alone[0]);
         assert!(
             agreement > 0.9999,
@@ -1669,7 +1727,7 @@ mod tests {
 
     /// Last-token pooling has to find the last position the mask admits, not the
     /// last column of the padded tensor, or every short text in a batch with a
-    /// long one would be pooled from padding.
+    /// long one would be pooled from padding. `embed_padded_batch` pads on the processor.
     #[test]
     fn last_token_pooling_ignores_the_padding_a_longer_text_added() {
         let e = embedder_or_skip!(OnnxOptions::for_model(&ModelManifest {
@@ -1678,8 +1736,8 @@ mod tests {
         }));
         let short = "offer".to_string();
         let long = "offer eligibility rules ".repeat(60);
-        let together = e.embed_documents(&[short.clone(), long]).unwrap();
-        let alone = e.embed_documents(&[short]).unwrap();
+        let together = e.embed_padded_batch(&[short.clone(), long]).unwrap();
+        let alone = e.embed_padded_batch(&[short]).unwrap();
         let agreement = dot(&together[0], &alone[0]);
         assert!(
             agreement > 0.9999,
@@ -1776,7 +1834,7 @@ mod tests {
     fn batches_respect_the_count_and_the_attention_budget() {
         // Long sequences: the cell budget binds long before the count does.
         let lengths = vec![1900usize; 64];
-        let batches = plan_batches(&lengths, 64, 24_000_000);
+        let batches = plan_batches(&lengths, 64, 24_000_000, false);
         assert!(
             batches.len() > 1,
             "64 sequences of 1900 tokens must not be one batch"
@@ -1789,7 +1847,7 @@ mod tests {
 
         // Short sequences: the count binds and the budget never does.
         let short = vec![8usize; 500];
-        let batches = plan_batches(&short, 16, 24_000_000);
+        let batches = plan_batches(&short, 16, 24_000_000, false);
         assert_eq!(batches.len(), 500 / 16 + usize::from(500 % 16 != 0));
         assert!(batches.iter().all(|b| b.len() <= 16));
     }
@@ -1799,7 +1857,7 @@ mod tests {
     #[test]
     fn every_text_lands_in_exactly_one_batch() {
         let lengths: Vec<usize> = (0..311).map(|i| 1 + (i * 37) % 2000).collect();
-        let batches = plan_batches(&lengths, 32, 24_000_000);
+        let batches = plan_batches(&lengths, 32, 24_000_000, false);
         let mut seen: Vec<usize> = batches.iter().flatten().copied().collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..lengths.len()).collect::<Vec<_>>());
@@ -1809,7 +1867,7 @@ mod tests {
     /// refusing it would silently remove a chunk from the corpus.
     #[test]
     fn one_oversized_text_is_still_given_a_batch() {
-        let batches = plan_batches(&[4000], 32, 1_000);
+        let batches = plan_batches(&[4000], 32, 1_000, false);
         assert_eq!(batches, vec![vec![0]]);
     }
 
@@ -1818,7 +1876,7 @@ mod tests {
     #[test]
     fn batches_group_texts_of_a_similar_length() {
         let lengths = vec![1000, 5, 1000, 5, 1000, 5];
-        let batches = plan_batches(&lengths, 3, usize::MAX);
+        let batches = plan_batches(&lengths, 3, usize::MAX, false);
         for b in &batches {
             let widths: Vec<usize> = b.iter().map(|&i| lengths[i]).collect();
             assert!(
@@ -1826,6 +1884,37 @@ mod tests {
                 "mixed lengths in one batch: {widths:?}"
             );
         }
+    }
+
+    /// On the processor no text in a batch is padded: every batch holds one token count, and texts
+    /// that share a count still share a batch up to the batch size. Without the rule the same
+    /// lengths are packed 16 to a batch with mixed counts, which is the padding that moved a
+    /// vector's low bits.
+    #[test]
+    fn a_processor_batch_holds_texts_of_one_token_count() {
+        // 23 token counts, 8 or 9 texts with each.
+        let lengths: Vec<usize> = (0..200).map(|i| 10 + (i * 7) % 23).collect();
+        let mixed = plan_batches(&lengths, 16, usize::MAX, false);
+        assert!(
+            mixed
+                .iter()
+                .any(|b| b.iter().any(|&i| lengths[i] != lengths[b[0]])),
+            "the lengths are meant to pad when the rule is off"
+        );
+
+        let batches = plan_batches(&lengths, 16, usize::MAX, true);
+        for b in &batches {
+            let widths: Vec<usize> = b.iter().map(|&i| lengths[i]).collect();
+            assert!(
+                widths.iter().all(|w| *w == widths[0]),
+                "mixed token counts in one batch: {widths:?}"
+            );
+            assert!(b.len() <= 16);
+        }
+        assert_eq!(batches.len(), 23, "one batch for each token count");
+        let mut seen: Vec<usize> = batches.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..lengths.len()).collect::<Vec<_>>());
     }
 
     /// `cuda:N` is how a caller names a card, and a name that is not a device has to
