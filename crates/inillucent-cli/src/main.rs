@@ -504,7 +504,7 @@ fn run() {
         eprintln!("Error: {message}");
         std::process::exit(1);
     }
-    let mut shell = match Shell::open_following(&invocation.path, invocation.readonly) {
+    let mut shell = match Shell::open_as(&invocation.path, invocation.readonly) {
         Ok(shell) => shell,
         Err(message) => {
             eprintln!(

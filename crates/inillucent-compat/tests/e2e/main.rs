@@ -35,4 +35,5 @@ mod release_format;
 mod setup_embeddings;
 mod shell_command_line;
 mod shell_output;
+mod shell_read_only;
 mod sqlite_dump_load;

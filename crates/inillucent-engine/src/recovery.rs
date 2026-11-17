@@ -982,15 +982,25 @@ pub(crate) fn resync_file(
     // `Database::with_writer_slot`.
     database
         .with_writer_slot(|| inillucent_wal::truncate_after(vfs.as_ref(), db_path, &outcome))?;
-    let (next_lsn, sequence) = resume_above_every_stamp(database, &outcome)?;
-    let wal = std::rc::Rc::new(Wal::open(
-        std::sync::Arc::clone(vfs),
-        db_path,
-        database.uuid(),
-        next_lsn,
-        sequence,
-        WalOptions::default(),
-    )?);
+    // **A read only connection resumes on a scratch log, as its open does.** The checkpoint
+    // `resume_above_every_stamp` may make is a write it cannot do, and a log opened on the disk
+    // would create a segment beside the database. The scratch log starts where this replay of
+    // the real log ended, which is what `the_log_on_disk_moved` compares the files with.
+    let (next_lsn, sequence) = match database.read_only() {
+        true => (outcome.next_lsn.max(FIRST_LSN), outcome.sequence.max(1)),
+        false => resume_above_every_stamp(database, &outcome)?,
+    };
+    let wal = match database.read_only() {
+        true => scratch_log(db_path, database.uuid(), next_lsn, sequence)?,
+        false => std::rc::Rc::new(Wal::open(
+            std::sync::Arc::clone(vfs),
+            db_path,
+            database.uuid(),
+            next_lsn,
+            sequence,
+            WalOptions::default(),
+        )?),
+    };
     database.pool().set_durable_lsn(wal.write_ahead_point());
     database
         .pool()

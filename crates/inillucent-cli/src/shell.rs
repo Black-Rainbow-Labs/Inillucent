@@ -246,10 +246,8 @@ pub struct Shell {
     /// two classifiers would eventually disagree, and the one that let a write
     /// through would be the one nobody was watching.
     ///
-    /// The *file* is still open for writing. The capability table says
-    /// `readonly_open` is `partial` and says exactly this, which is why the row
-    /// is worth reading before an application decides what it means by "open
-    /// this read only".
+    /// The engine connection is opened read only as well, so the shell writes
+    /// nothing to the file: see [`Shell::open_one_reporting`].
     pub readonly: bool,
     /// Whether the commands that reach outside the database are refused.
     ///
@@ -414,50 +412,21 @@ impl Shell {
 
     /// [`Shell::open_one_as`], handing back the engine's own error.
     ///
+    /// **Read only is asked of the engine, not only enforced by the shell.** An engine
+    /// connection opened for writing replays the committed transactions still in the log and
+    /// checkpoints them into the file as it opens. The shell used to open the engine for writing
+    /// and refuse writes itself, so `-readonly` on a file with a log rewrote the file, and moved
+    /// a format 1 file to format 2 where the release that wrote it could no longer open it. It
+    /// opened for writing because a read only engine connection did not see what a live writer
+    /// committed into the log. It does now (`durability::read_only_connection`, and the
+    /// `-readonly` reader in `durability::process_journal_handoff`): it replays the log into its
+    /// own memory and writes nothing. `e2e::shell_read_only` holds the shell to that.
+    ///
     /// @param path - the file, or an in-memory name
     /// @param read_only - whether this connection may write the file
     pub fn open_one_reporting(
         path: &str,
         read_only: bool,
-    ) -> Result<Opened, inillucent_base::DbError> {
-        Shell::open_one_with(path, read_only, read_only)
-    }
-
-    /// Opens one database for a person at the shell, which follows other processes' commits.
-    ///
-    /// **The engine connection is opened for writing even when the person asked
-    /// for read only, and the shell refuses the writes itself.** A connection the
-    /// engine opened read only does not see what another process commits after
-    /// the first statement: a long lived `inillucent-shell -readonly` kept
-    /// answering from the state it first read, even across `BEGIN; COMMIT;`.
-    /// A shell stays open and is read again and again, which is the case where
-    /// that matters. `-readonly` was a flag the shell enforced on a connection
-    /// opened for writing until the open was changed to ask the engine for read
-    /// only, and `process_journal_handoff` caught the change. Only when the file
-    /// cannot be opened for writing at all (a read only file or folder) does the
-    /// connection fall back to the engine's own read only mode.
-    ///
-    /// @param path - the file, or an in-memory name
-    /// @param read_only - whether the shell refuses statements that write
-    pub fn open_one_following(
-        path: &str,
-        read_only: bool,
-    ) -> Result<Opened, inillucent_base::DbError> {
-        match Shell::open_one_with(path, read_only, false) {
-            Err(_) if read_only => Shell::open_one_with(path, read_only, true),
-            other => other,
-        }
-    }
-
-    /// Opens one database with the engine connection read only or not, whatever the shell reports.
-    ///
-    /// @param path - the file, or an in-memory name
-    /// @param read_only - whether the shell reports and enforces read only
-    /// @param engine_read_only - whether the engine connection itself is read only
-    fn open_one_with(
-        path: &str,
-        read_only: bool,
-        engine_read_only: bool,
     ) -> Result<Opened, inillucent_base::DbError> {
         // **The detail, not only the code.** An open that fails with "bad
         // parameter or other API misuse" and nothing else is an error nobody
@@ -469,7 +438,7 @@ impl Shell {
             path,
             inillucent_driver::PAGE_SIZE,
             inillucent_driver::DEFAULT_FRAMES,
-            engine_read_only,
+            read_only,
             crate::keys::for_opening(),
         )?;
         // **The shell adds `fsdir`, and the library does not.** A table-valued
@@ -495,12 +464,6 @@ impl Shell {
         // A shell is a program that opens files it did not write, which is the
         // case the flag exists for.
         let _ = database.session_as(session).set_trusted_schema(false);
-        // The engine connection may be open for writing while the person asked for read only;
-        // see `open_one_following`. The engine then refuses writes to the files itself and
-        // lets the temporary schema be written, which a statement filter on the text cannot do.
-        if read_only {
-            let _ = database.session_as(session).set_files_read_only(true);
-        }
         Ok(Opened {
             database,
             session,
@@ -535,18 +498,6 @@ impl Shell {
     /// @param read_only - whether this connection may write the file
     pub fn open_reporting(path: &str, read_only: bool) -> Result<Shell, inillucent_base::DbError> {
         let first = Shell::open_one_reporting(path, read_only)?;
-        Ok(Shell::around(first))
-    }
-
-    /// Opens a shell for a person at the program, which follows other processes' commits.
-    ///
-    /// See [`Shell::open_one_following`] for why `read_only` is enforced by the
-    /// shell and not by the engine connection.
-    ///
-    /// @param path - the file, or an in-memory name
-    /// @param read_only - whether statements that write are refused
-    pub fn open_following(path: &str, read_only: bool) -> Result<Shell, String> {
-        let first = Shell::open_one_following(path, read_only).map_err(described)?;
         Ok(Shell::around(first))
     }
 
@@ -923,7 +874,7 @@ impl Shell {
     /// @param path - the file, or an in-memory name
     /// @param read_only - whether the file is opened read only
     pub fn reopen_as(&mut self, path: &str, read_only: bool) -> Result<(), String> {
-        let replacement = Shell::open_one_following(path, read_only).map_err(described)?;
+        let replacement = Shell::open_one_as(path, read_only)?;
         let active = self.active;
         if let Some(place) = self.connections.get_mut(active) {
             *place = Some(replacement);
