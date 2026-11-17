@@ -373,22 +373,23 @@ pub fn trace(shell: &mut Shell, arguments: &[&str]) {
         shell.trace = None;
         return;
     };
-    if word.eq_ignore_ascii_case("off") {
+    let stream = matches!(word.as_str(), "stdout" | "stderr");
+    if word.eq_ignore_ascii_case("off") || (shell.safe && !stream) {
         shell.trace = None;
         return;
     }
-    if !matches!(word.as_str(), "stdout" | "stderr") {
-        let Some(path) = crate::dot::confine_path(shell, &word) else {
-            return;
-        };
-        if std::fs::write(&path, b"").is_err() {
-            shell.complain(&format!("Error: cannot open \"{word}\""));
-            return;
-        }
-        shell.trace = Some(path);
+    if stream {
+        shell.trace = Some(word);
         return;
     }
-    shell.trace = Some(word);
+    let Some(path) = crate::dot::confine_path(shell, &word) else {
+        return;
+    };
+    if std::fs::write(&path, b"").is_err() {
+        shell.complain(&format!("Error: cannot open \"{word}\""));
+        return;
+    }
+    shell.trace = Some(path);
 }
 
 /// Writes one statement to where `.trace` sends them.

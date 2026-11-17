@@ -642,6 +642,39 @@ fn a_server_refuses_the_dot_commands_that_reach_outside_it() {
     );
 }
 
+#[test]
+fn trace_on_a_server_with_no_root_does_not_touch_the_named_file() {
+    let binary = program("inillucent");
+    let server = program("inillucent-mcp");
+    let database = populated_at(&binary, "trace");
+    let outside = database
+        .parent()
+        .expect("the fixture has a directory")
+        .join("..")
+        .join("mcp-wire-trace-outside");
+    let _ = std::fs::create_dir_all(&outside);
+    let victim = outside.join("victim.txt");
+    std::fs::write(&victim, b"precious content\n").expect("the victim file is written");
+    let named = victim.to_string_lossy().replace('\\', "/");
+
+    let mut session = Session::start_with(&server, &database, &["--readonly"]);
+    let answer = session.tool(
+        "inillucent_run",
+        &format!("{{\"input\":\".trace {named}\\nSELECT 'still-answers';\"}}"),
+    );
+    drop(session);
+
+    assert!(
+        answer.contains("still-answers"),
+        "the statement after `.trace` did not run:\n{answer}"
+    );
+    let after = std::fs::read(&victim).expect("the victim file reads");
+    assert_eq!(
+        after, b"precious content\n",
+        "`.trace` changed a file outside the server's folder:\n{answer}"
+    );
+}
+
 /// A statement deep enough to have ended the server is refused, and the server
 /// answers the next request (task-1979, section 5.3).
 ///
