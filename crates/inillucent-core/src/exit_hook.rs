@@ -1,5 +1,5 @@
-//! Drops every loaded model session before the process's C++ destructors run, and keeps ONNX
-//! Runtime's environment alive until the process ends.
+//! Drops every loaded model session before the process's C++ destructors run, and, on every target
+//! but Apple's, keeps ONNX Runtime's environment alive until the process ends.
 //!
 //! Invariant: **a process that loaded a model, or tried to and failed, exits with the exit code it
 //! chose.** On macOS, 2.0.3 aborted with exit code 134 and
@@ -37,8 +37,8 @@
 //! ## The environment reference
 //!
 //! The `ort` crate keeps ONNX Runtime's environment in a process wide `Arc` and releases it from
-//! a function that runs while the process exits. That release is only safe when it is not the last
-//! reference, and it runs at a different point on each operating system:
+//! a function that runs while the process exits. That function runs at a different point on each
+//! operating system, and so does whether it may be the last reference:
 //!
 //! - On Linux it runs from the `.fini_array` of the library that links `ort`. The loader runs it
 //!   after ONNX Runtime, which was loaded later, has already run its own destructors, so the call
@@ -47,14 +47,24 @@
 //!   execution provider's library and other libraries have started to unload. A debugger on
 //!   2.7.0 showed `ReleaseEnv` reading memory the heap had already filled with `0xfeeefeee`,
 //!   which ended the process with `STATUS_ACCESS_VIOLATION` or `STATUS_STACK_BUFFER_OVERRUN`.
-//! - On macOS it runs from a `__cxa_atexit` handler registered when the environment is first
-//!   created, which can run after ONNX Runtime's own C++ destructors.
+//! - On macOS and iOS it runs from a `__cxa_atexit` handler registered when the environment is
+//!   first created. ONNX Runtime has loaded by then, so the handler runs before ONNX Runtime's own
+//!   C++ destructors, and as the last reference it calls `ReleaseEnv` while everything the
+//!   environment uses still exists. That release must be the last one. When another reference is
+//!   still held, ONNX Runtime's static `std::unique_ptr<OrtEnv>` frees the environment later,
+//!   after a mutex it locks has been destroyed, and libc++ aborts the process with exit code 134
+//!   and `mutex lock failed: Invalid argument`.
 //!
 //! [`keep_environment`] holds one reference to the environment for the life of the process on
-//! every operating system, so that release is never the last one. The environment is never
+//! every target but Apple's, so that release is never the last one there. The environment is never
 //! released, and the process is exiting anyway. It is called when a session is about to be built,
 //! not only after one opened, because a CUDA execution provider that fails to start still creates
 //! the environment, and the process then crashed at exit after printing the refusal.
+//!
+//! On Apple targets it holds nothing. 2.8.0 held the reference there too, and from then every
+//! `inillucent`, `inillucent-shell` and `inillucent-mcp` process on a Mac that embedded printed its
+//! answer and then aborted at exit, under every residency profile. There `ort`'s own release must
+//! be the last reference whether a session opened, failed to open or was never built.
 //!
 //! ## The exiting flag
 //!
@@ -63,7 +73,7 @@
 //! handler sets [`exiting`] first and the reaper leaves a session alone once it is set.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 /// Something that drops one holder's session when the process exits.
 ///
@@ -84,8 +94,9 @@ static INSTALLED: OnceLock<bool> = OnceLock::new();
 /// One reference to ONNX Runtime's environment, held until the process ends.
 ///
 /// The module comment says why the `ort` crate's own release at exit must never be the last
-/// reference on any operating system.
-static KEPT_ENVIRONMENT: OnceLock<Arc<ort::environment::Environment>> = OnceLock::new();
+/// reference on every target but Apple's, and why on Apple targets it must be.
+#[cfg(not(target_vendor = "apple"))]
+static KEPT_ENVIRONMENT: OnceLock<std::sync::Arc<ort::environment::Environment>> = OnceLock::new();
 
 #[cfg(unix)]
 extern "C" {
@@ -93,18 +104,20 @@ extern "C" {
     fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
 }
 
-/// Holds one reference to ONNX Runtime's environment for the life of the process.
+/// Holds one reference to ONNX Runtime's environment for the life of the process, on every target
+/// but Apple's.
 ///
 /// Call it before the first session is built and again whenever one is, because it does nothing
-/// once a reference is held. It loads the library when `ort` has not yet, so a caller that cannot
-/// tolerate a panic from a library that will not load wraps it in `catch_unwind`, as
-/// `build_session` does.
+/// once a reference is held. Off Apple targets it loads the library when `ort` has not yet, so a
+/// caller that cannot tolerate a panic from a library that will not load wraps it in
+/// `catch_unwind`, as `build_session` does. On Apple targets it does nothing: a held reference
+/// there is what makes the process abort at exit, as the module comment says.
 pub fn keep_environment() {
-    if KEPT_ENVIRONMENT.get().is_some() {
-        return;
-    }
-    if let Ok(environment) = ort::environment::Environment::current() {
-        let _ = KEPT_ENVIRONMENT.set(environment);
+    #[cfg(not(target_vendor = "apple"))]
+    if KEPT_ENVIRONMENT.get().is_none() {
+        if let Ok(environment) = ort::environment::Environment::current() {
+            let _ = KEPT_ENVIRONMENT.set(environment);
+        }
     }
 }
 
