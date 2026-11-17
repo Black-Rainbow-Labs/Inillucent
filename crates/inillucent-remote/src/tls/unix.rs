@@ -145,16 +145,6 @@ const TLS1_2_VERSION: c_long = 0x0303;
 /// The library, resolved on first use.
 static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
 
-extern "C" {
-    /// Opens a shared library.
-    fn dlopen(name: *const c_char, flags: c_int) -> *mut c_void;
-    /// Looks a symbol up in one.
-    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
-}
-
-/// `RTLD_NOW | RTLD_GLOBAL`, so a missing symbol fails here rather than later.
-const RTLD_NOW_GLOBAL: c_int = 0x00002 | 0x00100;
-
 /// Resolves one symbol, or returns `None`.
 ///
 /// @param handle - the open library
@@ -165,7 +155,7 @@ const RTLD_NOW_GLOBAL: c_int = 0x00002 | 0x00100;
 /// `handle` must be a live library handle.
 unsafe fn symbol(handle: *mut c_void, name: &str) -> Option<*mut c_void> {
     let named = CString::new(name).ok()?;
-    let found = dlsym(handle, named.as_ptr());
+    let found = libc::dlsym(handle, named.as_ptr());
     (!found.is_null()).then_some(found)
 }
 
@@ -185,7 +175,8 @@ fn library() -> Option<&'static Library> {
                 // SAFETY: `named` is a live NUL-terminated string, and the
                 // handle is never closed, so every pointer resolved from it
                 // stays valid for the life of the process.
-                let handle = unsafe { dlopen(named.as_ptr(), RTLD_NOW_GLOBAL) };
+                let handle =
+                    unsafe { libc::dlopen(named.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
                 if handle.is_null() {
                     continue;
                 }
