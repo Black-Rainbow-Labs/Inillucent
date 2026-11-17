@@ -572,8 +572,27 @@ the quiet window. Bold values are outside the quiet window's range, and every on
 **A busy machine slows SQLite's side about twice as much as inillucent's, so it makes inillucent
 look faster.** The first pass of the 23 September family statistic window, which put `read.join` at
 4.37x, had SQLite's side 5% to 7% slow. Why SQLite suffers more is not established. It is not page
-faults. One difference is that SQLite's side is a new process each round and fills its cache while a
-workload is timed. inillucent's pool is warmed before the clock starts.
+faults. One difference is that SQLite's side is a new process each round.
+
+**SQLite's cache is now filled before the clock starts, as inillucent's is.** Until that change,
+SQLite's cache filled inside the clock of the first workload that read each table, so that workload
+paid for reading the whole fixture. The figures on this page were measured before the change. Ten
+rounds of each on a Mac, measured the same day:
+
+| | SQLite's cache filled while timed | filled before |
+|---|---|---|
+| `prepare.point` | 11.67x | 1.87x |
+| `correlated.exists` | 33.80x | 0.47x |
+| `join.selective` | 10.67x | 6.87x |
+| `open.prepare` family | 2.60x | 1.00x |
+| `read.join` family | 2.99x | 2.35x |
+| `read.point` family | 9.13x | 9.43x |
+| headline, weighted | 1.63x | 1.55x |
+
+Reads by key did not move, so the cache does not explain the `read.point` lead. The Mac's headline
+is much lower than the one above because Rust's `sync_all` on macOS asks the disk to flush its own
+cache, and SQLite's default `fsync` there does not. So inillucent's writes and commits pay for a
+stronger guarantee on that machine.
 
 The rules the gates follow:
 

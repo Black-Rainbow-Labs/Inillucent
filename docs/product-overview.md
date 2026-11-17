@@ -91,7 +91,7 @@ vectors.
 | **A file 3.6% larger** | 17,432,576 bytes against 16,830,464 bytes for the same imported data | [Performance](performance.md#disk) |
 | **402 of 416 SQL cases give SQLite's exact answer** | each case runs through both shells on a new database, and the output bytes are compared | [Feature comparison](feature-comparison.md) |
 | **Better than pgvector on 15 of 17 graded comparisons** | equivalent on 1, inconclusive on 1, worse on none | [Retrieval quality](retrieval-quality.md) |
-| **174% faster than pgvector without a filter** | median 0.8462 ms against 2.315 ms | [Retrieval quality](retrieval-quality.md#latency) |
+| **76% faster than pgvector without a filter** | median 0.8462 ms against 1.492 ms for pgvector at its defaults, and 2.315 ms set up to return complete results. pgvector's time includes a loopback round trip | [Retrieval quality](retrieval-quality.md#latency) |
 | **6,169% faster than pgvector with a filter** | median 0.5820 ms against 36.486 ms, for `source = slack` | [Retrieval quality](retrieval-quality.md#latency) |
 
 Six of the 116 workloads are not faster than SQLite. A range `DELETE` in the 48 workload plan is

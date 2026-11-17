@@ -743,7 +743,7 @@ fn print_configuration(
         println!("                SQLite compiles per iteration for a prepare-each workload too.");
     }
     println!(
-        "  warm state  : inillucent's pool is filled before each round; SQLite's cache fills as the plan runs"
+        "  warm state  : both engines fill their cache before the first workload of each round"
     );
     println!("  durability  : synchronous = FULL on both arms");
     println!();
@@ -1924,11 +1924,12 @@ fn round_on(
 ) -> Result<(Vec<Sample>, Vec<String>, RoundCost), String> {
     // **The pool is filled before the clock starts, which is what the read gate
     // does and what makes these numbers comparable to Phase 2's and Phase 3's.**
-    // It is an asymmetry and the configuration says so: SQLite's arm has no
-    // equivalent hook, and its own cache fills as the plan's earlier workloads
-    // read the same tables. The import closes and reopens the file, so without
-    // this the first workload of every round would be paying for the whole
-    // fixture's first read.
+    // SQLite's arm does the same: `sqlite_bench.c` reads every page through
+    // `dbstat` before its first workload. Before it did, SQLite's first workload
+    // to read a table paid for the whole fixture's first read inside its clock,
+    // which put `prepare.point` at 11.67x instead of 1.87x. The import closes and
+    // reopens the file, so without this the first workload of every round would
+    // be paying for the whole fixture's first read.
     database
         .warm()
         .map_err(|error| format!("warming failed: {}", why(&error)))?;

@@ -369,6 +369,19 @@ static int run_workload(sqlite3 *db, const struct workload *workload, long rows)
   return 1;
 }
 
+/*
+** Fills SQLite's page cache before the first clock starts, as inillucent's arm
+** fills its pool before every round. Until this ran, SQLite's cache filled
+** inside the clock of whichever workload first read a table, and that workload
+** was charged for reading the whole fixture. Over ten rounds on a Mac,
+** `prepare.point` read 11.67x and `correlated.exists` 33.80x with a cold cache,
+** and 1.87x and 0.47x with a warm one. `dbstat` visits every page of every table and index through the
+** pager, so each one lands in the cache that `cache_size` sized.
+*/
+static int warm_cache(sqlite3 *db) {
+  return run_sql(db, "SELECT count(*) FROM dbstat;");
+}
+
 static int apply_settings(sqlite3 *db, const struct plan *plan) {
   char sql[256];
   snprintf(sql, sizeof(sql), "PRAGMA page_size=%ld;", plan->page_size);
@@ -422,6 +435,7 @@ int main(int argc, char **argv) {
     sqlite3_close(db);
     return 0;
   }
+  if (!warm_cache(db)) return 2;
   for (index = 0; index < plan->workload_count; index++) {
     if (!run_workload(db, &plan->workloads[index], plan->rows)) return 2;
   }
