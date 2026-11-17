@@ -844,13 +844,14 @@ fn drives_from_a_value_list(plan: &PhysicalPlan, prepared: &Prepared) -> bool {
 /// @param prepared - the structural choices `prepare` made
 /// @param outputs - the result columns and the sort keys
 /// @param scan_order - the column groups the walk already orders rows by
-/// @param grouped_walk - whether the walk already brings each group together
+/// @param walk_group_collations - the collation of each group key when the
+///   walk already brings each group together, `None` when it does not
 fn already_sorted(
     plan: &PhysicalPlan,
     prepared: &Prepared,
     outputs: &Outputs,
     scan_order: &[Vec<usize>],
-    grouped_walk: bool,
+    walk_group_collations: Option<&[Collation]>,
 ) -> bool {
     let sort_keys = &outputs.sort_keys;
     // The one condition the forward walk and the skip scan both ask.
@@ -863,7 +864,7 @@ fn already_sorted(
                 &outputs.projected,
                 plan,
                 scan_order,
-                grouped_walk,
+                walk_group_collations,
             )
     };
     // A non-default NULL placement is a real ordering requirement, and no scan
@@ -1527,7 +1528,13 @@ pub(crate) fn build_upper(
         )
     };
     let up = Upward {
-        sorted_already: already_sorted(plan, prepared, &outputs, &scan_order, grouped_walk),
+        sorted_already: already_sorted(
+            plan,
+            prepared,
+            &outputs,
+            &scan_order,
+            grouped_walk.then_some(group_collations.as_slice()),
+        ),
         skipping: is_skip_scan(prepared),
         projection_types: if plan.aggregation == AggregationMode::None {
             scan_types.to_vec()

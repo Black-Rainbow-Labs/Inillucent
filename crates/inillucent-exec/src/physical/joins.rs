@@ -1307,23 +1307,38 @@ pub(crate) fn order_equivalents(
 /// @param projected - the output expressions
 /// @param plan - the planner's output
 /// @param scan_order - the tree columns the leaves are ordered by
-/// @param grouped_walk - whether a streaming grouped aggregate is in the chain
+/// @param walk_group_collations - the collation of each group key when a
+///   streaming grouped aggregate is in the chain, `None` when there is none
 pub(crate) fn output_is_sorted_by(
     sort_keys: &[SortKey],
     projected: &[Expr],
     plan: &PhysicalPlan,
     scan_order: &[Vec<usize>],
-    grouped_walk: bool,
+    walk_group_collations: Option<&[Collation]>,
 ) -> bool {
     match plan.aggregation {
         AggregationMode::Grouped => {
-            // The walk grouped the rows in byte order, so it answers an
-            // `ORDER BY` over the group columns only under `BINARY`; see
-            // `is_scan_prefix` (task-2079).
-            grouped_walk
-                && sort_keys.iter().enumerate().all(|(position, term)| {
-                    term.collation == Collation::Binary
-                        && matches!(projected.get(term.column), Some(Expr::Column(index)) if *index == position)
+            // **The groups arrive in the walked tree's order, which this
+            // check cannot see, so the planner must agree there is no sort.**
+            // Two shortcuts here returned wrong rows with no error:
+            //
+            // - It asked for `BINARY`, as if every walk were in byte order. A
+            //   walk of a `NOCASE` index on `e` keeps its groups in `NOCASE`
+            //   order, so `GROUP BY e ORDER BY e COLLATE BINARY` skipped its
+            //   sort and put `_x` before `A`. Each term is now compared with
+            //   its group key's collation, which a grouped walk shares with
+            //   the tree (`grouped_by_path` and `is_scan_prefix` check it).
+            // - It took the `GROUP BY` list to be the walk's key order. The
+            //   planner accepts the keys in any order, so `WHERE a > 0
+            //   GROUP BY b, a ORDER BY b` over an index on `(a, b)` walks by
+            //   `a` first and came back in `a` order. The planner's
+            //   `needs_sort` compares with the walked key itself.
+            !plan.needs_sort
+                && walk_group_collations.is_some_and(|collations| {
+                    sort_keys.iter().enumerate().all(|(position, term)| {
+                        collations.get(position) == Some(&term.collation)
+                            && matches!(projected.get(term.column), Some(Expr::Column(index)) if *index == position)
+                    })
                 })
         }
         AggregationMode::Whole => false,
