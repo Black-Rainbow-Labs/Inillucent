@@ -194,9 +194,9 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed_onnx.rs"
-ticket = "task-2275"
-reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
-sha256 = "8a577f64d905af0796e553828b6cdc61e16e9b4da15927ab3e203ee42934153b"
+ticket = "ort-secure-execution"
+reason = "A setuid or setgid process loads no ONNX Runtime: secure_execution.rs asks the loader's own secure mode flag (getauxval(AT_SECURE), issetugid), and embed_onnx refuses before ort is touched, because ORT_DYLIB_PATH, INILLUCENT_HOME and HOME would let the caller choose the library. An ordinary process chooses its runtime exactly as before; no search, ranking or index code changed."
+sha256 = "7621dddb37938e5cb06c1e0c812e55572bc05cd3eda9cba6d1ccd8a369d3f067"
 
 [[amendment]]
 path = "crates/inillucent-core/src/exit_hook.rs"
@@ -236,9 +236,9 @@ sha256 = "d0aae4d6505726b198c082de2f497c20a53d60954579f80fa12c9124042fdc06"
 
 [[amendment]]
 path = "crates/inillucent-core/src/lib.rs"
-ticket = "task-2275"
-reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
-sha256 = "52532bba8f27b259787d4d7394ee3731d0e3bcfb632d9e3201b80647be8563e2"
+ticket = "ort-secure-execution"
+reason = "A setuid or setgid process loads no ONNX Runtime: secure_execution.rs asks the loader's own secure mode flag (getauxval(AT_SECURE), issetugid), and embed_onnx refuses before ort is touched, because ORT_DYLIB_PATH, INILLUCENT_HOME and HOME would let the caller choose the library. An ordinary process chooses its runtime exactly as before; no search, ranking or index code changed."
+sha256 = "88ba573fbfb92c2779579b5c58d74e03953a30f037e03035193e252f6832f833"
 
 [[amendment]]
 path = "crates/inillucent-core/src/model.rs"
@@ -275,6 +275,12 @@ path = "crates/inillucent-core/src/residency.rs"
 ticket = "task-2110"
 reason = "Keep ONNX Runtime environment reference from the first session build on every platform, exiting flag for the idle reaper, release_all for the C call inillucent_release_models"
 sha256 = "824db2f2a57ddb63805e88c6a34350d9ae8eda9b20f3989e1afd6b9b62726e47"
+
+[[amendment]]
+path = "crates/inillucent-core/src/secure_execution.rs"
+ticket = "ort-secure-execution"
+reason = "A setuid or setgid process loads no ONNX Runtime: secure_execution.rs asks the loader's own secure mode flag (getauxval(AT_SECURE), issetugid), and embed_onnx refuses before ort is touched, because ORT_DYLIB_PATH, INILLUCENT_HOME and HOME would let the caller choose the library. An ordinary process chooses its runtime exactly as before; no search, ranking or index code changed."
+sha256 = "992dde42339a16d9d0fa6a745520adca54968bad44c5b813da3585f632372f45"
 
 [[amendment]]
 path = "crates/inillucent-core/src/store.rs"

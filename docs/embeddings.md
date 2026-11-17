@@ -153,6 +153,12 @@ embeddings.json                    what is installed, and the residency profile
 | `INILLUCENT_EMBED_THREADS` | how many threads ONNX Runtime uses inside one operator, for one process |
 | `INILLUCENT_EMBED_DEVICE` | `cpu`, `cuda` or `cuda:N`, for one process |
 
+**A program that runs setuid or setgid loads no ONNX Runtime.** The system loader ignores
+`LD_LIBRARY_PATH` and the `DYLD_` variables for such a program, so the person who starts it cannot
+choose its libraries. `ORT_DYLIB_PATH`, `INILLUCENT_HOME` and `HOME` would let them choose this
+one, so inillucent refuses to load it and the embedding fails with a message that says why. On
+Linux the same holds for a program with file capabilities.
+
 inillucent looks for the model folder in this order: `INILLUCENT_ONNX_DIR`, the install folder, the
 folders in `INILLUCENT_MODEL_ROOTS`, then `~/.cache/inillucent-models`. A folder counts only when it
 holds both the weights and the tokenizer.
