@@ -87,9 +87,7 @@ impl ImportedDatabase {
     ///
     /// @param directive - the bound statement
     fn refuse_a_read_only_directive(&self, directive: &Directive) -> DbResult<()> {
-        match (self.storage.read_only || self.pragmas.files_read_only())
-            && !read_only_allows(directive)
-        {
+        match self.storage.read_only && !read_only_allows(directive) {
             true => Err(query_only_refusal()),
             false => Ok(()),
         }

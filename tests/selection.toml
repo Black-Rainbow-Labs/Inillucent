@@ -3782,6 +3782,16 @@ module = "shell_command_line"
 tier = "e2e"
 covers = ["inillucent-cli"]
 
+# The shell asked for read only, three ways, on a release fixture whose log holds
+# a commit: it answers from the log and leaves every file byte for byte as it was.
+[[target]]
+package = "inillucent-compat"
+kind = "test"
+name = "e2e"
+module = "shell_read_only"
+tier = "e2e"
+covers = ["inillucent-cli", "inillucent-engine"]
+
 [[target]]
 package = "inillucent-compat"
 kind = "test"

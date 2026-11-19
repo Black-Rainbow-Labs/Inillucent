@@ -831,7 +831,7 @@ impl crate::ImportedDatabase {
     ///
     /// @param cached - the compiled statement
     fn refuse_a_read_only_write(&self, cached: &Cached) -> DbResult<()> {
-        if !self.storage.read_only && !self.pragmas.files_read_only() {
+        if !self.storage.read_only {
             return Ok(());
         }
         let database = match cached {
