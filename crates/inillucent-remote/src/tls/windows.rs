@@ -63,7 +63,7 @@ use windows_sys::Win32::Security::Cryptography::{
     HTTPSPolicyCallbackData, AUTHTYPE_SERVER, CERT_CHAIN_CONTEXT, CERT_CHAIN_ENGINE_CONFIG,
     CERT_CHAIN_EXCLUSIVE_ENABLE_CA_FLAG, CERT_CHAIN_PARA, CERT_CHAIN_POLICY_PARA,
     CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT, CERT_STORE_ADD_ALWAYS,
-    CERT_STORE_CREATE_NEW_FLAG, CERT_STORE_PROV_MEMORY, X509_ASN_ENCODING,
+    CERT_STORE_CREATE_NEW_FLAG, CERT_STORE_PROV_MEMORY, HCERTCHAINENGINE, X509_ASN_ENCODING,
 };
 
 /// How many bytes are read from the socket in one go during a handshake.
@@ -594,7 +594,7 @@ fn verify_against(certificate: *mut CERT_CONTEXT, host: &str, root: &[u8]) -> Db
     configuration.cbSize = size_of::<CERT_CHAIN_ENGINE_CONFIG>() as u32;
     configuration.hExclusiveRoot = store;
     configuration.dwExclusiveFlags = CERT_CHAIN_EXCLUSIVE_ENABLE_CA_FLAG;
-    let mut engine = 0;
+    let mut engine: HCERTCHAINENGINE = null_mut();
     // SAFETY: `configuration` is a correctly sized zeroed structure whose one
     // store is live, and `engine` is a local the call writes.
     let made = unsafe { CertCreateCertificateChainEngine(&configuration, &mut engine) };

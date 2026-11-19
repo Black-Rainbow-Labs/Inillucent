@@ -297,8 +297,8 @@ fn deleted(share: &LogShare) -> bool {
         AllocationSize: 0,
         EndOfFile: 0,
         NumberOfLinks: 0,
-        DeletePending: 0,
-        Directory: 0,
+        DeletePending: false,
+        Directory: false,
     };
     let handle = share.file.as_raw_handle() as HANDLE;
     // SAFETY: `information` is a `FILE_STANDARD_INFO` this frame owns, its size is passed with it,
@@ -312,7 +312,7 @@ fn deleted(share: &LogShare) -> bool {
         )
     };
     // A handle that cannot answer is not trusted either: the ordinary open is always correct.
-    answered == 0 || information.DeletePending != 0 || information.NumberOfLinks == 0
+    answered == 0 || information.DeletePending || information.NumberOfLinks == 0
 }
 
 /// Opens a log segment through this process's shared file object, making it on the first open,
