@@ -651,6 +651,53 @@ fn the_unsafe_dot_commands_are_refused_in_safe_mode() {
     );
 }
 
+#[test]
+fn trace_to_a_file_is_off_in_safe_mode() {
+    let binary = program("inillucent");
+    let shell = program("inillucent-shell");
+    let area = area("trace-safe");
+    let directory = area.to_string_lossy().replace('\\', "/");
+    let database = populated(&binary, &area);
+    let traced = area.join("traced.txt");
+
+    for safely in [false, true] {
+        std::fs::write(&traced, "kept\n").expect("the trace file is written");
+        let case = Case {
+            name: "trace",
+            input: ".trace {dir}/traced.txt\nSELECT 'ran';",
+            says: "ran",
+        };
+        let printed = drive(&shell, &database, &directory, &case, safely);
+        assert!(
+            printed.contains("ran"),
+            "the statement after `.trace` did not run (safe: {safely}):\n{printed}"
+        );
+        let held = std::fs::read_to_string(&traced).expect("the trace file reads");
+        if safely {
+            assert_eq!(
+                held, "kept\n",
+                "`.trace` changed its file under `-safe`:\n{printed}"
+            );
+        } else {
+            assert!(
+                held.contains("SELECT 'ran';") && !held.contains("kept"),
+                "`.trace` without `-safe` did not replace the file with the statement: {held:?}"
+            );
+        }
+    }
+
+    let case = Case {
+        name: "trace",
+        input: ".trace stdout\nSELECT 'echoed';",
+        says: "SELECT 'echoed';",
+    };
+    let printed = drive(&shell, &database, &directory, &case, true);
+    assert!(
+        printed.contains(case.says),
+        "`.trace stdout` stopped writing statements under `-safe`:\n{printed}"
+    );
+}
+
 /// The dispatcher handles exactly the reference's 65 names minus two.
 ///
 /// **The 63-of-65 claim had no `cargo test` behind it (task-1969, 5.5).** It was
