@@ -203,6 +203,11 @@ A migration from a host that is not a loopback address uses TLS. inillucent chec
 chain and the host name before it sends any user name, database name or password. When TLS fails,
 the migration stops. It does not fall back to an unencrypted connection.
 
+TLS uses the machine's own library, found when the migration starts. Windows uses SChannel, which
+is always there. Linux uses OpenSSL 3 or 1.1, which most distributions install. macOS has no public
+OpenSSL, so install Homebrew's with `brew install openssl@3`. Without it, a migration over TLS stops
+and names what to install.
+
 | What you write | What happens |
 |---|---|
 | nothing about encryption, and the host is not a loopback address | verified TLS |

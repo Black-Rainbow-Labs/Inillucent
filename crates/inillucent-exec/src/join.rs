@@ -454,6 +454,176 @@ mod tests {
         assert_eq!(merged, probed);
     }
 
+    /// What one index nested loop join produced.
+    struct Joined {
+        /// How many rows had come out before `finish` was called.
+        before_finish: usize,
+        /// Every row, in the order it came out.
+        rows: Vec<Vec<OwnedDatum>>,
+        /// How many outer rows were buffered for a walk.
+        merged: usize,
+        /// How many walks were abandoned for finding too many pairs.
+        abandoned: usize,
+    }
+
+    /// Joins outer rows into an inner tree by its first column, with or without the merge.
+    ///
+    /// The key is the outer rows' first column, and each joined row carries the inner tree's
+    /// second column after the outer ones.
+    ///
+    /// @param merge - whether the join may merge
+    /// @param inner - the inner tree's rows, in key order
+    /// @param key_columns - how many leading inner columns are the key
+    /// @param outer - the outer rows
+    /// @param types - the outer columns' types
+    fn join_into(
+        merge: bool,
+        inner: &[Vec<OwnedDatum>],
+        key_columns: usize,
+        outer: &[Vec<OwnedDatum>],
+        types: &[StaticType],
+    ) -> Joined {
+        let vfs = MemoryVfs::new();
+        let path = DbPath::new("inljbound.rdb");
+        let mut database = Database::create(
+            &vfs,
+            &path,
+            Options::default().with_page_size(4096).with_frames(512),
+        )
+        .unwrap();
+        let columns = (0..2)
+            .map(|at| match at < key_columns {
+                true => ColumnSpec::key(PhysicalType::Int64),
+                false => ColumnSpec::new(PhysicalType::Int64),
+            })
+            .collect();
+        let borrowed: Vec<Vec<Datum<'_>>> = inner
+            .iter()
+            .map(|row| row.iter().map(OwnedDatum::borrow).collect())
+            .collect();
+        let tree =
+            PagedTree::bulk_build(&mut database, 6, columns, key_columns, &borrowed).unwrap();
+        let (rows, sink) = collector();
+        let join = IndexNestedLoopJoin::new(
+            JoinKind::Inner,
+            &tree,
+            database.pool(),
+            vec![compile(&Expr::Column(0), types).unwrap()],
+            Projection(vec![1]),
+            key_columns == 1,
+            sink,
+        );
+        let mut join = if merge { join.with_merge() } else { join };
+        push_rows(&mut join, outer).unwrap();
+        let before_finish = rows.borrow().len();
+        join.finish().unwrap();
+        let produced = rows.borrow().clone();
+        Joined {
+            before_finish,
+            rows: produced,
+            merged: join.rows_merged(),
+            abandoned: join.walks_abandoned(),
+        }
+    }
+
+    /// The merge holds back no more outer rows than its byte limit allows.
+    ///
+    /// 3,000 outer rows of 512 bytes of text each, into a tree of 600 keys, every row matching
+    /// once. The join probes the first 60 and buffers the rest. Before the limit the buffered rows
+    /// came out only at `finish`, so the buffer grew with the outer side: 2,940 rows held back
+    /// here, and about 1.3 KB an outer row in `select5.test`'s joins of 19 tables, which passed
+    /// 3 GB. Now the rows held back when the input ends fit in `MERGE_BYTES`, which is 64 KiB in a
+    /// unit test, and the merge still runs and still emits what the probes emit.
+    #[test]
+    fn an_index_nested_loop_merge_holds_back_no_more_than_its_limit() {
+        const TEXT: usize = 512;
+        let inner: Vec<Vec<OwnedDatum>> = (0..600i64)
+            .map(|n| vec![OwnedDatum::Int(n), OwnedDatum::Int(n * 3)])
+            .collect();
+        let outer: Vec<Vec<OwnedDatum>> = (0..3000i64)
+            .map(|n| {
+                let mut text = format!("row {n} ").into_bytes();
+                text.resize(TEXT, b'x');
+                vec![OwnedDatum::Int((n * 37) % 600), OwnedDatum::Text(text)]
+            })
+            .collect();
+        let types = [StaticType::Int, StaticType::Text];
+        let probed = join_into(false, &inner, 1, &outer, &types);
+        let merged = join_into(true, &inner, 1, &outer, &types);
+        assert_eq!(probed.rows.len(), 3000, "every outer row matches once");
+        assert_eq!(probed.merged, 0);
+        assert!(
+            merged.merged > 2900,
+            "only {} rows were merged",
+            merged.merged
+        );
+        let held_back = merged.rows.len() - merged.before_finish;
+        let most = super::merged::MERGE_BYTES / TEXT;
+        assert!(
+            held_back <= most,
+            "{held_back} joined rows came out only at finish; {} bytes hold at most {most} \
+             outer rows of {TEXT} bytes",
+            super::merged::MERGE_BYTES
+        );
+        assert_eq!(merged.rows, probed.rows);
+    }
+
+    /// A walk that finds more pairs than the limit holds is abandoned, and its rows are probed.
+    ///
+    /// 1,000 outer keys into an index of 60 owners with 100 entries each. The join probes the
+    /// first 600 and buffers 400, whose walk finds 40,000 pairs, more than 64 KiB of them. The
+    /// walk is abandoned, and the probes find the same rows in the same order.
+    #[test]
+    fn an_index_nested_loop_merge_probes_a_walk_that_finds_too_many_pairs() {
+        let inner: Vec<Vec<OwnedDatum>> = (0..6000i64)
+            .map(|n| vec![OwnedDatum::Int(n / 100), OwnedDatum::Int(n)])
+            .collect();
+        let outer: Vec<Vec<OwnedDatum>> = (0..1000i64)
+            .map(|n| vec![OwnedDatum::Int((n * 7) % 60)])
+            .collect();
+        let types = [StaticType::Int];
+        let probed = join_into(false, &inner, 2, &outer, &types);
+        let merged = join_into(true, &inner, 2, &outer, &types);
+        assert_eq!(
+            probed.rows.len(),
+            100_000,
+            "every outer key has 100 entries"
+        );
+        assert_eq!(merged.merged, 400);
+        assert_eq!(merged.abandoned, 1, "the walk held every pair it found");
+        assert_eq!(merged.rows, probed.rows);
+    }
+
+    /// After a walk that read more entries than its probes would have cost, the join probes.
+    ///
+    /// 4,000 outer rows of 200 bytes of text, with keys spread over a tree of 20,000. The join
+    /// probes the first 2,000, and 64 KiB holds about 250 of the rest, so a walk over the whole
+    /// tree reads 20,000 entries for about 2,500 entries' worth of probes. Without the switch each
+    /// of eight buffers would walk the tree again.
+    #[test]
+    fn an_index_nested_loop_merge_probes_after_a_walk_that_did_not_pay() {
+        let inner: Vec<Vec<OwnedDatum>> = (0..20_000i64)
+            .map(|n| vec![OwnedDatum::Int(n), OwnedDatum::Int(n * 3)])
+            .collect();
+        let outer: Vec<Vec<OwnedDatum>> = (0..4000i64)
+            .map(|n| {
+                let mut text = format!("row {n} ").into_bytes();
+                text.resize(200, b'x');
+                vec![OwnedDatum::Int((n * 7919) % 20_000), OwnedDatum::Text(text)]
+            })
+            .collect();
+        let types = [StaticType::Int, StaticType::Text];
+        let probed = join_into(false, &inner, 1, &outer, &types);
+        let merged = join_into(true, &inner, 1, &outer, &types);
+        assert_eq!(probed.rows.len(), 4000, "every outer row matches once");
+        assert!(
+            merged.merged > 0 && merged.merged < 500,
+            "{} rows were merged; one buffer of about 250 was expected",
+            merged.merged
+        );
+        assert_eq!(merged.rows, probed.rows);
+    }
+
     /// A nested loop with no condition is a cross product; with one it filters.
     #[test]
     fn a_nested_loop_is_a_cross_product_until_a_condition_narrows_it() {

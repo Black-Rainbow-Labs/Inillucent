@@ -8,6 +8,23 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
+## Unreleased
+
+**A process on macOS that called `embed()` or `rerank()` exits with code 0 again.** From 2.8.0,
+every `inillucent`, `inillucent-shell` and `inillucent-mcp` process on a Mac that embedded printed
+the right answer and then aborted at exit with exit code 134 and `mutex lock failed: Invalid
+argument`, under every residency profile. A script that reads the exit code saw every embedding as a
+crash. 2.8.0 began holding one reference to ONNX Runtime's environment for the life of the process,
+on every operating system, to stop a crash at exit on Windows and Linux. On macOS the `ort` crate
+releases the environment before ONNX Runtime's own destructors run, and that release has to be the
+last one: with the reference held, ONNX Runtime freed the environment itself, after a mutex it locks
+was gone. The engine no longer holds the reference on Apple targets, and every other target is
+unchanged. The C library and the Node and Python packages use the same engine code; only the three
+programs were run on a Mac. The three suites that drive `embed()` and `rerank()` through the command line read the
+abort as a machine with no model and skipped, so none of them failed on a Mac. They now skip only
+when the program printed a refusal, and a new case checks the exit code under every residency
+profile.
+
 ## 2.10.0, 1 November 2026
 
 This release runs inillucent in a web page. The engine compiles to WebAssembly for the

@@ -196,13 +196,13 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 path = "crates/inillucent-core/src/embed_onnx.rs"
 ticket = "ort-secure-execution"
 reason = "A setuid or setgid process loads no ONNX Runtime: secure_execution.rs asks the loader's own secure mode flag (getauxval(AT_SECURE), issetugid), and embed_onnx refuses before ort is touched, because ORT_DYLIB_PATH, INILLUCENT_HOME and HOME would let the caller choose the library. An ordinary process chooses its runtime exactly as before; no search, ranking or index code changed."
-sha256 = "7621dddb37938e5cb06c1e0c812e55572bc05cd3eda9cba6d1ccd8a369d3f067"
+sha256 = "6b901661aa06d3af4c2e8ec6a6f0a11748f1d2b7e6d07ce90f42556e0c762bb2"
 
 [[amendment]]
 path = "crates/inillucent-core/src/exit_hook.rs"
-ticket = "task-2275"
-reason = "the CUDA driver is asked how many cards there are before ONNX Runtime is asked for one, because ONNX Runtime's CUDA provider writes into freed memory at exit after it failed to start for a card that is not there"
-sha256 = "0c275196c4379235941815d2168b2f208121c4deba2daef344ca00bda4cd7e33"
+ticket = "fix-embed-exit-abort"
+reason = "On Apple targets keep_environment holds no reference to ONNX Runtime's environment, because ort's own __cxa_atexit release must be the last one there; with ours held, every process on a Mac that embedded aborted at exit with code 134 from 2.8.0. Other targets are unchanged."
+sha256 = "cdae058046d597063dcefef3e2e459eff07cce46a99978d2c0d9b246f9c8c7a8"
 
 [[amendment]]
 path = "crates/inillucent-core/src/filter.rs"

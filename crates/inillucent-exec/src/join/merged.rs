@@ -21,6 +21,17 @@
 //! come. A join whose outer side stays small never buffers anything, which is `join.range`'s 201
 //! rows a run. A key that is not one integer, arriving while rows are buffered, first has the
 //! buffered rows emitted and is then probed, so the order holds there too.
+//!
+//! **How much.** The buffer holds at most [`MERGE_BYTES`] of outer rows, and a walk holds at most
+//! as much of the pairs it finds. Emitting buffered rows early keeps the order, because every row
+//! before them has already gone downstream. Until this limit, rows were emitted only at `finish`,
+//! so the buffer grew with the outer side: about 1.3 KB an outer row in `select5.test`'s joins of
+//! 19 tables, and one process passed 3 GB in a second and reached 134 GB left alone. A walk whose
+//! pairs pass the limit, because each outer key matches many inner entries, is abandoned and its
+//! rows probed: a probe pushes its pairs downstream as it finds them and holds none. After a walk
+//! that read more inner entries than the probes it replaced would have cost, which happens when
+//! one buffer's keys spread across a tree too large for a buffer to pay for, the rest of the
+//! execution probes.
 
 use inillucent_base::DbResult;
 use inillucent_pool::Pool;
@@ -35,6 +46,36 @@ use crate::scan::Projection;
 ///
 /// A probe descends from the root and searches a leaf; a walk reads the next entry.
 const PROBE_COST: u64 = 10;
+
+/// The most bytes of outer rows a buffer holds, and of pairs a walk holds, before it emits them.
+///
+/// Large enough that a walk pays for itself on a tree of a few hundred thousand entries: rows of a
+/// few narrow columns are under 100 bytes, so 8 MiB is 80,000 or more of them, against the tenth
+/// of the inner tree that buffering waits for. Small enough that what a join of many tables holds
+/// is a few times this much a level, however many rows its outer side has. A unit test uses 64 KiB so
+/// that it crosses the limit many times with little data.
+pub(super) const MERGE_BYTES: usize = if cfg!(test) { 64 << 10 } else { 8 << 20 };
+
+/// The bytes one value holds: its slot, and the text or blob it owns.
+///
+/// @param value - the value
+fn value_bytes(value: &OwnedDatum) -> usize {
+    let owned = match value {
+        OwnedDatum::Text(bytes) | OwnedDatum::Blob(bytes) => bytes.len(),
+        _ => 0,
+    };
+    std::mem::size_of::<OwnedDatum>().saturating_add(owned)
+}
+
+/// What came of emitting the buffered rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Emitted {
+    /// The walk paired them and pushed the pairs downstream, which answered this.
+    Walked(Flow),
+    /// The walk found more pairs than [`MERGE_BYTES`] holds and was abandoned. The rows are still
+    /// buffered, and the caller probes them with [`MergeBuffer::probe_each`].
+    TooMany,
+}
 
 /// The outer rows an index nested loop has buffered for a merge, and when it starts buffering.
 #[derive(Debug, Default)]
@@ -51,6 +92,13 @@ pub(super) struct MergeBuffer {
     width: usize,
     /// How many outer rows were ever buffered, for a test to tell that a merge ran.
     merged: usize,
+    /// The bytes the buffered rows hold, by [`value_bytes`].
+    bytes: usize,
+    /// Whether this execution has stopped buffering, because a walk cost more than its probes
+    /// would have or found too many pairs.
+    probes_only: bool,
+    /// How many walks were abandoned for finding too many pairs, for a test to tell.
+    abandoned: usize,
 }
 
 impl MergeBuffer {
@@ -66,6 +114,9 @@ impl MergeBuffer {
             values,
             width: 0,
             merged: 0,
+            bytes: 0,
+            probes_only: false,
+            abandoned: 0,
         }
     }
 }
@@ -114,7 +165,10 @@ impl MergeBuffer {
     /// @param live - how many live rows the batch has
     /// @param width - how many columns an outer row has
     pub(super) fn buffer_from(&mut self, live: usize, width: usize) -> usize {
-        let from = self.threshold.saturating_sub(self.seen).min(live);
+        let from = match self.probes_only {
+            true => live,
+            false => self.threshold.saturating_sub(self.seen).min(live),
+        };
         self.seen = self.seen.saturating_add(live);
         // Room for the rows this batch buffers, at once: growing the two vectors a row at a
         // time was a tenth of buffering (task-2226).
@@ -131,20 +185,33 @@ impl MergeBuffer {
         !self.keys.is_empty()
     }
 
-    /// Buffers one outer row whose key is one integer.
+    /// Returns how many columns a buffered row has.
+    pub(super) fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Reports whether this execution still buffers rows; see [`MergeBuffer::probe_each`].
+    pub(super) fn buffering(&self) -> bool {
+        !self.probes_only
+    }
+
+    /// Buffers one outer row whose key is one integer, and reports whether the buffer is full and
+    /// has to be emitted before another row is kept.
     ///
     /// @param key - the row's join key
     /// @param batch - the outer rows
     /// @param nth - which live row
-    pub(super) fn keep(&mut self, key: i64, batch: &Batch<'_>, nth: usize) -> DbResult<()> {
+    pub(super) fn keep(&mut self, key: i64, batch: &Batch<'_>, nth: usize) -> DbResult<bool> {
         self.width = batch.columns.len();
         self.keys.push(key);
         self.merged = self.merged.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(std::mem::size_of::<i64>());
         for column in 0..self.width {
-            self.values
-                .push(OwnedDatum::from_datum(&batch.value(nth, column)?));
+            let value = OwnedDatum::from_datum(&batch.value(nth, column)?);
+            self.bytes = self.bytes.saturating_add(value_bytes(&value));
+            self.values.push(value);
         }
-        Ok(())
+        Ok(self.bytes >= MERGE_BYTES)
     }
 
     /// Returns how many outer rows were ever buffered, across every execution.
@@ -152,15 +219,79 @@ impl MergeBuffer {
         self.merged
     }
 
+    /// Returns how many walks were abandoned for finding too many pairs, across every execution.
+    pub(super) fn abandoned(&self) -> usize {
+        self.abandoned
+    }
+
     /// Forgets every buffered row and the count of rows seen, for the next execution.
     pub(super) fn clear(&mut self) {
         self.seen = 0;
+        self.probes_only = false;
+        self.forget_rows();
+    }
+
+    /// Forgets the buffered rows, keeping the count of rows seen.
+    fn forget_rows(&mut self) {
         self.keys.clear();
         self.values.clear();
+        self.bytes = 0;
+    }
+
+    /// Hands every buffered row to `probe`, in arrival order, forgets them, and stops buffering
+    /// for the rest of this execution.
+    ///
+    /// For a walk [`MergeBuffer::emit`] abandoned: the probes find the pairs the walk would have
+    /// found, one row at a time, so nothing the walk found has to be held.
+    ///
+    /// @param probe - joins one row, given the rows, which live row, and its key
+    pub(super) fn probe_each(
+        &mut self,
+        mut probe: impl FnMut(&Batch<'_>, usize, i64) -> DbResult<Flow>,
+    ) -> DbResult<Flow> {
+        self.probes_only = true;
+        let width = self.width;
+        let mut flow = Flow::Continue;
+        for (chunk, keys) in self.keys.chunks(BATCH_ROWS).enumerate() {
+            let first = chunk.saturating_mul(BATCH_ROWS).saturating_mul(width);
+            let columns: Vec<Vec<Datum<'_>>> = (0..width)
+                .map(|column| {
+                    (0..keys.len())
+                        .map(|row| {
+                            self.values
+                                .get(
+                                    first
+                                        .saturating_add(row.saturating_mul(width))
+                                        .saturating_add(column),
+                                )
+                                .map(OwnedDatum::borrow)
+                                .unwrap_or(Datum::Null)
+                        })
+                        .collect()
+                })
+                .collect();
+            let vectors: Vec<Vector<'_>> = columns
+                .iter()
+                .map(|values| Vector::Values(values.as_slice()))
+                .collect();
+            let batch = Batch::over(keys.len(), &vectors);
+            for (nth, key) in keys.iter().enumerate() {
+                flow = probe(&batch, nth, *key)?;
+                if flow == Flow::Stop {
+                    break;
+                }
+            }
+            if flow == Flow::Stop {
+                break;
+            }
+        }
+        self.forget_rows();
+        Ok(flow)
     }
 
     /// Joins the buffered rows with the inner tree in one walk, pushes the pairs downstream in the
-    /// outer rows' order, and forgets the rows.
+    /// outer rows' order, and forgets the rows; or, when the walk finds more pairs than
+    /// [`MERGE_BYTES`] holds, keeps the rows and says so.
     ///
     /// @param inner - the inner tree, whose first key column the keys are compared with
     /// @param pool - the pool the inner tree's pages live in
@@ -174,15 +305,24 @@ impl MergeBuffer {
         projection: &Projection,
         needed: &crate::paged::Needed,
         downstream: &mut dyn Sink,
-    ) -> DbResult<Flow> {
-        let pairs = self.pairs(inner, pool, projection, needed)?;
+    ) -> DbResult<Emitted> {
+        let Some(pairs) = self.pairs(inner, pool, projection, needed)? else {
+            self.abandoned = self.abandoned.saturating_add(1);
+            return Ok(Emitted::TooMany);
+        };
+        // A walk that read more entries than the probes it replaced would have cost will do so
+        // again for the next buffer, whose keys spread the same way.
+        let probes = (self.keys.len() as u64).saturating_mul(PROBE_COST);
+        if pairs.read > probes {
+            self.probes_only = true;
+        }
         let flow = emit_in_outer_order(&pairs, &self.values, self.width, downstream)?;
-        self.keys.clear();
-        self.values.clear();
-        Ok(flow)
+        self.forget_rows();
+        Ok(Emitted::Walked(flow))
     }
 
-    /// Walks the inner tree over the range the buffered keys cover and returns every pair.
+    /// Walks the inner tree over the range the buffered keys cover and returns every pair, or
+    /// `None` once the pairs hold more than [`MERGE_BYTES`].
     ///
     /// @param inner - the inner tree
     /// @param pool - the pool its pages live in
@@ -194,7 +334,7 @@ impl MergeBuffer {
         pool: &Pool,
         projection: &Projection,
         needed: &crate::paged::Needed,
-    ) -> DbResult<Pairs> {
+    ) -> DbResult<Option<Pairs>> {
         // Each key and its row number packed into one integer that sorts as the pair does, so
         // the sort compares plain integers: the key with its sign bit flipped, which orders an
         // `i64` as an unsigned number, above the row number.
@@ -220,8 +360,9 @@ impl MergeBuffer {
             ..Pairs::default()
         };
         let (Some(first), Some(last)) = (order.first().copied(), order.last().copied()) else {
-            return Ok(pairs);
+            return Ok(Some(pairs));
         };
+        let mut bytes = 0usize;
         let low = [Datum::Int(first.0)];
         let high = [Datum::Int(last.0)];
         let mut at = 0usize;
@@ -242,6 +383,9 @@ impl MergeBuffer {
                     true => merged.len(),
                     false => end.saturating_sub(start),
                 };
+                // The whole leaf, even when the walk stops inside it: only a finished walk's
+                // count is read.
+                pairs.read = pairs.read.saturating_add(count as u64);
                 for row in 0..count {
                     let value = |column: usize| -> DbResult<Datum<'_>> {
                         match leaf.needs_materialising() {
@@ -265,13 +409,19 @@ impl MergeBuffer {
                             break;
                         }
                         pairs.outer.push(outer);
+                        bytes = bytes.saturating_add(std::mem::size_of::<u32>());
                         for (position, column) in projection.0.iter().enumerate() {
-                            pairs
-                                .values
-                                .push(match crate::paged::is_needed(needed, position) {
-                                    true => OwnedDatum::from_datum(&value(*column)?),
-                                    false => OwnedDatum::Null,
-                                });
+                            let held = match crate::paged::is_needed(needed, position) {
+                                true => OwnedDatum::from_datum(&value(*column)?),
+                                false => OwnedDatum::Null,
+                            };
+                            bytes = bytes.saturating_add(value_bytes(&held));
+                            pairs.values.push(held);
+                        }
+                        // Tested for each pair: many buffered rows can share one key, and one
+                        // inner entry then pairs with all of them.
+                        if bytes > MERGE_BYTES {
+                            return Ok(false);
                         }
                         matching = matching.saturating_add(1);
                     }
@@ -279,7 +429,7 @@ impl MergeBuffer {
                 Ok(at < order.len())
             },
         )?;
-        Ok(pairs)
+        Ok((bytes <= MERGE_BYTES).then_some(pairs))
     }
 }
 
@@ -312,6 +462,8 @@ struct Pairs {
     values: Vec<OwnedDatum>,
     /// How many inner values a pair carries.
     width: usize,
+    /// How many inner entries the walk read, matched or not.
+    read: u64,
 }
 
 /// Pushes pairs downstream in the outer rows' order, a batch at a time.

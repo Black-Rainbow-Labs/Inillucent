@@ -572,8 +572,36 @@ the quiet window. Bold values are outside the quiet window's range, and every on
 **A busy machine slows SQLite's side about twice as much as inillucent's, so it makes inillucent
 look faster.** The first pass of the 23 September family statistic window, which put `read.join` at
 4.37x, had SQLite's side 5% to 7% slow. Why SQLite suffers more is not established. It is not page
-faults. One difference is that SQLite's side is a new process each round and fills its cache while a
-workload is timed. inillucent's pool is warmed before the clock starts.
+faults. One difference is that SQLite's side is a new process each round.
+
+**In the full gate and the read gate, SQLite's cache is now filled before the clock starts, as
+inillucent's pool is.** Until that change, SQLite's cache filled inside the clock of the first
+workload that read each table, so that workload paid for reading the whole fixture. The plan file
+carries `warm 1` and `sqlite_bench.c` then reads every page through `dbstat` before its first
+workload. The scorecard and the write gate do not set it, because their inillucent arm starts with
+a cold pool too. The figures on this page were measured before the change.
+
+Measured on 18 November 2026 on the development machine: the medium fixture, the nightly's settings
+(page size 32768, 4096 frames, 128 MiB of cache on both), 10 rounds per pass, two passes of each
+build of `sqlite-bench`, run in the order old, new, new, old. The machine was busy with other work,
+so the gate did not grade these passes, and the ratios are only good for comparing the two columns:
+
+| | SQLite's cache filled while timed | filled before |
+|---|---|---|
+| `prepare.point` | 6.56x, 6.65x | 5.41x, 5.40x |
+| `correlated.exists` | 2.76x, 2.80x | 0.53x, 0.55x |
+| `join.selective` | 27.03x, 27.80x | 26.66x, 27.03x |
+| `open.prepare` family | 1.83x, 1.90x | 1.68x, 1.70x |
+| `read.join` family | 4.75x, 5.29x | 5.10x, 5.02x |
+| `read.point` family | 32.71x, 37.07x | 33.64x, 35.83x |
+| headline, weighted | 5.99x, 6.24x | 6.07x, 6.08x |
+
+Two workloads moved. `prepare.point` is the first workload in the plan, and SQLite's time for it
+fell from about 72 ms to about 59 ms, which is the cost of reading the fixture. `correlated.exists`
+runs once per round, so the first read of its tables was most of its time. With the cache filled,
+inillucent is 85% slower than SQLite on it. The headline and reads by key did not move, so the cold
+cache does not explain either of them. The twelve SQLite workloads the quiet check times also did not
+move, so the idle reference recorded before the change still applies.
 
 The rules the gates follow:
 

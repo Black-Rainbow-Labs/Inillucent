@@ -843,7 +843,8 @@ fn open_session(model_path: &Path, options: &OnnxOptions) -> Result<Session> {
     // provider that will not start still created ONNX Runtime's environment, and without this
     // reference `ort` released it as the last one while the process exited, which read freed memory
     // and ended the process with STATUS_ACCESS_VIOLATION or STATUS_STACK_BUFFER_OVERRUN on Windows
-    // after the refusal had been printed. `exit_hook` says why the reference is never given back.
+    // after the refusal had been printed. `exit_hook` says why the reference is held on every target
+    // but Apple's.
     crate::exit_hook::keep_environment();
     let mut builder = Session::builder().context("creating an ONNX session builder")?;
     builder = builder

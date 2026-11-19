@@ -360,6 +360,9 @@ fn run(fixture: &Path, settings: &Settings) -> Result<Option<bool>, String> {
         Some(kib) => -kib,
         None => -((pool_bytes / 1024) as i32),
     };
+    // The pool is warmed below, before any clock, so SQLite's arm reads every
+    // page into its cache before its first workload as well.
+    plan.warm_reference = true;
 
     let imported_at = Instant::now();
     let database =

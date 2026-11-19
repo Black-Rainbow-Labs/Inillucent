@@ -143,17 +143,25 @@ const TLSEXT_NAMETYPE_HOST_NAME: c_long = 0;
 const TLS1_2_VERSION: c_long = 0x0303;
 
 /// The library, resolved on first use.
-static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+static LIBRARY: OnceLock<Result<Library, Vec<Refused>>> = OnceLock::new();
 
-extern "C" {
-    /// Opens a shared library.
-    fn dlopen(name: *const c_char, flags: c_int) -> *mut c_void;
-    /// Looks a symbol up in one.
-    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+/// Why one candidate library was not used.
+#[derive(Debug, PartialEq)]
+enum Refused {
+    Unopened(&'static str),
+    Incomplete(&'static str, &'static str),
 }
 
-/// `RTLD_NOW | RTLD_GLOBAL`, so a missing symbol fails here rather than later.
-const RTLD_NOW_GLOBAL: c_int = 0x00002 | 0x00100;
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Unopened(name) => write!(formatter, "{name} could not be opened"),
+            Refused::Incomplete(name, missing) => {
+                write!(formatter, "{name} was opened but has no {missing}")
+            }
+        }
+    }
+}
 
 /// Resolves one symbol, or returns `None`.
 ///
@@ -165,97 +173,103 @@ const RTLD_NOW_GLOBAL: c_int = 0x00002 | 0x00100;
 /// `handle` must be a live library handle.
 unsafe fn symbol(handle: *mut c_void, name: &str) -> Option<*mut c_void> {
     let named = CString::new(name).ok()?;
-    let found = dlsym(handle, named.as_ptr());
+    let found = libc::dlsym(handle, named.as_ptr());
     (!found.is_null()).then_some(found)
 }
 
-/// Loads the system TLS library and resolves what this client uses.
+/// Loads the first candidate that opens and has every function, or says why
+/// each one was passed over.
+///
+/// @param candidates - the library names to try, in order
+fn load(candidates: &[&'static str]) -> Result<Library, Vec<Refused>> {
+    let mut refused = Vec::new();
+    for &name in candidates {
+        let Ok(named) = CString::new(name) else {
+            refused.push(Refused::Unopened(name));
+            continue;
+        };
+        // SAFETY: `named` is a live NUL-terminated string, and the
+        // handle is never closed, so every pointer resolved from it
+        // stays valid for the life of the process.
+        let handle = unsafe { libc::dlopen(named.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        if handle.is_null() {
+            refused.push(Refused::Unopened(name));
+            continue;
+        }
+        // SAFETY: `handle` was just returned by `dlopen` and is never closed.
+        match unsafe { resolve(handle, name) } {
+            Ok(library) => return Ok(library),
+            Err(missing) => refused.push(Refused::Incomplete(name, missing)),
+        }
+    }
+    Err(refused)
+}
+
+/// Resolves what this client uses from one open library, or names the first
+/// function it lacks.
 ///
 /// Every symbol is required. A partial resolution is treated as no library at
 /// all, because the alternative is discovering the missing one during a
 /// handshake, at which point the choice is between a crash and a silent
 /// downgrade.
-fn library() -> Option<&'static Library> {
+///
+/// @param handle - the open library
+/// @param name - the name it was opened by
+///
+/// # Safety
+///
+/// `handle` must be a live library handle.
+unsafe fn resolve(handle: *mut c_void, name: &'static str) -> Result<Library, &'static str> {
+    let find = |wanted: &'static str| symbol(handle, wanted).ok_or(wanted);
+    // Each transmute's target is the `Library` field it is
+    // assigned to, so the struct above is the annotation, and
+    // spelling it out a second time on twenty calls is twenty
+    // places for the two copies to disagree.
+    //
+    // Each cast is from a resolved symbol to the signature OpenSSL publishes
+    // for it. A wrong signature here is a defect this file owns; the names are
+    // stable across 1.1 and 3.
+    #[allow(clippy::missing_transmute_annotations)]
+    Ok(Library {
+        tls_client_method: std::mem::transmute(find("TLS_client_method")?),
+        ssl_ctx_new: std::mem::transmute(find("SSL_CTX_new")?),
+        ssl_ctx_free: std::mem::transmute(find("SSL_CTX_free")?),
+        ssl_ctx_set_default_verify_paths: std::mem::transmute(find(
+            "SSL_CTX_set_default_verify_paths",
+        )?),
+        ssl_ctx_load_verify_locations: std::mem::transmute(find("SSL_CTX_load_verify_locations")?),
+        ssl_ctx_set_verify: std::mem::transmute(find("SSL_CTX_set_verify")?),
+        ssl_ctx_ctrl: std::mem::transmute(find("SSL_CTX_ctrl")?),
+        ssl_new: std::mem::transmute(find("SSL_new")?),
+        ssl_free: std::mem::transmute(find("SSL_free")?),
+        ssl_set_fd: std::mem::transmute(find("SSL_set_fd")?),
+        // The host name check. Absent before OpenSSL 1.1.0, and
+        // its absence is why such a library is refused rather
+        // than used.
+        ssl_set1_host: std::mem::transmute(find("SSL_set1_host")?),
+        ssl_ctrl: std::mem::transmute(find("SSL_ctrl")?),
+        ssl_connect: std::mem::transmute(find("SSL_connect")?),
+        ssl_read: std::mem::transmute(find("SSL_read")?),
+        ssl_write: std::mem::transmute(find("SSL_write")?),
+        ssl_shutdown: std::mem::transmute(find("SSL_shutdown")?),
+        ssl_get_verify_result: std::mem::transmute(find("SSL_get_verify_result")?),
+        x509_verify_cert_error_string: std::mem::transmute(find("X509_verify_cert_error_string")?),
+        ssl_get_version: std::mem::transmute(find("SSL_get_version")?),
+        name,
+    })
+}
+
+/// The system TLS library, resolved on first use, or why none was usable.
+fn library() -> Result<&'static Library, &'static [Refused]> {
     LIBRARY
-        .get_or_init(|| {
-            for name in CANDIDATES {
-                let Ok(named) = CString::new(name) else {
-                    continue;
-                };
-                // SAFETY: `named` is a live NUL-terminated string, and the
-                // handle is never closed, so every pointer resolved from it
-                // stays valid for the life of the process.
-                let handle = unsafe { dlopen(named.as_ptr(), RTLD_NOW_GLOBAL) };
-                if handle.is_null() {
-                    continue;
-                }
-                // Each transmute's target is the `Library` field it is
-                // assigned to, so the struct above is the annotation, and
-                // spelling it out a second time on twenty calls is twenty
-                // places for the two copies to disagree.
-                //
-                // SAFETY: `handle` is a live library handle, and each cast is
-                // from a resolved symbol to the signature OpenSSL publishes for
-                // it. A wrong signature here is a defect this file owns; the
-                // names are stable across 1.1 and 3.
-                #[allow(clippy::missing_transmute_annotations)]
-                let resolved = unsafe {
-                    Some(Library {
-                        tls_client_method: std::mem::transmute(symbol(
-                            handle,
-                            "TLS_client_method",
-                        )?),
-                        ssl_ctx_new: std::mem::transmute(symbol(handle, "SSL_CTX_new")?),
-                        ssl_ctx_free: std::mem::transmute(symbol(handle, "SSL_CTX_free")?),
-                        ssl_ctx_set_default_verify_paths: std::mem::transmute(symbol(
-                            handle,
-                            "SSL_CTX_set_default_verify_paths",
-                        )?),
-                        ssl_ctx_load_verify_locations: std::mem::transmute(symbol(
-                            handle,
-                            "SSL_CTX_load_verify_locations",
-                        )?),
-                        ssl_ctx_set_verify: std::mem::transmute(symbol(
-                            handle,
-                            "SSL_CTX_set_verify",
-                        )?),
-                        ssl_ctx_ctrl: std::mem::transmute(symbol(handle, "SSL_CTX_ctrl")?),
-                        ssl_new: std::mem::transmute(symbol(handle, "SSL_new")?),
-                        ssl_free: std::mem::transmute(symbol(handle, "SSL_free")?),
-                        ssl_set_fd: std::mem::transmute(symbol(handle, "SSL_set_fd")?),
-                        // The host name check. Absent before OpenSSL 1.1.0, and
-                        // its absence is why such a library is refused rather
-                        // than used.
-                        ssl_set1_host: std::mem::transmute(symbol(handle, "SSL_set1_host")?),
-                        ssl_ctrl: std::mem::transmute(symbol(handle, "SSL_ctrl")?),
-                        ssl_connect: std::mem::transmute(symbol(handle, "SSL_connect")?),
-                        ssl_read: std::mem::transmute(symbol(handle, "SSL_read")?),
-                        ssl_write: std::mem::transmute(symbol(handle, "SSL_write")?),
-                        ssl_shutdown: std::mem::transmute(symbol(handle, "SSL_shutdown")?),
-                        ssl_get_verify_result: std::mem::transmute(symbol(
-                            handle,
-                            "SSL_get_verify_result",
-                        )?),
-                        x509_verify_cert_error_string: std::mem::transmute(symbol(
-                            handle,
-                            "X509_verify_cert_error_string",
-                        )?),
-                        ssl_get_version: std::mem::transmute(symbol(handle, "SSL_get_version")?),
-                        name,
-                    })
-                };
-                if resolved.is_some() {
-                    return resolved;
-                }
-            }
-            None
-        })
+        .get_or_init(|| load(&CANDIDATES))
         .as_ref()
+        .map_err(Vec::as_slice)
 }
 
 /// Returns the name of the TLS library this machine will use.
 pub fn available() -> Option<&'static str> {
-    library().map(|held| held.name)
+    library().ok().map(|held| held.name)
 }
 
 /// One established TLS session over a socket.
@@ -303,25 +317,31 @@ impl Drop for Session {
     }
 }
 
+/// The error a migration reports when no candidate was usable.
+///
+/// @param refused - why each candidate was passed over
+fn refusal(refused: &[Refused]) -> inillucent_base::error::DbError {
+    let nothing_opened = refused
+        .iter()
+        .all(|reason| matches!(reason, Refused::Unopened(_)));
+    // On macOS the platform library is Homebrew's OpenSSL, so the message
+    // names the command that installs it.
+    let install = if cfg!(target_os = "macos") && nothing_opened {
+        " (on macOS: brew install openssl@3)"
+    } else {
+        ""
+    };
+    let reasons: Vec<String> = refused.iter().map(Refused::to_string).collect();
+    super::unavailable(format!("{}{install}", reasons.join("; ")))
+}
+
 /// Connects, handshakes and verifies.
 ///
 /// @param socket - the connected socket
 /// @param host - the name to check the certificate against
 /// @param root - an extra certificate authority file, when the URL named one
 pub fn connect(socket: TcpStream, host: &str, root: Option<&str>) -> DbResult<Session> {
-    let Some(library) = library() else {
-        // On macOS the platform library is Homebrew's OpenSSL, so the message
-        // names the command that installs it.
-        let install = if cfg!(target_os = "macos") {
-            " (on macOS: brew install openssl@3)"
-        } else {
-            ""
-        };
-        return Err(super::unavailable(format!(
-            "none of {} could be loaded{install}",
-            CANDIDATES.join(", ")
-        )));
-    };
+    let library = library().map_err(refusal)?;
     let named = CString::new(host)
         .map_err(|_| super::not_verified(host, "the host name contains a NUL byte"))?;
 
@@ -530,5 +550,70 @@ impl Write for Session {
     /// Nothing to flush: OpenSSL writes each record as it is produced.
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inillucent_base::testing::skipping;
+
+    #[cfg(target_os = "macos")]
+    const NOT_TLS: &str = "/usr/lib/libSystem.B.dylib";
+    #[cfg(not(target_os = "macos"))]
+    const NOT_TLS: &str = "libc.so.6";
+    const ABSENT: &str = "/nonexistent/inillucent/libssl-absent.so";
+
+    #[test]
+    fn each_refused_candidate_says_why() {
+        let Err(refused) = load(&[ABSENT, NOT_TLS]) else {
+            panic!("a list with no TLS library in it loaded one");
+        };
+        let said: Vec<String> = refused.iter().map(Refused::to_string).collect();
+        assert_eq!(
+            said,
+            vec![
+                format!("{ABSENT} could not be opened"),
+                format!("{NOT_TLS} was opened but has no TLS_client_method"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_refusal_lists_each_reason_and_offers_brew_only_when_nothing_opened() {
+        let unopened = refusal(&[Refused::Unopened(ABSENT)]).to_string();
+        let incomplete = refusal(&[Refused::Incomplete(NOT_TLS, "TLS_client_method")]).to_string();
+        assert!(
+            unopened.contains(&format!(
+                "no TLS implementation is usable here: {ABSENT} could not be opened"
+            )),
+            "{unopened}"
+        );
+        assert!(
+            incomplete.contains(&format!(
+                "{NOT_TLS} was opened but has no TLS_client_method"
+            )),
+            "{incomplete}"
+        );
+        assert_eq!(
+            unopened.contains("brew install openssl@3"),
+            cfg!(target_os = "macos"),
+            "{unopened}"
+        );
+        assert!(!incomplete.contains("brew install"), "{incomplete}");
+    }
+
+    #[test]
+    fn a_candidate_missing_a_function_does_not_end_the_search() {
+        if load(&CANDIDATES).is_err() {
+            skipping("tls::unix: no OpenSSL on this machine");
+            return;
+        }
+        let mut candidates = vec![NOT_TLS];
+        candidates.extend(CANDIDATES);
+        match load(&candidates) {
+            Ok(loaded) => assert!(CANDIDATES.contains(&loaded.name), "{}", loaded.name),
+            Err(refused) => panic!("the search stopped early: {refused:?}"),
+        }
     }
 }

@@ -29,6 +29,7 @@ mod group_walk;
 mod hint;
 mod implied;
 mod join_cost;
+mod join_order;
 mod limit_walk;
 mod order_constant;
 mod outer_paths;
@@ -1125,9 +1126,9 @@ pub fn expression_holds_subquery(expr: &BoundExpr) -> bool {
 /// enumeration is over those runs rather than over the whole list.
 ///
 /// Inside a run the search is exhaustive while that is affordable - the runs
-/// that occur in practice are two to five terms - and falls back to the written
-/// order beyond, because a greedy answer that is worse than the written order
-/// is worse than not reordering at all.
+/// that occur in practice are two to five terms - and over the most promising
+/// partial orders beyond, kept only when the model prices the result below the
+/// written order; see [`join_order::best_order`].
 fn choose_order(select: &BoundSelect, terms: &[BoundExpr], levers: Levers) -> Vec<usize> {
     let count = select.sources.len();
     if count < 2 {
@@ -1141,119 +1142,15 @@ fn choose_order(select: &BoundSelect, terms: &[BoundExpr], levers: Levers) -> Ve
             .get(position)
             .is_some_and(|source| matches!(source.join, JoinKind::Cross) || is_outer(source.join));
         if pins {
-            order.extend(best_order(select, terms, &run, levers));
+            order.extend(join_order::best_order(select, terms, &run, levers));
             run.clear();
             order.push(position);
             continue;
         }
         run.push(position);
     }
-    order.extend(best_order(select, terms, &run, levers));
+    order.extend(join_order::best_order(select, terms, &run, levers));
     order
-}
-
-/// Returns the cheapest visiting order for one run of reorderable terms.
-fn best_order(
-    select: &BoundSelect,
-    terms: &[BoundExpr],
-    run: &[usize],
-    levers: Levers,
-) -> Vec<usize> {
-    // Eight terms is 40,320 orders, which is milliseconds; beyond that the
-    // written order stands rather than a guess being substituted for it.
-    if run.len() < 2 || run.len() > 8 {
-        return run.to_vec();
-    }
-    let prerequisites = argument_prerequisites(select, terms, run);
-    let mut best: Option<(f64, Vec<usize>)> = None;
-    let mut candidate = run.to_vec();
-    permute(&mut candidate, 0, &mut |order| {
-        if !respects_prerequisites(order, &prerequisites) {
-            return;
-        }
-        let cost = order_cost(select, terms, order, levers);
-        let better = best
-            .as_ref()
-            .is_none_or(|(existing, _)| cost < *existing - 1e-9);
-        if better {
-            best = Some((cost, order.to_vec()));
-        }
-    });
-    best.map(|(_, order)| order).unwrap_or_else(|| run.to_vec())
-}
-
-/// Returns, for each table function in a run, the terms its arguments read.
-///
-/// **A function cannot run before its argument exists.** The cost model
-/// priced a function whose argument was not yet available as an ordinary
-/// scan, so in `FROM j, json_each(j.doc) e JOIN t ON t.id = e.value` the cheap
-/// order put `e` first. The function then ran with a NULL document, returned
-/// nothing, and the query answered no rows where SQLite answers every match.
-/// This is SQLite's prerequisite rule for a virtual table's constraints.
-///
-/// Each pair is (the position that needs, the position it needs), both in
-/// `select.sources`. A term outside the run, such as one an earlier pinned run
-/// holds, is already placed and adds no pair.
-///
-/// @param select - the bound statement
-/// @param terms - the statement's `WHERE` and `ON` conjuncts
-/// @param run - the positions of one run of reorderable terms
-fn argument_prerequisites(
-    select: &BoundSelect,
-    terms: &[BoundExpr],
-    run: &[usize],
-) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for term in terms {
-        if !flatten::is_table_argument(select, term) {
-            continue;
-        }
-        let BoundExpr::Compare { left, right, .. } = term else {
-            continue;
-        };
-        let BoundExpr::Column { source: needs, .. } = left.as_ref() else {
-            continue;
-        };
-        let position_of = |id: usize| {
-            run.iter()
-                .copied()
-                .find(|at| select.sources.get(*at).is_some_and(|held| held.id == id))
-        };
-        let Some(dependent) = position_of(*needs) else {
-            continue;
-        };
-        let mut used = Vec::new();
-        right.sources_used(&mut used);
-        for id in used.into_iter().filter(|id| id != needs) {
-            if let Some(needed) = position_of(id) {
-                pairs.push((dependent, needed));
-            }
-        }
-    }
-    pairs
-}
-
-/// Reports whether every term in an order comes after the terms it needs.
-///
-/// @param order - one permutation of a run
-/// @param prerequisites - pairs from [`argument_prerequisites`]
-fn respects_prerequisites(order: &[usize], prerequisites: &[(usize, usize)]) -> bool {
-    prerequisites.iter().all(|(needs, needed)| {
-        order.iter().position(|at| at == needs) > order.iter().position(|at| at == needed)
-    })
-}
-
-/// Calls a closure with every permutation of a slice.
-fn permute(order: &mut Vec<usize>, at: usize, visit: &mut impl FnMut(&[usize])) {
-    if at >= order.len() {
-        visit(order);
-        return;
-    }
-    for index in at..order.len() {
-        order.swap(at, index);
-        permute(order, at.saturating_add(1), visit);
-        order.swap(at, index);
-    }
 }
 
 /// Returns what one visiting order is estimated to cost.

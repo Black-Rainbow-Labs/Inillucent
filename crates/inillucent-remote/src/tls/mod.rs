@@ -136,7 +136,7 @@ pub fn connect(socket: TcpStream, host: &str, root: Option<&str>) -> DbResult<Se
 /// @param why - what was missing
 pub(crate) fn unavailable(why: impl std::fmt::Display) -> inillucent_base::error::DbError {
     refusal(format!(
-        "this migration asks for verified TLS and no TLS implementation is reachable here: {why}. \
+        "this migration asks for verified TLS and no TLS implementation is usable here: {why}. \
          Install the platform's TLS library, or - only for a loopback address or a network you \
          trust - write sslmode=disable in the URL and pass --insecure-plaintext."
     ))
