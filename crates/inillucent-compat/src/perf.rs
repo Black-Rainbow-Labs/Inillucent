@@ -154,6 +154,15 @@ pub struct Plan {
     pub page_size: u32,
     /// The page cache budget both engines use, in SQLite's own units.
     pub cache_size: i32,
+    /// Whether SQLite's arm reads every page into its cache before the first
+    /// workload, outside every clock.
+    ///
+    /// **Set only by a driver whose inillucent arm fills its pool first**: the
+    /// full gate and the read gate. Before this existed, those two warmed
+    /// inillucent's pool and left SQLite's cache to fill inside the clock of
+    /// the first workload that read each table. The scorecard and the write
+    /// gate leave it off, because their inillucent arm starts cold as well.
+    pub warm_reference: bool,
     /// The statements that build the pristine database.
     pub setup: Vec<String>,
     /// The workloads, in the order both engines run them.
@@ -169,9 +178,16 @@ impl Plan {
         let _ = writeln!(out, "scale\t{}", self.scale);
         let _ = writeln!(out, "rows\t{}", self.rows);
         let _ = writeln!(out, "journal\t{}", self.journal);
+        // `sqlite_bench.c` has read a `locking` key since the full gate gained
+        // `--locking`, but nothing wrote it, so `--locking exclusive` left
+        // SQLite in `normal` while the configuration said `exclusive`.
+        let _ = writeln!(out, "locking\t{}", self.locking);
         let _ = writeln!(out, "synchronous\t{}", self.synchronous);
         let _ = writeln!(out, "page_size\t{}", self.page_size);
         let _ = writeln!(out, "cache_size\t{}", self.cache_size);
+        if self.warm_reference {
+            out.push_str("warm\t1\n");
+        }
         for statement in &self.setup {
             let _ = writeln!(out, "setup\t{}", one_line(statement));
         }
@@ -819,6 +835,7 @@ pub fn plan_for(scale: &str) -> Plan {
         synchronous: "full".to_string(),
         page_size: 4096,
         cache_size: -2000,
+        warm_reference: false,
         setup: setup_for(rows),
         workloads,
     }
@@ -1626,14 +1643,15 @@ mod tests {
     /// The plan renders one line per key, with the SQL flattened.
     #[test]
     fn a_plan_renders_one_line_per_key() {
-        let plan = Plan {
+        let mut plan = Plan {
             scale: "small".to_string(),
             rows: 1000,
             journal: "delete".to_string(),
-            locking: "normal".to_string(),
+            locking: "exclusive".to_string(),
             synchronous: "full".to_string(),
             page_size: 4096,
             cache_size: -2000,
+            warm_reference: false,
             setup: vec!["CREATE TABLE t(a INTEGER PRIMARY KEY,\n b TEXT)".to_string()],
             workloads: vec![Workload {
                 name: "read.point".to_string(),
@@ -1654,6 +1672,12 @@ mod tests {
         assert!(rendered.contains("bind\trowid\n"));
         assert!(rendered.contains("prepare\tonce\n"));
         assert!(!rendered.contains("\n \n"));
+        // The lock mode reaches SQLite's arm, and the warmup is off unless a
+        // driver whose own arm is warmed asks for it.
+        assert!(rendered.contains("locking\texclusive\n"));
+        assert!(!rendered.contains("warm\t"));
+        plan.warm_reference = true;
+        assert!(plan.render().contains("warm\t1\n"));
     }
 
     /// A sample survives the round trip through a driver's output line.

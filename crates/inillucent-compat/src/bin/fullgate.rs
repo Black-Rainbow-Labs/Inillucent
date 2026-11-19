@@ -566,6 +566,9 @@ fn filtered_plan(settings: &Settings) -> Result<inillucent_compat::perf::Plan, S
         plan_for(&settings.scale)
     };
     plan.setup.clear();
+    // `round_on` fills inillucent's pool before the first workload, so SQLite's
+    // arm fills its cache before the first workload too.
+    plan.warm_reference = true;
     // **A workload whose family no table weights still runs** (task-2066
     // §4.3.1). `--families` names which of the ten weighted families to
     // measure and its default is all of them, so a filter by membership drops
@@ -743,7 +746,7 @@ fn print_configuration(
         println!("                SQLite compiles per iteration for a prepare-each workload too.");
     }
     println!(
-        "  warm state  : inillucent's pool is filled before each round; SQLite's cache fills as the plan runs"
+        "  warm state  : both engines fill their cache before the first workload of each round"
     );
     println!("  durability  : synchronous = FULL on both arms");
     println!();
@@ -1924,11 +1927,14 @@ fn round_on(
 ) -> Result<(Vec<Sample>, Vec<String>, RoundCost), String> {
     // **The pool is filled before the clock starts, which is what the read gate
     // does and what makes these numbers comparable to Phase 2's and Phase 3's.**
-    // It is an asymmetry and the configuration says so: SQLite's arm has no
-    // equivalent hook, and its own cache fills as the plan's earlier workloads
-    // read the same tables. The import closes and reopens the file, so without
-    // this the first workload of every round would be paying for the whole
-    // fixture's first read.
+    // SQLite's arm does the same, because `filtered_plan` sets `warm_reference` and
+    // `sqlite_bench.c` then reads every page through `dbstat` before its first
+    // workload. Before it did, SQLite's first workload to read a table paid for
+    // the whole fixture's first read inside its clock. On the medium fixture on
+    // Windows that put `prepare.point` at 6.6x instead of 5.4x and
+    // `correlated.exists` at 2.8x instead of 0.54x. The import closes and reopens
+    // the file, so without this the first workload of every round would be
+    // paying for the whole fixture's first read.
     database
         .warm()
         .map_err(|error| format!("warming failed: {}", why(&error)))?;
