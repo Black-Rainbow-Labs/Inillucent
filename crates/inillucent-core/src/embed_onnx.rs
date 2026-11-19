@@ -808,7 +808,10 @@ impl TokenCounter {
 /// @param model_path - the `.onnx` file
 /// @param options - the device, the thread count and the optimization level
 pub(crate) fn build_session(model_path: &Path, options: &OnnxOptions) -> Result<Session> {
-    use_installed_runtime().map_err(|reason| anyhow::anyhow!(reason))?;
+    use_installed_runtime().map_err(|failure| match failure {
+        LoadFailure::Refused => anyhow::Error::new(RuntimeRefused),
+        LoadFailure::WouldNotLoad(reason) => anyhow::anyhow!(reason),
+    })?;
     // **A panic inside `ort` becomes an error here.** Under `load-dynamic`,
     // `ort` loads the library the first time its API is used, and when the
     // library will not load it panics instead of returning an error. 2.0.3's
@@ -1182,15 +1185,22 @@ pub(crate) fn plan_batches(
 /// has pinned a specific library keeps it; and a failure to load the installed
 /// one is left to the session to report, because the loader's own message names
 /// the file and a message from here would only name the attempt.
-fn use_installed_runtime() -> std::result::Result<(), String> {
+///
+/// The one exception is a process the system runs with raised privileges, which
+/// [`choose_runtime`] refuses before `ort` is touched.
+fn use_installed_runtime() -> std::result::Result<(), LoadFailure> {
     use std::sync::OnceLock;
-    static ONCE: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    static ONCE: OnceLock<std::result::Result<(), LoadFailure>> = OnceLock::new();
     ONCE.get_or_init(|| {
-        if std::env::var("ORT_DYLIB_PATH").is_ok_and(|value| !value.trim().is_empty()) {
-            return Ok(());
-        }
-        let Some(library) = crate::install::runtime_library() else {
-            return Ok(());
+        let named = std::env::var("ORT_DYLIB_PATH").is_ok_and(|value| !value.trim().is_empty());
+        let library = match choose_runtime(
+            crate::secure_execution::active(),
+            named,
+            crate::install::runtime_library,
+        ) {
+            RuntimeChoice::Refuse => return Err(LoadFailure::Refused),
+            RuntimeChoice::LeaveToOrt => return Ok(()),
+            RuntimeChoice::Installed(library) => library,
         };
         // **A library that is installed and will not load is an error, not a
         // fallback.** 2.0.3 printed a warning here and went on to the system
@@ -1202,14 +1212,89 @@ fn use_installed_runtime() -> std::result::Result<(), String> {
                 builder.commit();
                 Ok(())
             }
-            Err(error) => Err(format!(
+            Err(error) => Err(LoadFailure::WouldNotLoad(format!(
                 "the ONNX Runtime at {} would not load: {error}.{}",
                 library.display(),
                 RUNTIME_LOAD_HELP
-            )),
+            ))),
         }
     })
     .clone()
+}
+
+/// Why no ONNX Runtime is available to a session, kept once per process.
+#[derive(Debug, Clone)]
+enum LoadFailure {
+    /// The process runs with raised privileges; see [`RuntimeRefused`].
+    Refused,
+    /// The installed library would not load. The text names it and the loader's reason.
+    WouldNotLoad(String),
+}
+
+/// The error opening a session gives when ONNX Runtime was not loaded because the process runs
+/// with raised privileges.
+///
+/// **A type and not only a sentence.** `inillucent-search` finds it with `downcast_ref` and writes
+/// a refusal of its own. Its usual message for a session that would not open says to install the
+/// runtime, and installing it would change nothing here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeRefused;
+
+impl std::fmt::Display for RuntimeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SECURE_EXECUTION_REFUSAL)
+    }
+}
+
+impl std::error::Error for RuntimeRefused {}
+
+/// Where ONNX Runtime is loaded from, decided before `ort` is first used.
+#[derive(Debug, PartialEq)]
+enum RuntimeChoice {
+    /// Load no library at all; see [`RuntimeRefused`].
+    Refuse,
+    /// Let `ort` find the library itself: `ORT_DYLIB_PATH` when it is set, the
+    /// system loader otherwise.
+    LeaveToOrt,
+    /// Load the runtime `inillucent setup-embeddings` installed, at this path.
+    Installed(PathBuf),
+}
+
+/// Why no ONNX Runtime is loaded in a process the system runs with raised
+/// privileges.
+const SECURE_EXECUTION_REFUSAL: &str = "ONNX Runtime was not loaded, because this program runs with privileges its caller does not have (setuid, setgid or file capabilities) and the library would be chosen by the caller's environment: ORT_DYLIB_PATH, or the install folder INILLUCENT_HOME or HOME names. Run it as an ordinary program to use embeddings";
+
+/// Decides where ONNX Runtime comes from.
+///
+/// **Raised privileges refuse every source, not only `ORT_DYLIB_PATH`.** In a
+/// setuid or setgid program the system loader ignores `LD_LIBRARY_PATH` and
+/// `DYLD_` variables, so a caller cannot choose the program's libraries. Each
+/// source here is chosen by the caller's environment too: `ORT_DYLIB_PATH`
+/// directly, which `ort` would also read by itself; and the installed runtime
+/// through `INILLUCENT_HOME` or `HOME`, which the loader leaves in place.
+/// Ignoring the one variable would still let `HOME` point at a folder holding a
+/// library of the caller's making. A privileged program that needs embeddings
+/// is not something inillucent ships, so refusing costs nothing real.
+///
+/// @param secure - whether the process runs with raised privileges, from
+///   [`crate::secure_execution::active`]
+/// @param named - whether `ORT_DYLIB_PATH` is set to something other than blanks
+/// @param installed - finds the installed runtime; called only when it is used
+fn choose_runtime(
+    secure: bool,
+    named: bool,
+    installed: impl FnOnce() -> Option<PathBuf>,
+) -> RuntimeChoice {
+    if secure {
+        return RuntimeChoice::Refuse;
+    }
+    if named {
+        return RuntimeChoice::LeaveToOrt;
+    }
+    match installed() {
+        Some(library) => RuntimeChoice::Installed(library),
+        None => RuntimeChoice::LeaveToOrt,
+    }
 }
 
 /// What to say after an installed ONNX Runtime fails to load.
@@ -1284,6 +1369,49 @@ impl Embedder for OnnxEmbedder {
 mod tests {
     use super::*;
     use crate::distance::dot;
+
+    /// With raised privileges, `ORT_DYLIB_PATH` is refused and not handed on to `ort`, which
+    /// would read it by itself. An order that looked at the variable first would leave it to `ort`.
+    #[test]
+    fn raised_privileges_refuse_a_named_runtime() {
+        let choice = choose_runtime(true, true, || Some(PathBuf::from("/installed/lib")));
+        assert_eq!(choice, RuntimeChoice::Refuse);
+    }
+
+    /// With raised privileges, the installed runtime is refused too, and never even looked up,
+    /// because `HOME` and `INILLUCENT_HOME` choose the folder it is found in.
+    #[test]
+    fn raised_privileges_refuse_the_installed_runtime_without_looking_for_it() {
+        let mut looked = false;
+        let choice = choose_runtime(true, false, || {
+            looked = true;
+            Some(PathBuf::from("/installed/lib"))
+        });
+        assert_eq!(choice, RuntimeChoice::Refuse);
+        assert!(
+            !looked,
+            "the install folder was searched in a privileged process"
+        );
+    }
+
+    /// An ordinary process keeps what it had: a named library is left to `ort`, the installed one
+    /// is loaded when nothing is named, and with neither `ort` asks the system loader.
+    #[test]
+    fn an_ordinary_process_chooses_as_before() {
+        let installed = PathBuf::from("/installed/lib");
+        assert_eq!(
+            choose_runtime(false, true, || Some(installed.clone())),
+            RuntimeChoice::LeaveToOrt
+        );
+        assert_eq!(
+            choose_runtime(false, false, || Some(installed.clone())),
+            RuntimeChoice::Installed(installed.clone())
+        );
+        assert_eq!(
+            choose_runtime(false, false, || None),
+            RuntimeChoice::LeaveToOrt
+        );
+    }
 
     fn model_dir() -> Option<PathBuf> {
         // The roots are the installer's, read from the environment rather than

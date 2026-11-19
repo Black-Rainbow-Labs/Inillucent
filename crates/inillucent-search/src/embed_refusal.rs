@@ -162,6 +162,25 @@ pub fn cuda_would_not_start(function: &str, reason: &dyn std::fmt::Display) -> D
     .with_detail(format!("{function}: {reason}"))
 }
 
+/// The refusal a call gets when the program runs setuid or setgid, so no ONNX Runtime is loaded.
+///
+/// **It does not say to install the runtime**, which [`model_would_not_run`] does. The runtime is
+/// refused wherever it is, because the caller's environment chooses the library, and an install
+/// would change nothing. It names the variables so the person can see which choice was refused.
+///
+/// @param function - the SQL function that was called, such as `embed`
+pub fn runtime_refused(function: &str) -> DbError {
+    error::unmet_requirement(
+        "a program without raised privileges",
+        format!(
+            "{function}: ONNX Runtime is not loaded in a program that runs setuid or setgid, \
+             because the caller's environment would choose the library through ORT_DYLIB_PATH, \
+             {} or HOME. Run it as an ordinary program to use {function}",
+            install::HOME_VAR
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +239,21 @@ mod tests {
             "the runtime's own words are kept for a diagnostic reader"
         );
         assert_eq!(refused.requirement(), Some("a working ONNX Runtime"));
+    }
+
+    /// A program with raised privileges is told why, and is not told to install a runtime that
+    /// would be refused just the same.
+    #[test]
+    fn a_privileged_program_is_told_why_and_not_to_install_the_runtime() {
+        let refused = runtime_refused("embed");
+        let message = format!("{refused}");
+        assert!(message.contains("setuid or setgid"), "{message}");
+        assert!(message.contains("ORT_DYLIB_PATH"), "{message}");
+        assert!(!message.contains("setup-embeddings"), "{message}");
+        assert_eq!(
+            refused.requirement(),
+            Some("a program without raised privileges")
+        );
     }
 
     /// A CUDA start that failed names the command that installs the CUDA runtime, and says it did

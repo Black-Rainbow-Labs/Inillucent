@@ -45,13 +45,15 @@
 use std::sync::{Arc, OnceLock};
 
 use inillucent_base::{error, DbResult};
-use inillucent_core::embed_onnx::{OnnxOptions, TokenCounter};
+use inillucent_core::embed_onnx::{OnnxOptions, RuntimeRefused, TokenCounter};
 use inillucent_core::install;
 use inillucent_core::model::ModelManifest;
 use inillucent_core::residency::{ManagedEmbedder, Residency};
 use inillucent_value::Value;
 
-use crate::embed_refusal::{cuda_would_not_start, model_would_not_run, no_model, MODEL};
+use crate::embed_refusal::{
+    cuda_would_not_start, model_would_not_run, no_model, runtime_refused, MODEL,
+};
 
 /// The managed embedder, and whether building one was even possible.
 ///
@@ -139,13 +141,15 @@ fn embed(arguments: &[Value<'static>]) -> DbResult<Value<'static>> {
         Ok(built) => built,
         Err(failure) => return Err(refusal_for(failure)),
     };
-    let vectors = built
-        .embedder
-        .embed_prefixed(&[text])
-        .map_err(|reason| match built.cuda {
+    let vectors = built.embedder.embed_prefixed(&[text]).map_err(|reason| {
+        if reason.downcast_ref::<RuntimeRefused>().is_some() {
+            return runtime_refused("embed");
+        }
+        match built.cuda {
             true => cuda_would_not_start("embed", &format!("{reason:#}")),
             false => model_would_not_run(&format!("{reason:#}")),
-        })?;
+        }
+    })?;
     let Some(vector) = vectors.first() else {
         return Err(error::refusal("embed: the model returned no vector"));
     };

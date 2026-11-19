@@ -47,6 +47,8 @@ pub mod rank;
 #[cfg(feature = "onnx")]
 pub mod rerank_onnx;
 pub mod residency;
+#[cfg(feature = "onnx")]
+mod secure_execution;
 pub mod store;
 pub mod tokenize;
 pub mod vectors;

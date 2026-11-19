@@ -21,13 +21,15 @@
 use std::sync::{Arc, OnceLock};
 
 use inillucent_base::DbResult;
-use inillucent_core::embed_onnx::OnnxOptions;
+use inillucent_core::embed_onnx::{OnnxOptions, RuntimeRefused};
 use inillucent_core::install;
 use inillucent_core::model::ModelManifest;
 use inillucent_core::residency::{ManagedReranker, Residency};
 use inillucent_value::Value;
 
-use crate::embed_refusal::{cuda_would_not_start, no_reranker, reranker_would_not_run, RERANKER};
+use crate::embed_refusal::{
+    cuda_would_not_start, no_reranker, reranker_would_not_run, runtime_refused, RERANKER,
+};
 
 /// The managed reranker, and whether building one was possible.
 ///
@@ -103,13 +105,15 @@ pub(crate) fn score(query: &str, passages: &[&str]) -> DbResult<Vec<f32>> {
         Ok(built) => built,
         Err(failure) => return Err(refusal_for(failure)),
     };
-    built
-        .reranker
-        .score(query, passages)
-        .map_err(|reason| match built.cuda {
+    built.reranker.score(query, passages).map_err(|reason| {
+        if reason.downcast_ref::<RuntimeRefused>().is_some() {
+            return runtime_refused("rerank");
+        }
+        match built.cuda {
             true => cuda_would_not_start("rerank", &format!("{reason:#}")),
             false => reranker_would_not_run(&format!("{reason:#}")),
-        })
+        }
+    })
 }
 
 /// Returns a value's text, or nothing when it is NULL.
