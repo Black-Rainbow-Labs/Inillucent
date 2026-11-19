@@ -19,9 +19,9 @@
 //! What is **not** implemented is deliberate: no zip64, no encryption, no
 //! compression method other than store and deflate, no tar extension beyond the
 //! GNU long-name record. Each of those is refused by name if it appears, so an
-//! archive this cannot read is a message rather than a wrong file. The two
-//! archives this actually opens - Microsoft's ONNX Runtime releases - use none
-//! of them.
+//! archive this cannot read is a message rather than a wrong file. The archives
+//! this actually opens are Microsoft's ONNX Runtime packages on NuGet, which are
+//! zip files, and they use none of them.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -56,6 +56,18 @@ pub const MAX_MEMBER: u64 = 1024 * 1024 * 1024;
 ///
 /// @param bytes - the whole archive
 pub fn read_zip(bytes: &[u8]) -> DbResult<Vec<Member>> {
+    read_zip_matching(bytes, &|_| true)
+}
+
+/// Reads the members of a zip archive whose names `keep` accepts.
+///
+/// A member `keep` refuses is skipped before it is decompressed. The NuGet
+/// package ONNX Runtime is installed from holds the library for every platform,
+/// about 260 MB once inflated, and an installer needs one folder of it.
+///
+/// @param bytes - the whole archive
+/// @param keep - whether a member, by its name inside the archive, is read
+pub fn read_zip_matching(bytes: &[u8], keep: &dyn Fn(&str) -> bool) -> DbResult<Vec<Member>> {
     let end = find_end_of_central_directory(bytes)
         .ok_or_else(|| refusal("this is not a zip archive: it has no central directory"))?;
     let count = u64::from(word(bytes, end.saturating_add(10)));
@@ -89,7 +101,7 @@ pub fn read_zip(bytes: &[u8]) -> DbResult<Vec<Member>> {
             .saturating_add(extra_len)
             .saturating_add(comment_len);
 
-        if name.ends_with('/') {
+        if name.ends_with('/') || !keep(&name) {
             continue;
         }
         if compressed as u64 > MAX_MEMBER || uncompressed as u64 > MAX_MEMBER {
@@ -270,11 +282,26 @@ pub fn read_tar(bytes: &[u8]) -> DbResult<Vec<Member>> {
 ///
 /// @param bytes - the whole archive
 pub fn read(bytes: &[u8]) -> DbResult<Vec<Member>> {
+    read_matching(bytes, &|_| true)
+}
+
+/// Reads the members of an archive whose names `keep` accepts, choosing the
+/// format from the file's own first bytes.
+///
+/// A zip member `keep` refuses is never decompressed. A gzipped tar is one
+/// compressed stream, so all of it is decompressed and the members `keep`
+/// refuses are dropped afterwards.
+///
+/// @param bytes - the whole archive
+/// @param keep - whether a member, by its name inside the archive, is read
+pub fn read_matching(bytes: &[u8], keep: &dyn Fn(&str) -> bool) -> DbResult<Vec<Member>> {
     if byte(bytes, 0) == 0x1f && byte(bytes, 1) == 0x8b {
-        return read_tar_gz(bytes);
+        let mut members = read_tar_gz(bytes)?;
+        members.retain(|member| keep(&member.name));
+        return Ok(members);
     }
     if byte(bytes, 0) == b'P' && byte(bytes, 1) == b'K' {
-        return read_zip(bytes);
+        return read_zip_matching(bytes, keep);
     }
     Err(refusal(
         "this file is neither a zip archive nor a gzip stream",
@@ -578,6 +605,35 @@ mod tests {
         assert_eq!(read(&zip_of("a", b"x", 0)).unwrap().len(), 1);
         assert_eq!(read(&gzip_of(&tar_of("a", b"x"))).unwrap().len(), 1);
         assert!(read(b"not an archive at all").is_err());
+    }
+
+    /// A zip member the caller does not want is skipped before it is
+    /// decompressed.
+    ///
+    /// The member is written with compression method 9, which this reader
+    /// refuses. Reading everything fails on it. Reading with a filter that
+    /// refuses its name succeeds, which shows the filter ran before the
+    /// decompression did.
+    #[test]
+    fn a_member_the_filter_refuses_is_never_decompressed() {
+        let archive = zip_of("runtimes/android/native/onnxruntime.aar", b"x", 9);
+        assert!(read(&archive).is_err());
+        let kept = read_matching(&archive, &|name| name.starts_with("runtimes/linux-x64/"))
+            .expect("a refused member is skipped rather than read");
+        assert!(kept.is_empty());
+
+        let wanted = zip_of("runtimes/linux-x64/native/libonnxruntime.so", b"x", 0);
+        let kept = read_matching(&wanted, &|name| name.starts_with("runtimes/linux-x64/")).unwrap();
+        assert_eq!(kept.len(), 1);
+        let tar = gzip_of(&tar_of(
+            "runtimes/osx-arm64/native/libonnxruntime.dylib",
+            b"x",
+        ));
+        assert!(
+            read_matching(&tar, &|name| name.starts_with("runtimes/linux-x64/"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A member that walks out of the destination stops the extraction.

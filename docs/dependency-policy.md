@@ -191,9 +191,9 @@ unencrypted connection.
 
 ## Example: downloads for `setup-embeddings`
 
-`inillucent setup-embeddings` downloads ONNX Runtime from GitHub and the model weights from Hugging
-Face. It checks both against pinned SHA-256 digests, then takes one shared library out of a zip file
-or a gzipped tar file. None of that added a dependency.
+`inillucent setup-embeddings` downloads ONNX Runtime from NuGet and the model weights from Hugging
+Face. It checks both against pinned SHA-256 digests, then takes the shared libraries out of the
+NuGet package, which is a zip file. None of that added a dependency.
 
 An HTTP client crate was refused for the same reason as the `postgres` crate. Each one brings a TLS
 library, and the popular ones bring an async runtime, into a program whose peak memory is published.

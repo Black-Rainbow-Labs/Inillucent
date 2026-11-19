@@ -254,7 +254,7 @@ than the one that added facets refuses to open it, with a message that says so.
 inillucent can make the vectors itself, inside your process, with no embedding server:
 
 ```sh
-inillucent setup-embeddings all        # ONNX Runtime and nomic-embed-text-v1.5, about 620 MB, once
+inillucent setup-embeddings all        # ONNX Runtime and nomic-embed-text-v1.5, about 670 MB, once
 ```
 
 ```sql

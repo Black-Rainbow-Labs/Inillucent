@@ -10,6 +10,18 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`inillucent setup-embeddings runtime` installs ONNX Runtime from NuGet.** Every URL in the
+`github.com/microsoft/onnxruntime` repository, release downloads included, now answers 404, so the
+command could not install the runtime on any platform. It now downloads Microsoft's
+`Microsoft.ML.OnnxRuntime` package from `api.nuget.org`, or `Microsoft.ML.OnnxRuntime.Gpu.Windows`
+and `Microsoft.ML.OnnxRuntime.Gpu.Linux` with `--gpu`. The packages are pinned by SHA-256, and only
+the folder of the package for this machine's platform is decompressed. The CPU package holds every
+platform's library and is 121 MB, so the first `setup-embeddings all` downloads about 670 MB where
+it used to download about 620 MB. ONNX Runtime is still 1.22.0. A new test, run when
+`INILLUCENT_NETWORK_TESTS` is set, checks that every package in the table is served and installs the
+runtime for the machine it runs on. An earlier release can still use a runtime set with
+`ORT_DYLIB_PATH`.
+
 **A process on macOS that called `embed()` or `rerank()` exits with code 0 again.** From 2.8.0,
 every `inillucent`, `inillucent-shell` and `inillucent-mcp` process on a Mac that embedded printed
 the right answer and then aborted at exit with exit code 134 and `mutex lock failed: Invalid

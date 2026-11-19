@@ -470,6 +470,40 @@ pub fn get(url: &str, limit: usize) -> DbResult<Vec<u8>> {
     get_on(url, limit, crate::curl::selected())
 }
 
+/// Checks that a URL serves a file, and returns its size when the server says it.
+///
+/// The body is opened and its first bytes are read, then the connection is
+/// closed, so a 300 MB file costs one chunk. An error status, a refused
+/// redirect or an empty body is an error. This is how a test checks that every
+/// download the installer knows about is still there without downloading all
+/// of them.
+///
+/// @param url - what to check
+pub fn served(url: &str) -> DbResult<Option<u64>> {
+    let parsed = Url::parse(url)?;
+    let opened = open_body(url, &parsed, 0, crate::curl::selected())?;
+    let mut body = opened.body;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let read = match body.read_body(&mut buffer) {
+        Ok(read) => read,
+        Err(error) => {
+            body.abandon();
+            return Err(error);
+        }
+    };
+    if read == 0 {
+        // curl reports an HTTP error only when it exits, so the empty read is
+        // where a 404 shows up on that transport.
+        body.finish()?;
+        return Err(refusal(format!(
+            "{} answered with an empty body",
+            parsed.display()
+        )));
+    }
+    body.abandon();
+    Ok(opened.total)
+}
+
 /// [`get`], on the transport the caller names.
 ///
 /// @param url - what to fetch
