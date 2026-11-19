@@ -642,6 +642,13 @@ fn a_server_refuses_the_dot_commands_that_reach_outside_it() {
     );
 }
 
+/// `.trace <path>` sent to a server started `--readonly` with no `--root` does
+/// not change the named file.
+///
+/// The server runs in safe mode, where the reference treats a trace file as
+/// `off`. Before that check the server emptied the file, so any file the server
+/// process could write could be truncated by one tool call. The statement after
+/// `.trace` must still answer, so the server did not fail the whole request.
 #[test]
 fn trace_on_a_server_with_no_root_does_not_touch_the_named_file() {
     let binary = program("inillucent");

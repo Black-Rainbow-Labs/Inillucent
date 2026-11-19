@@ -651,6 +651,11 @@ fn the_unsafe_dot_commands_are_refused_in_safe_mode() {
     );
 }
 
+/// `.trace FILE` under `-safe` turns tracing off and leaves the file as it was.
+///
+/// The same input without `-safe` must replace the file with the statement, so
+/// the test cannot pass because `.trace` writes nothing at all. `.trace stdout`
+/// must still print under `-safe`, because the reference allows both streams.
 #[test]
 fn trace_to_a_file_is_off_in_safe_mode() {
     let binary = program("inillucent");
