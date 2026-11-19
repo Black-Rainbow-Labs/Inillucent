@@ -254,7 +254,7 @@ than the one that added facets refuses to open it, with a message that says so.
 inillucent can make the vectors itself, inside your process, with no embedding server:
 
 ```sh
-inillucent setup-embeddings all        # ONNX Runtime and nomic-embed-text-v1.5, about 620 MB, once
+inillucent setup-embeddings all        # ONNX Runtime and nomic-embed-text-v1.5, about 670 MB, once
 ```
 
 ```sql
@@ -272,7 +272,8 @@ SELECT id FROM note ORDER BY vector_distance_cos(v, embed('search_query: flight 
 
 - **Nothing has to be exported after the install.** The engine finds the runtime and the model
   where `inillucent setup-embeddings` put them. `ORT_DYLIB_PATH` and `INILLUCENT_ONNX_DIR` override
-  those locations.
+  those locations. A program that runs setuid or setgid loads no runtime at all, because the
+  environment of whoever started it would choose the library.
 - **`embed()` runs once for a statement when its argument does not change between rows.** `embed`
   is registered as deterministic, so the planner can compute it once.
 - **`embed()` runs only in a statement the program sends.** It is refused in a trigger, a view, a

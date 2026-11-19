@@ -24,12 +24,26 @@
 //! unverified in the output *and* in the install state, and the state file is
 //! where somebody later finds out that this one was taken on trust.
 //!
+//! ## Where the runtime comes from
+//!
+//! NuGet, from the packages Microsoft publishes there: `Microsoft.ML.OnnxRuntime`
+//! for the CPU build, and `Microsoft.ML.OnnxRuntime.Gpu.Windows` and
+//! `Microsoft.ML.OnnxRuntime.Gpu.Linux` for the CUDA build. A package is a zip
+//! file, and its `runtimes/<platform>/native/` folder holds the shared library
+//! for that platform. Until November 2026 this downloaded the archives on the
+//! release pages of github.com/microsoft/onnxruntime. Every URL in that
+//! repository started answering 404, and `setup-embeddings runtime` could not
+//! install the runtime on any platform (task-2776). NuGet serves every version,
+//! and a published NuGet package cannot be replaced, so a digest pinned here
+//! stays correct.
+//!
+//! The CPU package holds every platform's library, so it is the same 121 MB
+//! download everywhere. Only the members in this platform's folder are
+//! decompressed.
+//!
 //! ## Why 1.22.0
 //!
-//! It is the version this repository's embedding numbers were taken on, and it
-//! is the last release Microsoft publishes a `universal2` macOS archive for.
-//! After it, macOS is two archives and an installer that picks the wrong one is
-//! a support question rather than an error.
+//! It is the version this repository's embedding numbers were taken on.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -46,13 +60,22 @@ use crate::json::{self, Json};
 /// The ONNX Runtime version installed when nothing else is asked for.
 pub const DEFAULT_RUNTIME: &str = "1.22.0";
 
-/// Where Microsoft publishes the runtime.
-const RUNTIME_BASE: &str = "https://github.com/microsoft/onnxruntime/releases/download";
+/// Where Microsoft publishes the runtime: NuGet's package content endpoint.
+///
+/// A package's URL is `{RUNTIME_BASE}/{id}/{version}/{id}.{version}.nupkg`, with
+/// the id and the version in lowercase, which is how that endpoint names them.
+const RUNTIME_BASE: &str = "https://api.nuget.org/v3-flatcontainer";
 
 /// Where the weights come from.
 const MODEL_BASE: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main";
 
-/// One platform's ONNX Runtime archive.
+/// The NuGet package holding the CPU build for every platform.
+const CPU_PACKAGE: &str = "microsoft.ml.onnxruntime";
+
+/// SHA-256 of [`CPU_PACKAGE`] at [`DEFAULT_RUNTIME`].
+const CPU_PACKAGE_SHA256: &str = "d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a";
+
+/// One platform's ONNX Runtime build, and the package it comes out of.
 struct RuntimeArchive {
     /// The Rust target operating system this is for.
     os: &'static str,
@@ -60,9 +83,11 @@ struct RuntimeArchive {
     arch: &'static str,
     /// Whether this is the build carrying the CUDA execution provider.
     gpu: bool,
-    /// The asset name, with `{version}` where the version goes.
-    asset: &'static str,
-    /// SHA-256 of the asset at [`DEFAULT_RUNTIME`], lowercase hex.
+    /// The NuGet package id, in lowercase.
+    package: &'static str,
+    /// The folder inside the package that holds this platform's libraries.
+    folder: &'static str,
+    /// SHA-256 of the package at [`DEFAULT_RUNTIME`], lowercase hex.
     ///
     /// Only the pinned version's digest is here, because a digest is a fact
     /// about one file and a table of them per version would be a table nobody
@@ -70,66 +95,95 @@ struct RuntimeArchive {
     sha256: &'static str,
 }
 
-/// Every archive this build knows how to install.
+impl RuntimeArchive {
+    /// The package's file name at a version, which is also the name it is
+    /// downloaded under.
+    ///
+    /// @param version - the ONNX Runtime version
+    fn file_name(&self, version: &str) -> String {
+        format!("{}.{}.nupkg", self.package, version.to_ascii_lowercase())
+    }
+
+    /// The URL NuGet serves the package at, at a version.
+    ///
+    /// @param version - the ONNX Runtime version
+    fn url(&self, version: &str) -> String {
+        format!(
+            "{RUNTIME_BASE}/{}/{}/{}",
+            self.package,
+            version.to_ascii_lowercase(),
+            self.file_name(version)
+        )
+    }
+}
+
+/// Every build this release knows how to install.
 ///
-/// `universal2` covers both macOS architectures, which is why there is one row
-/// for the platform rather than two.
+/// The CPU rows share one package, and each row names its own folder in it.
 const RUNTIMES: &[RuntimeArchive] = &[
     RuntimeArchive {
         os: "windows",
         arch: "x86_64",
         gpu: false,
-        asset: "onnxruntime-win-x64-{version}.zip",
-        sha256: "174c616efc0271194488642a72f1a514e01487da4dfe84c49296d66e40ebe0da",
+        package: CPU_PACKAGE,
+        folder: "runtimes/win-x64/native/",
+        sha256: CPU_PACKAGE_SHA256,
     },
     RuntimeArchive {
         os: "windows",
         arch: "aarch64",
         gpu: false,
-        asset: "onnxruntime-win-arm64-{version}.zip",
-        sha256: "7008f7ff82f8e7de563a22f2b590e08e706a1289eba606b93de2b56edfb1e04b",
+        package: CPU_PACKAGE,
+        folder: "runtimes/win-arm64/native/",
+        sha256: CPU_PACKAGE_SHA256,
     },
     RuntimeArchive {
         os: "windows",
         arch: "x86_64",
         gpu: true,
-        asset: "onnxruntime-win-x64-gpu-{version}.zip",
-        sha256: "5b5241716b2628c1ab5e79ee620be767531021149ee68f30fc46c16263fb94dd",
+        package: "microsoft.ml.onnxruntime.gpu.windows",
+        folder: "runtimes/win-x64/native/",
+        sha256: "5496c77ed4ea1835caf27fe2f1cc3e52f68fc4a29c3dd84125b8e15c0e444daa",
     },
     RuntimeArchive {
         os: "macos",
         arch: "x86_64",
         gpu: false,
-        asset: "onnxruntime-osx-universal2-{version}.tgz",
-        sha256: "cfa6f6584d87555ed9f6e7e8a000d3947554d589efe3723b8bfa358cd263d03c",
+        package: CPU_PACKAGE,
+        folder: "runtimes/osx-x64/native/",
+        sha256: CPU_PACKAGE_SHA256,
     },
     RuntimeArchive {
         os: "macos",
         arch: "aarch64",
         gpu: false,
-        asset: "onnxruntime-osx-universal2-{version}.tgz",
-        sha256: "cfa6f6584d87555ed9f6e7e8a000d3947554d589efe3723b8bfa358cd263d03c",
+        package: CPU_PACKAGE,
+        folder: "runtimes/osx-arm64/native/",
+        sha256: CPU_PACKAGE_SHA256,
     },
     RuntimeArchive {
         os: "linux",
         arch: "x86_64",
         gpu: false,
-        asset: "onnxruntime-linux-x64-{version}.tgz",
-        sha256: "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3",
+        package: CPU_PACKAGE,
+        folder: "runtimes/linux-x64/native/",
+        sha256: CPU_PACKAGE_SHA256,
     },
     RuntimeArchive {
         os: "linux",
         arch: "aarch64",
         gpu: false,
-        asset: "onnxruntime-linux-aarch64-{version}.tgz",
-        sha256: "bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702",
+        package: CPU_PACKAGE,
+        folder: "runtimes/linux-arm64/native/",
+        sha256: CPU_PACKAGE_SHA256,
     },
     RuntimeArchive {
         os: "linux",
         arch: "x86_64",
         gpu: true,
-        asset: "onnxruntime-linux-x64-gpu-{version}.tgz",
-        sha256: "2a19dbfa403672ec27378c3d40a68f793ac7a6327712cd0e8240a86be2b10c55",
+        package: "microsoft.ml.onnxruntime.gpu.linux",
+        folder: "runtimes/linux-x64/native/",
+        sha256: "d3dabd8235b7a04a67838a3b93437420f1a709528a8d8611e08bedbb08206d1d",
     },
 ];
 
@@ -748,7 +802,7 @@ fn install_runtime(
     let gpu = accelerator == Accelerator::Gpu;
     let force = force == Reinstall::Always;
     let archive_spec = pick_runtime(gpu)?;
-    let asset = archive_spec.asset.replace("{version}", version);
+    let asset = archive_spec.file_name(version);
     let directory = install::runtime_dir(root, version);
     let library = directory.join("lib").join(install::runtime_library_name());
 
@@ -765,7 +819,7 @@ fn install_runtime(
     // Only the pinned version's digest is a fact about the file being fetched.
     // Asking for another version is allowed and is reported as unverified.
     let expected = (version == DEFAULT_RUNTIME).then_some(archive_spec.sha256);
-    let url = format!("{RUNTIME_BASE}/v{version}/{asset}");
+    let url = archive_spec.url(version);
     let downloaded = install::downloads_dir(root).join(&asset);
     let mut progress = bar();
     let fetched = http::download(&url, &downloaded, expected, &mut progress)
@@ -777,11 +831,14 @@ fn install_runtime(
             fetched.path.display()
         ))
     })?;
-    let members = archive::read(&bytes).map_err(|error| Failed::misuse(format!("{error}")))?;
+    let folder = archive_spec.folder;
+    let members = archive::read_matching(&bytes, &|name| name.starts_with(folder))
+        .map_err(|error| Failed::misuse(format!("{error}")))?;
     let libraries = shared_libraries(&members);
     if libraries.is_empty() {
         return Err(Failed::misuse(format!(
-            "{asset} holds no {} - it is not an ONNX Runtime release, or its layout has changed",
+            "{asset} holds no {} in {folder} - it is not an ONNX Runtime package, or its layout \
+             has changed",
             install::runtime_library_name()
         )));
     }
@@ -797,8 +854,8 @@ fn install_runtime(
         archive::write_member(member, &lib_dir, Some(name))
             .map_err(|error| Failed::misuse(format!("{error}")))?;
     }
-    // The archive is a download, not an installed component, and it is between
-    // 7 MB and 300 MB. It goes once the library is out of it.
+    // The package is a download, not an installed component, and it is between
+    // 121 MB and 230 MB. It goes once the library is out of it.
     let _ = std::fs::remove_file(&fetched.path);
 
     if !library.exists() {
@@ -1383,18 +1440,45 @@ mod tests {
             assert!(found.is_some(), "{os} on {arch} has no archive");
         }
         for entry in RUNTIMES {
-            assert_eq!(entry.sha256.len(), 64, "{} has a short digest", entry.asset);
+            assert_eq!(
+                entry.sha256.len(),
+                64,
+                "{} has a short digest",
+                entry.package
+            );
             assert!(
                 entry.sha256.chars().all(|c| c.is_ascii_hexdigit()),
                 "{} has a digest that is not hex",
-                entry.asset
+                entry.package
             );
             assert!(
-                entry.asset.contains("{version}"),
-                "{} has no version slot",
-                entry.asset
+                entry.folder.starts_with("runtimes/") && entry.folder.ends_with("/native/"),
+                "{} names {}, which is not a native folder of a NuGet package",
+                entry.package,
+                entry.folder
             );
         }
+    }
+
+    /// A package's URL is the one NuGet's package content endpoint serves it at.
+    ///
+    /// That endpoint names the id and the version in lowercase and answers 404
+    /// for any other spelling, so a prerelease version is lowered here too.
+    #[test]
+    fn a_runtime_package_url_is_the_one_nuget_serves() {
+        let cpu = RUNTIMES
+            .iter()
+            .find(|entry| entry.os == "linux" && entry.arch == "x86_64" && !entry.gpu)
+            .unwrap();
+        assert_eq!(
+            cpu.url("1.22.0"),
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/\
+             microsoft.ml.onnxruntime.1.22.0.nupkg"
+        );
+        assert_eq!(
+            cpu.file_name("1.23.0-RC.2"),
+            "microsoft.ml.onnxruntime.1.23.0-rc.2.nupkg"
+        );
     }
 
     /// Every model file has a digest and a size, and the two files the manifest
@@ -1470,43 +1554,120 @@ mod tests {
         );
     }
 
-    /// The three archive layouts each yield the main library under the name this
-    /// platform's loader will look for, and the macOS debug bundle is skipped.
+    /// Each platform's folder in the CPU package yields one main library,
+    /// installed under the name this platform's loader looks for.
     ///
-    /// The names are the ones the real archives hold, listed from
-    /// `onnxruntime-{win-x64,linux-x64,osx-universal2}-1.22.0`.
+    /// The names are the ones `Microsoft.ML.OnnxRuntime` 1.22.0 holds. The
+    /// reader is given only one folder's members, so a platform never installs
+    /// another platform's library. The versioned names and the macOS debug
+    /// bundle are the layout of the archives on GitHub, which other ONNX Runtime
+    /// builds still use, so they are still handled.
     #[test]
     fn each_archive_layout_yields_the_library_the_loader_wants() {
-        let members: Vec<Member> = [
-            "onnxruntime-win-x64-1.22.0/lib/onnxruntime.dll",
-            "onnxruntime-win-x64-1.22.0/lib/onnxruntime.lib",
-            "onnxruntime-win-x64-1.22.0/lib/onnxruntime.pdb",
+        let package = [
+            "runtimes/android/native/onnxruntime.aar",
+            "runtimes/linux-x64/native/libonnxruntime.so",
+            "runtimes/linux-x64/native/libonnxruntime_providers_shared.so",
+            "runtimes/osx-arm64/native/libonnxruntime.dylib",
+            "runtimes/win-x64/native/onnxruntime.dll",
+            "runtimes/win-x64/native/onnxruntime.lib",
+            "runtimes/win-x64/native/onnxruntime_providers_shared.dll",
+        ];
+        for folder in [
+            "runtimes/linux-x64/native/",
+            "runtimes/osx-arm64/native/",
+            "runtimes/win-x64/native/",
+        ] {
+            let members: Vec<Member> = package
+                .iter()
+                .filter(|name| name.starts_with(folder))
+                .map(|name| Member {
+                    name: name.to_string(),
+                    bytes: Vec::new(),
+                    executable: false,
+                })
+                .collect();
+            let picked = shared_libraries(&members);
+            let main: Vec<&str> = picked
+                .iter()
+                .filter(|(member, _)| is_main_library(member.name.rsplit('/').next().unwrap()))
+                .map(|(_, name)| name.as_str())
+                .collect();
+            assert_eq!(main, vec![install::runtime_library_name()], "{folder}");
+        }
+
+        let github: Vec<Member> = [
             "onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0",
-            "onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.pc",
             "onnxruntime-osx-universal2-1.22.0/lib/libonnxruntime.1.22.0.dylib",
             "onnxruntime-osx-universal2-1.22.0/lib/libonnxruntime.1.22.0.dylib.dSYM/Contents/Resources/DWARF/libonnxruntime.1.22.0.dylib",
         ]
         .into_iter()
         .map(|name| Member { name: name.to_string(), bytes: Vec::new(), executable: false })
         .collect();
+        let picked = shared_libraries(&github);
+        assert_eq!(picked.len(), 2, "the macOS debug bundle is not a library");
+    }
 
-        let picked = shared_libraries(&members);
-        let names: Vec<&str> = picked.iter().map(|(_, name)| name.as_str()).collect();
+    /// Every package the runtime table names is served by NuGet.
+    ///
+    /// Off unless `INILLUCENT_NETWORK_TESTS` is set. Each package is opened and
+    /// its first bytes are read, so the check costs one chunk per package rather
+    /// than half a gigabyte. Until task-2776 the table named the archives on
+    /// github.com/microsoft/onnxruntime, every one of them started answering
+    /// 404, and nothing in the suite noticed.
+    #[test]
+    fn every_runtime_package_is_served() {
+        if std::env::var("INILLUCENT_NETWORK_TESTS").is_err() {
+            inillucent_base::testing::skipping("set INILLUCENT_NETWORK_TESTS to run this");
+            return;
+        }
+        let mut urls: Vec<String> = RUNTIMES
+            .iter()
+            .map(|entry| entry.url(DEFAULT_RUNTIME))
+            .collect();
+        urls.dedup();
+        for url in urls {
+            let total = http::served(&url).unwrap_or_else(|error| panic!("{url}: {error}"));
+            assert!(total.unwrap_or(1) > 0, "{url} is empty");
+        }
+    }
+
+    /// The runtime for this machine downloads, matches its pinned digest, and
+    /// installs a shared library this platform can load.
+    ///
+    /// Off unless `INILLUCENT_NETWORK_TESTS` is set, because it downloads the
+    /// 121 MB CPU package. It drives the same function `setup-embeddings
+    /// runtime` does, into a scratch install root.
+    #[test]
+    fn the_runtime_for_this_machine_downloads_and_installs() {
+        if std::env::var("INILLUCENT_NETWORK_TESTS").is_err() {
+            inillucent_base::testing::skipping("set INILLUCENT_NETWORK_TESTS to run this");
+            return;
+        }
+        let root = scratch("runtime-network");
+        let installed =
+            install_runtime(&root, DEFAULT_RUNTIME, Accelerator::Cpu, Reinstall::Always)
+                .unwrap_or_else(|error| panic!("the runtime installs: {}", error.message));
+        assert!(installed.verified, "the pinned digest was checked");
+        let library = std::fs::read(&installed.library).expect("the library is on disk");
         assert!(
-            names
-                .iter()
-                .all(|name| *name == install::runtime_library_name()),
-            "every main library is installed under this platform's name: {names:?}"
+            library.len() > 1_000_000,
+            "{} is {} bytes",
+            installed.library,
+            library.len()
         );
+        let magic = library.get(..4).unwrap_or(&[]);
+        let loadable = magic == b"\x7fELF"
+            || magic.get(..2) == Some(b"MZ".as_slice())
+            || magic == [0xcf, 0xfa, 0xed, 0xfe]
+            || magic == [0xca, 0xfe, 0xba, 0xbe];
+        assert!(loadable, "{} starts with {magic:02x?}", installed.library);
         assert!(
-            !picked
-                .iter()
-                .any(|(member, _)| member.name.contains(".dSYM/")),
-            "the macOS debug bundle is not a library"
+            !install::downloads_dir(&root)
+                .join(&installed.archive)
+                .exists(),
+            "the package is removed once the library is out of it"
         );
-        // Three archives are listed, so three main libraries are found - one per
-        // layout. A real install only ever reads one archive.
-        assert_eq!(picked.len(), 3, "{names:?}");
     }
 
     /// A provider library keeps its own name, because the main library loads it

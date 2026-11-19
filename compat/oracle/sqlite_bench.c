@@ -87,6 +87,7 @@ struct plan {
   char synchronous[32];
   long page_size;
   long cache_size;
+  int warm;
   char setup[MAX_SETUP][MAX_SQL];
   int setup_count;
   struct workload workloads[MAX_WORKLOADS];
@@ -210,6 +211,8 @@ static int read_plan(const char *path, struct plan *plan) {
       plan->page_size = strtol(value, 0, 10);
     } else if (strcmp(key, "cache_size") == 0) {
       plan->cache_size = strtol(value, 0, 10);
+    } else if (strcmp(key, "warm") == 0) {
+      plan->warm = strcmp(value, "1") == 0;
     } else if (strcmp(key, "setup") == 0) {
       if (plan->setup_count < MAX_SETUP) {
         snprintf(plan->setup[plan->setup_count], MAX_SQL, "%s", value);
@@ -369,6 +372,21 @@ static int run_workload(sqlite3 *db, const struct workload *workload, long rows)
   return 1;
 }
 
+/*
+** Fills SQLite's page cache before the first clock starts, when the plan says
+** `warm 1`. The full gate and the read gate set it, because their inillucent
+** arm fills its pool before the first workload. Without it, SQLite's cache
+** filled inside the clock of whichever workload first read a table, and that
+** workload was charged for reading the whole fixture. The scorecard, the write
+** gate and the other drivers do not set it, because their inillucent arm starts
+** cold too, and warming only this side would be the same unfairness in the
+** other direction. `dbstat` visits every page of every table and index through
+** the pager, so each one lands in the cache that `cache_size` sized.
+*/
+static int warm_cache(sqlite3 *db) {
+  return run_sql(db, "SELECT count(*) FROM dbstat;");
+}
+
 static int apply_settings(sqlite3 *db, const struct plan *plan) {
   char sql[256];
   snprintf(sql, sizeof(sql), "PRAGMA page_size=%ld;", plan->page_size);
@@ -422,6 +440,7 @@ int main(int argc, char **argv) {
     sqlite3_close(db);
     return 0;
   }
+  if (plan->warm && !warm_cache(db)) return 2;
   for (index = 0; index < plan->workload_count; index++) {
     if (!run_workload(db, &plan->workloads[index], plan->rows)) return 2;
   }

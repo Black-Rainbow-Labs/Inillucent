@@ -111,7 +111,7 @@ const UNSAFE_CRATES: [&str; 1] = ["inillucent-driver-capi"];
 // are FFI. Each call installs a handler and reads nothing back; each handler
 // stores `true` into an already-allocated `AtomicBool` and returns, which is
 // the whole of what a handler is allowed to do.
-const UNSAFE_ALLOWED: [&str; 30] = [
+const UNSAFE_ALLOWED: [&str; 31] = [
     // **CRC-32 by the processor's instructions, added by task-2191.** Checking a
     // page as it is read was 20% of a cold query of 100 rows from the command
     // line. Carryless multiply on x86-64 and `CRC32X` on aarch64 compute the
@@ -169,6 +169,11 @@ const UNSAFE_ALLOWED: [&str; 30] = [
     // and `cuDeviceGetCount` is FFI: one library load and three calls, each with
     // its SAFETY note, and nothing kept but the count.
     "crates/inillucent-core/src/cuda_probe.rs",
+    // **Whether the process runs setuid or setgid, so ONNX Runtime is not loaded from a path the
+    // caller's environment chose.** The standard library cannot say. One declaration and one call
+    // per platform, `getauxval(AT_SECURE)` on Linux and `issetugid()` on macOS and the BSDs, each
+    // taking integers or nothing and returning an integer, each with its SAFETY note.
+    "crates/inillucent-core/src/secure_execution.rs",
     "crates/inillucent-cli/src/interrupt.rs",
     // **How much stack the running thread has, added by task-2191.** The
     // standard library cannot say, and `on_a_sized_stack` needs to know whether
@@ -1445,7 +1450,7 @@ const CEILINGS: [(&str, usize); 17] = [
     // one `WHERE` term as a comparison against one column, which
     // `plan/pattern.rs` and `plan/seek_union.rs` were already reaching
     // back into `plan.rs` for.
-    ("crates/inillucent-sql/src/plan.rs", 2_632),
+    ("crates/inillucent-sql/src/plan.rs", 2_526),
     // 2,600 until task-1970's `cargo fmt --all` reflowed this crate, which took the file to 2,799
     // without changing what it does. Measured at the character level rather than assumed: with all
     // whitespace stripped, the only differences between `ef4b630` and the formatted file are 13

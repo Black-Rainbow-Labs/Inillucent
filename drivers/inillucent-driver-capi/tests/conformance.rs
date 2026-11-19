@@ -312,23 +312,62 @@ fn place_asan_runtime(out: &Path) -> bool {
     let Some(vcvars) = vcvars() else {
         return false;
     };
-    // `.../VC/Auxiliary/Build/vcvars64.bat` -> `.../VC/Tools/MSVC/<version>`
-    let mut root = vcvars;
-    for _ in 0..3 {
-        root.pop();
-    }
-    let versions = root.join("Tools/MSVC");
-    let Ok(entries) = std::fs::read_dir(&versions) else {
-        return false;
-    };
     let name = "clang_rt.asan_dynamic-x86_64.dll";
-    for entry in entries.flatten() {
-        let candidate = entry.path().join("bin/Hostx64/x64").join(name);
-        if candidate.is_file() {
-            return std::fs::copy(&candidate, out.join(name)).is_ok();
+    match asan_runtime_of_default_toolset(&vcvars, name) {
+        Some(runtime) => std::fs::copy(&runtime, out.join(name)).is_ok(),
+        None => false,
+    }
+}
+
+/// Returns the sanitizer runtime of the MSVC toolset `vcvars64.bat` compiles
+/// with, or of the newest toolset when the default one is not named.
+///
+/// **The runtime has to come from the toolset that compiled the program.**
+/// This used to copy the DLL from the first folder under `VC/Tools/MSVC` that
+/// `read_dir` listed, which is the oldest toolset when there are several, and
+/// a program built against one toolset's import library cannot load another's
+/// DLL. On GitHub's Windows image of 2026-11-16 the sanitized canary exited
+/// with 0xC0000139, an entry point not found, before it printed anything, and
+/// failed as "the sanitizer did not report the read"; on the image of
+/// 2026-11-03 it passed. `vcvars.bat` takes its toolset version from
+/// `Microsoft.VCToolsVersion.default.txt` beside `vcvars64.bat`, so this reads
+/// the same file.
+///
+/// @param vcvars - the `.../VC/Auxiliary/Build/vcvars64.bat` the program was compiled with
+/// @param name - the runtime's file name
+fn asan_runtime_of_default_toolset(vcvars: &Path, name: &str) -> Option<PathBuf> {
+    let build = vcvars.parent()?;
+    let versions = build.parent()?.parent()?.join("Tools/MSVC");
+    let runtime_of = |version: &str| versions.join(version).join("bin/Hostx64/x64").join(name);
+    let default = std::fs::read_to_string(build.join("Microsoft.VCToolsVersion.default.txt"));
+    if let Ok(version) = default.as_deref().map(str::trim) {
+        let runtime = runtime_of(version);
+        if !version.is_empty() && runtime.is_file() {
+            return Some(runtime);
         }
     }
-    false
+    let mut installed: Vec<String> = std::fs::read_dir(&versions)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    installed.sort_by_key(|version| toolset_order(version));
+    installed
+        .iter()
+        .rev()
+        .map(|version| runtime_of(version))
+        .find(|runtime| runtime.is_file())
+}
+
+/// Returns a toolset folder name such as `14.43.34808` as numbers, so that
+/// `14.100` sorts after `14.43`.
+///
+/// @param version - the folder name
+fn toolset_order(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
 }
 
 /// Returns the batch file that puts a C compiler on the path, on Windows.

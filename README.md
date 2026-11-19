@@ -21,7 +21,7 @@ search and keyword search built in. Everything lives in one file.
   66% less processor time.[^2]
 - 74% faster than SQLite when called the way programs call it: 418% faster from Node, 135% from
   Python and 49% through scripts piped into the shell.[^4]
-- 174% faster than PostgreSQL with pgvector for semantic search.[^3]
+- 76% faster than PostgreSQL with pgvector for semantic search.[^3]
 - 302% better than PostgreSQL full text search at finding identifiers.[^3]
 - A command line and an MCP server with the same commands.
 - A write ahead log and crash recovery, tested by cutting the power at every step of a commit.
@@ -120,7 +120,7 @@ processor time than SQLite.[^2]
 Store embeddings in a `VECTOR(768)` column, index them with HNSW, and order results by
 `vector_distance_cos`. Keyword search with BM25 is in the same file. One query can combine the two,
 so an agent finds "how does the release process work" and `PROJ-1932` with the same call. Semantic
-search is 174% faster than PostgreSQL with pgvector, and finding identifiers is 302% better than
+search is 76% faster than PostgreSQL with pgvector, and finding identifiers is 302% better than
 PostgreSQL full text search.[^3]
 [Vector search](docs/vector-search.md)
 
@@ -247,8 +247,11 @@ MIT. See [LICENSE](LICENSE).
     with release 2.5.4, with both programs on the same eight performance cores. Every run was
     graded: SQLite ran within 2% of its idle reference. Overall: 499% faster, the weighted geometric
     mean across ten families of work, with a 95% lower bound of 459%. Reads by key: 3,304% faster.
-    Every result is hashed and compared with SQLite's before its time counts. Of the 116 workloads
-    timed through the engine's API and through the `Connection` API, 110 are faster than SQLite.
+    Every result is hashed and compared with SQLite's before its time counts. In that run
+    SQLite's cache filled while its first workloads were timed, and Inillucent's was filled
+    before. The benchmark now fills both before timing. Measured again on the same machine, the
+    overall figure and reads by key did not move. Of the 116 workloads timed through the engine's
+    API and through the `Connection` API, 110 are faster than SQLite.
     Of the six that are not, one pays for folding the log into the database file, one compiles
     `SELECT 1` on every call through an API no program uses, and four are within 6% of SQLite.
     [Performance](docs/performance.md) names each one and says why, and
@@ -264,9 +267,12 @@ MIT. See [LICENSE](LICENSE).
 
 [^3]: Graded on 20 September 2026 against PostgreSQL with pgvector over a corpus of 185,078
     passages at 768 dimensions. Both engines were loaded with the same vectors and given the same
-    embedded query. Semantic search: a median of 0.85 ms against 2.32 ms for the faster of two
-    pgvector configurations, 174% faster. Keyword search on identifiers: mean reciprocal rank 0.546
-    against 0.136 for PostgreSQL full text search, 302% better. Of 17 graded comparisons, Inillucent
+    embedded query. Semantic search: a median of 0.85 ms against 1.49 ms for pgvector at its
+    defaults, the faster of its two configurations, 76% faster; pgvector set up to return complete
+    results took 2.32 ms. pgvector's time includes a round trip over a loopback connection, and
+    Inillucent's does not, because it runs inside the calling process. Keyword search on
+    identifiers: mean reciprocal rank 0.546 against 0.136 for PostgreSQL full text search, 302%
+    better. Of 17 graded comparisons, Inillucent
     was better on 15, equivalent on 1, inconclusive on 1 and worse on none.
     [Retrieval quality](docs/retrieval-quality.md) has the full table.
 

@@ -10,6 +10,33 @@ fails the build when any copy of it disagrees.
 
 ## Unreleased
 
+**`inillucent setup-embeddings runtime` installs ONNX Runtime from NuGet.** Every URL in the
+`github.com/microsoft/onnxruntime` repository, release downloads included, now answers 404, so the
+command could not install the runtime on any platform. It now downloads Microsoft's
+`Microsoft.ML.OnnxRuntime` package from `api.nuget.org`, or `Microsoft.ML.OnnxRuntime.Gpu.Windows`
+and `Microsoft.ML.OnnxRuntime.Gpu.Linux` with `--gpu`. The packages are pinned by SHA-256, and only
+the folder of the package for this machine's platform is decompressed. The CPU package holds every
+platform's library and is 121 MB, so the first `setup-embeddings all` downloads about 670 MB where
+it used to download about 620 MB. ONNX Runtime is still 1.22.0. A new test, run when
+`INILLUCENT_NETWORK_TESTS` is set, checks that every package in the table is served and installs the
+runtime for the machine it runs on. An earlier release can still use a runtime set with
+`ORT_DYLIB_PATH`.
+
+**A process on macOS that called `embed()` or `rerank()` exits with code 0 again.** From 2.8.0,
+every `inillucent`, `inillucent-shell` and `inillucent-mcp` process on a Mac that embedded printed
+the right answer and then aborted at exit with exit code 134 and `mutex lock failed: Invalid
+argument`, under every residency profile. A script that reads the exit code saw every embedding as a
+crash. 2.8.0 began holding one reference to ONNX Runtime's environment for the life of the process,
+on every operating system, to stop a crash at exit on Windows and Linux. On macOS the `ort` crate
+releases the environment before ONNX Runtime's own destructors run, and that release has to be the
+last one: with the reference held, ONNX Runtime freed the environment itself, after a mutex it locks
+was gone. The engine no longer holds the reference on Apple targets, and every other target is
+unchanged. The C library and the Node and Python packages use the same engine code; only the three
+programs were run on a Mac. The three suites that drive `embed()` and `rerank()` through the command line read the
+abort as a machine with no model and skipped, so none of them failed on a Mac. They now skip only
+when the program printed a refusal, and a new case checks the exit code under every residency
+profile.
+
 **`inillucent embed` on the processor writes the same bytes as `embed()` again.** On an Apple M4 Pro,
 114 of 295 vectors the command wrote at the default batch size differed from `embed(prefix || text)`
 in their last bits, though [Embeddings](docs/embeddings.md#embedding-a-whole-table) promised they

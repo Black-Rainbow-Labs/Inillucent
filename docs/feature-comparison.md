@@ -814,7 +814,7 @@ dot commands are outside the probe's cases:
 | `.cd`, `.shell`, `.system`, `.excel`, `.www` | the same |
 | `.crlf`, `.prompt`, `.explain`, `.nonce` | the same |
 | `.testcase`, `.check` | the same, including the summary line |
-| `.trace` | writes each statement to `stdout`, `stderr` or a file, as `select 1;`. The options `--expanded`, `--plain` and `--stmt` are accepted. A statement with bound parameters is written as typed. `--profile`, `--row` and `--close` are accepted and write nothing extra |
+| `.trace` | writes each statement to `stdout`, `stderr` or a file, as `select 1;`. The options `--expanded`, `--plain` and `--stmt` are accepted. A statement with bound parameters is written as typed. `--profile`, `--row` and `--close` are accepted and write nothing extra. Under `-safe`, and so on the MCP server, a file is treated as `off` and is not opened, as the reference treats it |
 | `.scanstats` | accepted and recorded. It prints nothing, where `sqlite3` prints a table of processor cycles, loops and rows that differs on every run. The `sqlite_stmt` table has `nscan`, `nsort` and `naidx` |
 | `.auth ON\|OFF` | the same. It installs an authorizer on the connection |
 | `.dbinfo`, `.dbtotxt`, `.intck`, `.filectrl` | the same reports, over this file's own numbers. Five of `.dbinfo`'s 22 lines name SQLite header fields this file format does not have |

@@ -178,13 +178,6 @@ pub(crate) struct Pragmas {
     /// set by `PRAGMA legacy_alter_table`.
     legacy_alter_table: std::cell::Cell<bool>,
 
-    /// Whether the files are refused writes while the temporary schema stays writable.
-    ///
-    /// Set by a shell that was asked for read only on a connection the engine opened for
-    /// writing (see `Shell::open_one_following`), and read by the checks that decide, once a
-    /// statement is bound, whether it writes the file.
-    files_read_only: std::cell::Cell<bool>,
-
     /// What `PRAGMA temp_store` reports.
     ///
     /// The *setting* rather than the state, which is what SQLite reports: this
@@ -440,18 +433,6 @@ impl Pragmas {
         self.recursive_triggers.set(value);
     }
 
-    /// Returns whether writes to the files are refused on this connection.
-    pub(crate) fn files_read_only(&self) -> bool {
-        self.files_read_only.get()
-    }
-
-    /// Sets whether writes to the files are refused on this connection.
-    ///
-    /// @param value - whether to refuse them
-    pub(crate) fn set_files_read_only(&self, value: bool) {
-        self.files_read_only.set(value);
-    }
-
     /// Returns whether `PRAGMA legacy_alter_table` is on.
     pub(crate) fn legacy_alter_table(&self) -> bool {
         self.legacy_alter_table.get()
@@ -639,7 +620,6 @@ impl Pragmas {
             table_being_filled: std::cell::RefCell::new(None),
             recursive_triggers: std::cell::Cell::new(false),
             legacy_alter_table: std::cell::Cell::new(false),
-            files_read_only: std::cell::Cell::new(false),
             temp_store: std::cell::Cell::new(0),
             remembered: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             scoped: std::cell::RefCell::new(std::collections::BTreeMap::new()),

@@ -339,8 +339,15 @@ pub fn scanstats(shell: &mut Shell, arguments: &[&str]) {
 /// `.trace ?FILE|off?`: echo each statement before it runs.
 ///
 /// `stdout` and `stderr` name the two streams; anything else is a file, which is
-/// emptied when the command runs; `off` stops. With no argument it stops, which
-/// is what the reference does.
+/// emptied when the command runs; `off` stops. With no argument it stops.
+///
+/// **Under `-safe` a file name is treated as `off` and the file is not opened.**
+/// The pinned reference's `output_file_open` turns every name except `stdout`
+/// and `stderr` into `off` in safe mode, and does not refuse the command. The
+/// MCP server always runs in safe mode, and before this check an agent could
+/// send `.trace <path>` to a server started `--readonly` with no `--root` and
+/// empty any file the server process could write. `trace_to_a_file_is_off_in_safe_mode`
+/// and `trace_on_a_server_with_no_root_does_not_touch_the_named_file` test both.
 ///
 /// **The statement is written, the way the reference writes it, with any trailing
 /// semicolons replaced by one and a newline** (bug hunt 10). The command used to
@@ -373,22 +380,23 @@ pub fn trace(shell: &mut Shell, arguments: &[&str]) {
         shell.trace = None;
         return;
     };
-    if word.eq_ignore_ascii_case("off") {
+    let stream = matches!(word.as_str(), "stdout" | "stderr");
+    if word.eq_ignore_ascii_case("off") || (shell.safe && !stream) {
         shell.trace = None;
         return;
     }
-    if !matches!(word.as_str(), "stdout" | "stderr") {
-        let Some(path) = crate::dot::confine_path(shell, &word) else {
-            return;
-        };
-        if std::fs::write(&path, b"").is_err() {
-            shell.complain(&format!("Error: cannot open \"{word}\""));
-            return;
-        }
-        shell.trace = Some(path);
+    if stream {
+        shell.trace = Some(word);
         return;
     }
-    shell.trace = Some(word);
+    let Some(path) = crate::dot::confine_path(shell, &word) else {
+        return;
+    };
+    if std::fs::write(&path, b"").is_err() {
+        shell.complain(&format!("Error: cannot open \"{word}\""));
+        return;
+    }
+    shell.trace = Some(path);
 }
 
 /// Writes one statement to where `.trace` sends them.

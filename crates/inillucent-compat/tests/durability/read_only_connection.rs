@@ -9,8 +9,12 @@
 //! 9, and a long lived read only shell then answered every query from the state at its first
 //! statement, so `durability::process_journal_handoff` failed. This holds the engine's read only
 //! connection to the rule directly, through the driver, with the writes made by another process.
+//!
+//! A writer that ends folds its log into the file and moves the meta record, so the first case
+//! sees each commit through the meta record. A writer that stays open leaves its commits in the
+//! log, and the second case reads those.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -89,4 +93,56 @@ fn a_read_only_connection_reads_each_later_commit() {
             "the read only connection missed commit {n} of another process"
         );
     }
+}
+
+/// Three commits by another process that stays open, each read by one read only connection.
+///
+/// The writer does not fold while it is open, so its commits are only in the log. A read only
+/// connection's own log is a scratch one in memory, and it used to measure that one to decide
+/// whether the log had moved: it answered 2000 three times, and `inillucent-shell -readonly`
+/// opened the engine for writing to get around it.
+#[test]
+fn a_read_only_connection_reads_what_a_live_writer_left_in_the_log() {
+    let path = area("live-writer").join("case.rdb");
+    shell(
+        &path,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v); \
+         INSERT INTO t SELECT value, 1 FROM generate_series(1, 2000);\n",
+    );
+    let options = OpenOptions {
+        read_only: true,
+        create: false,
+        ..OpenOptions::default()
+    };
+    let database = Database::open_with(&path, options).expect("the file opens read only");
+    let reader = database.session();
+    assert_eq!(integer(&reader, "SELECT sum(v) FROM t"), 2000);
+    let mut writer = Command::new(program("inillucent-shell"))
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the writer starts");
+    let mut input = writer.stdin.take().expect("the writer's input");
+    let mut output = BufReader::new(writer.stdout.take().expect("the writer's output"));
+    for n in 1..=3i64 {
+        input
+            .write_all(b"UPDATE t SET v = v + 1 WHERE id <= 100;\nSELECT 'committed';\n")
+            .and_then(|()| input.flush())
+            .expect("the update is sent");
+        let mut line = String::new();
+        while line.trim() != "committed" {
+            line.clear();
+            let read = output.read_line(&mut line).expect("the writer answers");
+            assert!(read > 0, "the writer ended before commit {n}");
+        }
+        assert_eq!(
+            integer(&reader, "SELECT sum(v) FROM t"),
+            2000 + 100 * n,
+            "the read only connection missed commit {n} of a writer that is still open"
+        );
+    }
+    drop(input);
+    writer.wait().expect("the writer exits");
 }

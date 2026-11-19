@@ -1648,15 +1648,15 @@ pub struct LogTail {
 /// lock another process can append between the read and the use, which is the
 /// defect this exists to close rather than one to repeat one layer up.
 ///
-/// **This is the form for a caller with no log open**, and since task-1999 it
-/// has no caller inside the workspace. It takes a path, so every call is a
-/// path lookup and a file open, and the two callers it had -
+/// **This is the form for a caller with no log open.** It takes a path, so
+/// every call is a path lookup and a file open, and the two callers it had -
 /// `ImportedDatabase::the_log_moved` and its attached twin - ask the question
 /// once per statement per file under `locking_mode = normal`. They now ask
 /// [`Wal::tail_of_open_segment`] instead, off the handle they already hold, and
-/// that was worth 3.2 ms of an 8.8 ms autocommit statement. It is kept because
-/// it is published API of this crate and it answers for a log this process has
-/// not opened, which the method cannot.
+/// that was worth 3.2 ms of an 8.8 ms autocommit statement. A read only
+/// connection still asks this, because the log it holds is a scratch one in
+/// memory and the real segments are a log it has not opened, which the method
+/// cannot answer for.
 ///
 /// @param vfs - the file system the segments live on
 /// @param base - the database file the segments are named after
@@ -1772,8 +1772,10 @@ fn belongs_elsewhere(vfs: &dyn Vfs, path: &DbPath, uuid: u128, sequence: u64) ->
 /// @param path - the segment file
 /// @param uuid - the database's identity
 fn read_tail(vfs: &dyn Vfs, path: &DbPath, uuid: u128) -> DbResult<Option<LogTail>> {
+    // Opened read only: it reads one header, and a read only connection asks it of a log it may
+    // not write, on a file system that may refuse a write handle.
     let file = vfs
-        .open(path, OpenOptions::of_kind(FileKind::Wal))
+        .open(path, OpenOptions::of_kind(FileKind::Wal).read_only())
         .map_err(inillucent_vfs::VfsError::into_db_error)?;
     let size = file
         .file_size()

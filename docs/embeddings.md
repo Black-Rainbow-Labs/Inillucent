@@ -49,13 +49,15 @@ inillucent setup-embeddings all
 
 `inillucent setup-embeddings all` downloads two things into a folder in your user profile:
 
-- ONNX Runtime 1.22.0, the shared library that runs the model;
+- ONNX Runtime 1.22.0, the shared library that runs the model, from Microsoft's
+  `Microsoft.ML.OnnxRuntime` package on NuGet;
 - the `nomic-embed-text-v1.5` weights and tokenizer, from Hugging Face.
 
 The reranker is a separate download of about 600 MB, so `all` does not include it. See
 [Reranking](#reranking).
 
-The download is about 620 MB the first time. A later run finds the files and downloads nothing.
+The download is about 670 MB the first time: 121 MB for the ONNX Runtime package and 548 MB for
+the weights and tokenizer. A later run finds the files and downloads nothing.
 Every file is checked against a SHA-256 digest written into the inillucent source. A file with the
 wrong digest is deleted, and the error names both digests. A download goes to a `.part` file that is
 renamed only after its digest matches. A download that fails before any byte arrives, such as one a
@@ -121,8 +123,29 @@ Each file is found under the name it is installed as, such as `model.onnx`, or u
 Hugging Face repository, such as `onnx/model.onnx`, so a folder of installed files and a clone of
 the repository both work. Every file is checked against the size and SHA-256 this release pins
 before any file is copied. One file missing or different, and the command names it, prints both
-digests, and installs nothing. ONNX Runtime comes from GitHub and is still downloaded:
+digests, and installs nothing. ONNX Runtime comes from NuGet and is still downloaded:
 `setup-embeddings all --from <folder>` downloads the runtime and copies the model.
+
+### Where ONNX Runtime comes from
+
+`inillucent setup-embeddings runtime` downloads one of Microsoft's ONNX Runtime packages from
+NuGet, at `https://api.nuget.org/v3-flatcontainer/`:
+
+| Build | NuGet package | Size at 1.22.0 | Platforms |
+|---|---|---|---|
+| CPU | `Microsoft.ML.OnnxRuntime` | 121 MB | Windows x86-64 and ARM64, macOS Intel and Apple silicon, Linux x86-64 and ARM64 |
+| CUDA, with `--gpu` | `Microsoft.ML.OnnxRuntime.Gpu.Windows` | 208 MB | Windows x86-64 |
+| CUDA, with `--gpu` | `Microsoft.ML.OnnxRuntime.Gpu.Linux` | 227 MB | Linux x86-64 |
+
+A NuGet package is a zip file. The command checks the package against the SHA-256 written into the
+inillucent source, takes the libraries out of the package's `runtimes/<platform>/native/` folder for
+this machine, and deletes the package. The CPU package holds the library for every platform, so
+it is the same download on every machine.
+
+Before November 2026 the runtime came from the release pages of `github.com/microsoft/onnxruntime`.
+Every URL in that repository now answers 404, so an inillucent release before 2.10.1 cannot install
+the runtime. Install the runtime with a later release, or set `ORT_DYLIB_PATH` to an ONNX Runtime
+library you already have.
 
 ### Where the files go
 
@@ -153,15 +176,19 @@ embeddings.json                    what is installed, and the residency profile
 | `INILLUCENT_EMBED_THREADS` | how many threads ONNX Runtime uses inside one operator, for one process |
 | `INILLUCENT_EMBED_DEVICE` | `cpu`, `cuda` or `cuda:N`, for one process |
 
+**A program that runs setuid or setgid loads no ONNX Runtime.** The system loader ignores
+`LD_LIBRARY_PATH` and the `DYLD_` variables for such a program, so the person who starts it cannot
+choose its libraries. `ORT_DYLIB_PATH`, `INILLUCENT_HOME` and `HOME` would let them choose this
+one, so inillucent refuses to load it and the embedding fails with a message that says why. On
+Linux the same holds for a program with file capabilities.
+
 inillucent looks for the model folder in this order: `INILLUCENT_ONNX_DIR`, the install folder, the
 folders in `INILLUCENT_MODEL_ROOTS`, then `~/.cache/inillucent-models`. A folder counts only when it
 holds both the weights and the tokenizer.
 
 ### Why these versions
 
-ONNX Runtime 1.22.0 is the version the measurements on this page were taken with. ONNX Runtime
-1.22.0 is also the last release with one `universal2` archive for macOS that runs on both Intel and
-Apple processors.
+ONNX Runtime 1.22.0 is the version the measurements on this page were taken with.
 
 The weights are the full precision export, `onnx/model.onnx`. The Hugging Face repository has other
 exports of the same model. The `model_int8.onnx` export gives query vectors with a cosine similarity

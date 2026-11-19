@@ -271,9 +271,12 @@ The shell follows `sqlite3` in these ways:
 - A text or a file that is not UTF-8 is read and written byte for byte. A byte order mark at the
   start of standard input or of a `.read` file is skipped.
 - `-readonly`, `.open --readonly` and a `file:` URI with `mode=ro` open the file read only and
-  fail when it is missing instead of creating it. `.open --new` empties the file. `.open --append`,
-  `--deserialize`, `--zip` and `--hexdb` are refused by name, because the engine has nothing they
-  could control.
+  fail when it is missing instead of creating it. They write nothing to the file or its log: the
+  committed transactions still in the log are read into memory, not copied into the file. A file
+  with a rollback journal from an interrupted write is refused, because putting the journal back
+  is a write. Open it once for writing to recover it.
+- `.open --new` empties the file. `.open --append`, `--deserialize`, `--zip` and `--hexdb` are
+  refused by name, because the engine has nothing they could control.
 - `.backup`, `.save` and `.clone` work on a database held in memory, and `.backup aux FILE` copies
   the attached database named `aux`. `.clone` refuses a file that exists.
 - `.tables`, `.indexes` and `.schema` list the objects of `temp` and of every attached database

@@ -694,3 +694,204 @@ fn a_filtered_correlated_query_answers_what_sqlite_answers() {
         assert_eq!(integers(&connection, &sql), expected, "{sql}");
     }
 }
+
+/// Returns every row as its values joined by `|`, NULL written as `NULL`, the
+/// way `sqlite3` lists a row under `.nullvalue NULL`.
+///
+/// @param sql - the query the rows answer, named if a value cannot be listed
+/// @param rows - the rows
+fn rendered(sql: &str, rows: &[Vec<OwnedDatum>]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| match value {
+                    OwnedDatum::Null => "NULL".to_string(),
+                    OwnedDatum::Int(number) => number.to_string(),
+                    OwnedDatum::Text(text) => String::from_utf8_lossy(text).into_owned(),
+                    other => panic!("{sql} answered {other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+/// Returns a query's rows as [`rendered`] lists them, or the error's message.
+///
+/// @param connection - the connection to ask
+/// @param sql - the query
+fn listed(connection: &Connection<'_>, sql: &str) -> Result<Vec<String>, String> {
+    let rows = connection
+        .query(sql)
+        .map_err(|error| error.message().to_string())?;
+    Ok(rendered(sql, &rows))
+}
+
+/// Returns the plan lines `EXPLAIN QUERY PLAN` prints for a query.
+///
+/// @param connection - the connection to ask
+/// @param sql - the query, without `EXPLAIN QUERY PLAN`
+fn plan_of(connection: &Connection<'_>, sql: &str) -> Vec<String> {
+    connection
+        .query(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        .iter()
+        .map(|row| match row.get(3) {
+            Some(OwnedDatum::Text(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            other => panic!("{sql} produced {other:?} in the detail column"),
+        })
+        .collect()
+}
+
+/// Returns a database holding the tables the `LEFT JOIN` tests below join:
+/// `t2` has an index on each of two columns, and `u` is what the subqueries read.
+///
+/// @param name - the test's name, which names its file
+fn join_fixture(name: &str) -> Database {
+    let database = fixture(name);
+    database
+        .session()
+        .execute_batch(
+            "CREATE TABLE t1 (a INTEGER, b TEXT); \
+             CREATE TABLE t2 (a INTEGER, e TEXT, f NUMERIC); \
+             CREATE INDEX t2_f ON t2(f); \
+             CREATE INDEX t2_a ON t2(a); \
+             CREATE TABLE u (k INTEGER, tag TEXT); \
+             INSERT INTO t1(a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z'); \
+             INSERT INTO t2(a, e, f) VALUES (1, 'p', 10), (1, 'q', 20), (2, 'r', 30); \
+             INSERT INTO u(k, tag) VALUES (1, 'x'), (2, 'nope'), (3, 'z')",
+        )
+        .expect("the join tables load");
+    database
+}
+
+/// A correlated subquery in a `LEFT JOIN`'s `ON` is answered when the right
+/// table is read through an index, and an outer row whose subquery says no is
+/// still null extended.
+///
+/// Two plans read the right table through an index: a covering index, when the
+/// statement reads no column of `t2` outside one index, and a lookup on the `ON`
+/// equality `t2.a = t1.a`, which leaves the subquery to be tested on what the
+/// lookup finds. Both build a `ProbedOuterJoin`, which tested the `ON` without
+/// answering its subqueries and refused every case here as "a correlated
+/// subquery used as a value"; reverting the fix in `build_probed_outer` fails
+/// all seven. The plan each case is meant to take is asserted, so a planner
+/// change cannot move a case off the index unnoticed. Each case is asked again
+/// with `t2 NOT INDEXED`, the scan that already answered it, and both plans
+/// must give the same rows. Each shape is asked with `EXISTS`, a scalar
+/// subquery and `IN`, and in each one at least one outer row matches no `t2`
+/// row once the subquery is applied. The expected rows are SQLite 3.53.4's
+/// answers over the same tables, and its plans name the same indexes.
+#[test]
+fn a_correlated_subquery_in_a_left_join_on_is_answered_through_an_index() {
+    let database = join_fixture("left_join_on");
+    let connection = database.session();
+    // `count(*)` reads no column of `t2`, so either index covers it, and both
+    // engines take `t2_a`; the other covering cases read `t2.f` and take `t2_f`.
+    let covering = "SCAN t2 USING COVERING INDEX";
+    let lookup = "SEARCH t2 USING INDEX t2_a (a=?)";
+    let cases: [(&str, &str, &[&str]); 7] = [
+        (
+            covering,
+            "SELECT t1.a, t2.f FROM t1 LEFT JOIN t2 ON EXISTS \
+             (SELECT 1 FROM u WHERE u.k = t1.a AND u.tag = t1.b) ORDER BY 1, 2",
+            &["1|10", "1|20", "1|30", "2|NULL", "3|10", "3|20", "3|30"],
+        ),
+        (
+            covering,
+            "SELECT t1.a, t2.f FROM t1 LEFT JOIN t2 \
+             ON t2.f > (SELECT count(*) FROM u WHERE u.k <= t1.a) * 10 ORDER BY 1, 2",
+            &["1|20", "1|30", "2|30", "3|NULL"],
+        ),
+        (
+            covering,
+            "SELECT t1.a, t2.f FROM t1 LEFT JOIN t2 \
+             ON t2.f IN (SELECT k * 10 FROM u WHERE u.tag = t1.b) ORDER BY 1, 2",
+            &["1|10", "2|NULL", "3|30"],
+        ),
+        (
+            covering,
+            "SELECT count(*) FROM t1 LEFT JOIN t2 \
+             ON EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)",
+            &["7"],
+        ),
+        (
+            lookup,
+            "SELECT t1.a, t2.e FROM t1 LEFT JOIN t2 ON t2.a = t1.a AND EXISTS \
+             (SELECT 1 FROM u WHERE u.k = t2.f / 10 AND u.tag = t1.b) ORDER BY 1, 2",
+            &["1|p", "2|NULL", "3|NULL"],
+        ),
+        (
+            lookup,
+            "SELECT t1.a, t2.e FROM t1 LEFT JOIN t2 ON t2.a = t1.a \
+             AND t2.f > (SELECT min(f) FROM t2 AS q WHERE q.a = t1.a) ORDER BY 1, 2",
+            &["1|q", "2|NULL", "3|NULL"],
+        ),
+        (
+            lookup,
+            "SELECT t1.a, t2.e FROM t1 LEFT JOIN t2 ON t2.a = t1.a \
+             AND t2.e IN (SELECT 'p' FROM u WHERE u.tag = t1.b) ORDER BY 1, 2",
+            &["1|p", "2|NULL", "3|NULL"],
+        ),
+    ];
+    // Every case is asked before any is judged, so a failure names all the
+    // shapes that answer wrongly and not only the first.
+    let mut wrong: Vec<String> = Vec::new();
+    for (path, sql, expected) in cases {
+        let scanned = sql.replace("LEFT JOIN t2 ", "LEFT JOIN t2 NOT INDEXED ");
+        assert_ne!(scanned, sql, "the case does not name `LEFT JOIN t2 `");
+        let plans = [(sql.to_string(), true), (scanned, false)];
+        for (asked, indexed) in plans {
+            let plan = plan_of(&connection, &asked);
+            if plan.iter().any(|line| line.starts_with(path)) != indexed {
+                wrong.push(format!("{asked}\n  planned {plan:?}"));
+            }
+            let answered = listed(&connection, &asked);
+            if !matches!(&answered, Ok(rows) if rows == expected) {
+                wrong.push(format!(
+                    "{asked}\n  expected {expected:?}\n  answered {answered:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A probed `LEFT JOIN` whose `ON` subquery reads a bound parameter answers
+/// each run with that run's value, and sees a write made between runs.
+///
+/// The statement is cached by its text, and the operator that answers the
+/// subquery keeps its own copy of the parameters and the subquery's answers
+/// for the run. A copy or an answer that outlived its run would give the
+/// second or third run the first run's rows. The expected rows are SQLite
+/// 3.53.4's answers to the same three runs.
+#[test]
+fn a_probed_left_join_subquery_reads_each_run_s_parameters() {
+    let database = join_fixture("left_join_on_params");
+    let connection = database.session();
+    let sql = "SELECT t1.a, t2.e FROM t1 LEFT JOIN t2 ON t2.a = t1.a AND EXISTS \
+               (SELECT 1 FROM u WHERE u.k = t1.a AND u.tag = ?1) ORDER BY 1, 2";
+    assert!(
+        plan_of(&connection, sql)
+            .iter()
+            .any(|line| line.starts_with("SEARCH t2 USING INDEX t2_a (a=?)")),
+        "the join no longer reads t2 through t2_a, so this proves nothing about the probe"
+    );
+    let run = |tag: &str| -> Vec<String> {
+        let tag = Params::from_values(vec![OwnedDatum::Text(tag.into())]);
+        let rows = connection
+            .query_with(sql, &tag)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        rendered(sql, &rows)
+    };
+    assert_eq!(run("x"), ["1|p", "1|q", "2|NULL", "3|NULL"], "first run");
+    assert_eq!(run("nope"), ["1|NULL", "2|r", "3|NULL"], "second run");
+    connection
+        .execute_batch("INSERT INTO u(k, tag) VALUES (1, 'nope')")
+        .expect("the write lands");
+    assert_eq!(
+        run("nope"),
+        ["1|p", "1|q", "2|r", "3|NULL"],
+        "the run after a write to u"
+    );
+}

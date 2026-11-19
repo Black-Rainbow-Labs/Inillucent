@@ -840,6 +840,9 @@ impl ImportedDatabase {
         if self.storage.path.as_os_str().is_empty() {
             return Ok(false);
         }
+        if self.storage.read_only {
+            return self.the_log_on_disk_moved();
+        }
         let tail = self.storage.wal.tail_of_open_segment()?;
         // **And whether the log rolled on past it.** A roll leaves the segment
         // this connection had open at the length it last saw, so the length
@@ -848,6 +851,32 @@ impl ImportedDatabase {
         Ok(tail.sequence != self.storage.wal.sequence()
             || tail.next_lsn != self.storage.wal.written_end()
             || (!self.quiet_since_checked() && self.storage.wal.next_segment_exists()?))
+    }
+
+    /// Whether another process appended to the log since this read only connection last replayed it.
+    ///
+    /// **A read only connection's log is a scratch one in memory** (`recovery::scratch_log`), so
+    /// [`Wal::tail_of_open_segment`] measured that, and it never moved. Such a connection then
+    /// answered every statement from what it replayed at open while a live writer committed into
+    /// the log, and saw a commit only after the writer folded and moved the meta record.
+    /// `inillucent-shell -readonly` opened the engine for writing to get around it, and a writable
+    /// open replays the log into the file, so a read only shell rewrote the database. The real
+    /// segments are asked by name instead, which is the slower form `the_log_moved` gave up for
+    /// the writable path. Only a read only connection pays for it, and the scratch log's end and
+    /// sequence are where the replay of the real log ended, so they compare with what the files
+    /// say. `durability::process_journal_handoff`'s read only reader holds it.
+    fn the_log_on_disk_moved(&self) -> DbResult<bool> {
+        let db_path = DbPath::new(self.storage.path.to_string_lossy().as_ref());
+        let on_disk = inillucent_wal::tail_on_disk(
+            self.storage.vfs.as_ref(),
+            &db_path,
+            self.storage.database.uuid(),
+            self.storage.wal.sequence(),
+        )?;
+        Ok(on_disk.is_some_and(|tail| {
+            tail.sequence != self.storage.wal.sequence()
+                || tail.next_lsn != self.storage.wal.written_end()
+        }))
     }
 
     /// Puts back the pages a process that died holding the file left in it,

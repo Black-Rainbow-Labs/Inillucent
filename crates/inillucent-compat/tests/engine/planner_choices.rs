@@ -1,4 +1,4 @@
-//! Five query shapes where the planner picked a plan far slower than SQLite's.
+//! Six query shapes where the planner picked a plan far slower than SQLite's.
 //!
 //! Invariant: **each plan below is the one that stops early or reads the fewest rows, and returns
 //! the rows the plan it replaced returned.**
@@ -20,8 +20,13 @@
 //! - A six table join with `WHERE c.region = 'R3'` started from the 100,000 row `users` index
 //!   instead of the filtered `customers`: 680 ms against 159 ms.
 //!
+//! And sqllogictest's `select5.test`: a join of 19 tables of 10 rows, written in no useful order,
+//! kept its written order because it had more than eight terms, and passed 3 GB in a second where
+//! SQLite answers in 0.2 s.
+//!
 //! The plan is asserted where the plan text shows the difference, and the rows are compared with a
-//! form of the same query that cannot take the new path.
+//! form of the same query that cannot take the new path, or with the answer worked out from the
+//! data.
 
 use inillucent_compat::newengine::connect::Database;
 use inillucent_compat::newengine::OwnedDatum;
@@ -297,4 +302,97 @@ fn a_filter_on_an_unindexed_column_chooses_the_outer_table() {
                   CROSS JOIN users u WHERE o.id = i.order_id AND c.id = o.customer_id \
                   AND u.id = c.id AND c.region = 'R3'";
     assert_eq!(rows(&database, sql), rows(&database, forced));
+}
+
+/// Returns where the chain's row `a` of table `n` points: its `b`, the `a` of table `n + 1` it
+/// joins.
+///
+/// A permutation of 1 to 10 for every table, so each row of one table joins exactly one row of the
+/// next and the chain answers exactly one row for each value it is pinned to.
+///
+/// @param n - the table, 1 to 20
+/// @param a - the row, 1 to 10
+fn chain_next(n: i64, a: i64) -> i64 {
+    let step = [1, 3, 7, 9][(n % 4) as usize];
+    (a * step + n) % 10 + 1
+}
+
+/// A join of 20 tables written out of order is planned along its equalities, and answers.
+///
+/// sqllogictest's `select5.test` joins up to 64 tables of 10 rows by chains of equalities, each
+/// table's `b` naming the next one's `INTEGER PRIMARY KEY` `a`, with the tables and the terms in
+/// no useful order. Above eight terms the planner kept the written order, so every table the
+/// written order reached before the one its key comes from was scanned inside the tables before
+/// it: a product of 10 rows a table. Its query of 19 tables passed 3 GB in a second; SQLite
+/// answers it in 0.2 s with one scan and 18 key lookups. This is the same shape with 20 tables,
+/// pinned on the chain's last table as that query is, and written so that the old order scans
+/// nine tables one inside another.
+///
+/// The plan is asserted before the query runs, so the engine this test was written against
+/// fails here instead of running the product. The row is the one the chain reaches, worked out
+/// here from the data.
+#[test]
+fn a_twenty_table_chain_written_out_of_order_follows_its_equalities() {
+    let directory = workspace_root().join("_agent_output/planner-choices/chain");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("the case directory can be made");
+    let database = Database::open(directory.join("case.rdb")).expect("the database opens");
+    let mut schema = String::from("BEGIN;");
+    for n in 1..=20i64 {
+        schema.push_str(&format!(
+            "CREATE TABLE t{n}(a{n} INTEGER PRIMARY KEY, b{n} INTEGER, x{n} VARCHAR(40));"
+        ));
+        for a in 1..=10i64 {
+            schema.push_str(&format!(
+                "INSERT INTO t{n} VALUES({a}, {}, 'table t{n} row {a}');",
+                chain_next(n, a)
+            ));
+        }
+    }
+    schema.push_str("COMMIT;");
+    database
+        .session()
+        .execute_batch(&schema)
+        .expect("the tables are built");
+    let pinned = 4i64;
+    let columns = (1..=20).map(|n| format!("x{n}")).collect::<Vec<_>>();
+    let from = (0..20)
+        .map(|at| format!("t{}", (at * 9) % 20 + 1))
+        .collect::<Vec<_>>();
+    let mut terms = (0..19)
+        .map(|at| {
+            let n = (at * 11) % 19 + 1;
+            format!("b{n}=a{}", n + 1)
+        })
+        .collect::<Vec<_>>();
+    terms.insert(7, format!("a20={pinned}"));
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {}",
+        columns.join(","),
+        from.join(","),
+        terms.join(" AND ")
+    );
+
+    let described = plan(&database, &sql);
+    let scans = described
+        .split(" / ")
+        .filter(|line| line.starts_with("SCAN "))
+        .count();
+    assert!(
+        scans <= 1,
+        "the plan scans {scans} tables one inside another, where one entry into the chain \
+         is enough: {described}"
+    );
+
+    let start = (1..=10i64)
+        .find(|first| (1..20).fold(*first, |a, n| chain_next(n, a)) == pinned)
+        .expect("one row of t1 reaches the pinned row of t20");
+    let mut expected = Vec::new();
+    let mut a = start;
+    for n in 1..=20i64 {
+        expected.push(OwnedDatum::Text(format!("table t{n} row {a}").into_bytes()));
+        a = chain_next(n, a);
+    }
+    let answered = database.session().query(&sql).expect("the query runs");
+    assert_eq!(answered, vec![expected]);
 }

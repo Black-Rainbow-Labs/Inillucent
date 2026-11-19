@@ -85,7 +85,11 @@ A statement moves down this picture in five steps.
    `SELECT 1; DROP TABLE t` is refused and a `SELECT` that contains the word "delete" is not.
 3. **Plan.** The planner first copies each derived table, view and CTE into the query where SQLite
    would, and plans an outer join the `WHERE` cannot null extend as an inner join. Then it picks an
-   access path and a join order. A derived table that stays a subquery is sized the way SQLite sizes
+   access path and a join order. For up to eight tables joined without an outer join or a
+   `CROSS JOIN` between them, it prices every order. For more, it builds orders one table at a
+   time and keeps the cheapest ten of them at each step, as SQLite does. It keeps the
+   written order when no order it built is cheaper. A
+   derived table that stays a subquery is sized the way SQLite sizes
    it: a `SELECT` with no `FROM` clause is one row, a `UNION` adds its arms, and a constant `LIMIT`
    caps it. A small one becomes the outer loop. `EXPLAIN QUERY PLAN` prints its choice as SQLite's tree.
 4. **Compile.** The plan becomes a chain of operators. The compiled form is cached by statement text,
@@ -1159,6 +1163,13 @@ An application that links the engine has no reason to limit itself. A server tha
 an agent does, so only `inillucent-mcp` sets limits. The numbers are `Limits::served` in
 `crates/inillucent-base/src/budget.rs` and `MAX_ROWS`, `MAX_REQUEST_BYTES` and `MAX_RESPONSE_BYTES`
 in `crates/inillucent-cli/src/mcp.rs`.
+
+A join through an index holds rows for its own reason and has a limit of its own, outside the
+budget. Once enough outer rows have arrived, it keeps them to pair them all with one walk of the
+index instead of one search each. It emits them whenever they reach 8 MiB, and searches for them
+one by one when the walk would find more than 8 MiB of matches. A walk that reads more of the index
+than the searches would have cost makes the join search for every later row. Before the limit it
+held every outer row until the end, and a join of 19 small tables passed 3 GB.
 
 `cancel` sets its flag from any thread. The statement fails with the status `interrupted`, and the
 connection stays usable. `inillucent capabilities` reports `cancel` as `partial`, because an operator

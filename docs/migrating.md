@@ -243,6 +243,11 @@ A migration from a server that is not on this machine uses TLS. The server's cer
 host name are checked. If TLS is not available, the migration stops. It never falls back to an
 unencrypted connection.
 
+TLS uses the machine's own library, found when the migration starts. Windows uses SChannel, which
+is always there. Linux uses OpenSSL 3 or 1.1, which most distributions install. macOS has no public
+OpenSSL, so install Homebrew's with `brew install openssl@3`. Without it, a migration over TLS stops
+and names what to install.
+
 | What the URL and flags say | What happens |
 |---|---|
 | nothing about encryption, and the host is not a loopback address | verified TLS |
