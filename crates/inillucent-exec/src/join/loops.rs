@@ -119,6 +119,14 @@ impl<'t> IndexNestedLoopJoin<'t> {
             .map_or(0, super::merged::MergeBuffer::merged)
     }
 
+    /// Returns how many of this join's walks were abandoned for finding more pairs than a walk may
+    /// hold, across every execution; see `super::merged`.
+    pub fn walks_abandoned(&self) -> usize {
+        self.merge
+            .as_ref()
+            .map_or(0, super::merged::MergeBuffer::abandoned)
+    }
+
     /// Returns the join emitting only the inner columns the statement reads.
     ///
     /// @param needed - which inner columns are read, or `None` for all
@@ -193,20 +201,18 @@ impl Sink for IndexNestedLoopJoin<'_> {
             } else {
                 with_seek_key(outer_keys, batch, nth, |key| {
                     match (nth >= buffer_from, key, merge.as_mut()) {
-                        (true, [Datum::Int(value)], Some(held)) => {
-                            held.keep(*value, batch, nth).map(|()| Flow::Continue)
+                        // A full buffer is emitted at once, so it never holds more than
+                        // `MERGE_BYTES`; see `super::merged`.
+                        (true, [Datum::Int(value)], Some(held)) if held.buffering() => {
+                            match held.keep(*value, batch, nth)? {
+                                true => emit_held(held, &mut probing),
+                                false => Ok(Flow::Continue),
+                            }
                         }
                         // A key that is not one integer is probed: the walk pairs integers
                         // only. The rows buffered before it go first, to keep the order.
                         (_, _, Some(held)) if held.holds_rows() => {
-                            let flow = held.emit(
-                                probing.inner,
-                                probing.pool,
-                                probing.inner_projection,
-                                probing.needed,
-                                &mut *probing.downstream,
-                            )?;
-                            match flow {
+                            match emit_held(held, &mut probing)? {
                                 Flow::Stop => Ok(Flow::Stop),
                                 Flow::Continue => probing.inner_matches(batch, nth, key),
                             }
@@ -223,15 +229,33 @@ impl Sink for IndexNestedLoopJoin<'_> {
     }
 
     fn finish(&mut self) -> DbResult<()> {
-        if let Some(held) = self.merge.as_mut() {
+        let IndexNestedLoopJoin {
+            kind,
+            inner,
+            pool,
+            inner_projection,
+            needed,
+            full_key,
+            downstream,
+            selection,
+            merge,
+            ..
+        } = self;
+        if let Some(held) = merge.as_mut() {
+            let mut probing = Probing {
+                kind: *kind,
+                inner,
+                pool,
+                inner_projection,
+                needed,
+                full_key: *full_key,
+                width: held.width(),
+                inner_width: inner_projection.0.len(),
+                downstream: downstream.as_mut(),
+                selection,
+            };
             // A pipeline that asked to stop is still finished, as the probes' path finishes it.
-            held.emit(
-                self.inner,
-                self.pool,
-                &self.inner_projection,
-                &self.needed,
-                self.downstream.as_mut(),
-            )?;
+            emit_held(held, &mut probing)?;
         }
         self.downstream.finish()
     }
@@ -243,6 +267,30 @@ impl Sink for IndexNestedLoopJoin<'_> {
             held.clear();
         }
         self.downstream.reset()
+    }
+}
+
+/// Joins the rows a merge buffer holds and pushes the pairs downstream: by one walk of the inner
+/// tree, or by a probe each when the walk found more pairs than the buffer may hold.
+///
+/// @param held - the buffer
+/// @param probing - the inner side and the sink the pairs go into
+fn emit_held(
+    held: &mut super::merged::MergeBuffer,
+    probing: &mut Probing<'_, '_>,
+) -> DbResult<Flow> {
+    let emitted = held.emit(
+        probing.inner,
+        probing.pool,
+        probing.inner_projection,
+        probing.needed,
+        &mut *probing.downstream,
+    )?;
+    match emitted {
+        super::merged::Emitted::Walked(flow) => Ok(flow),
+        super::merged::Emitted::TooMany => {
+            held.probe_each(|batch, nth, key| probing.inner_matches(batch, nth, &[Datum::Int(key)]))
+        }
     }
 }
 
