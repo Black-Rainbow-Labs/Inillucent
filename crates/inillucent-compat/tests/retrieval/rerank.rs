@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use inillucent_compat::cliproc::{document, field, items, number_of, program, rows, text_of};
+use inillucent_scalar::json::node::Node;
 
 /// What one run of the program produced.
 struct Ran {
@@ -58,13 +59,20 @@ fn reranker_or_skip() -> Option<PathBuf> {
             ":memory:",
             "query",
             "SELECT rerank('a question', 'an answer')",
+            "--output",
+            "json",
         ],
     );
-    if probe.code != 0 {
+    // **Decided by whether the program answered, not by its exit code.** From 2.8.0 every process
+    // on a Mac that reranked printed the answer and then aborted at exit, and a probe that read the
+    // exit code skipped the whole suite there, including the cases that check the exit code. A
+    // program that printed nothing at all fails here, because that is a crash and not a missing model.
+    let answer = document(&probe.stdout);
+    if !matches!(field(&answer, "ok"), Some(Node::True)) {
         inillucent_compat::differential::skipping(&format!(
             "this machine cannot answer rerank(): {}. Run `inillucent setup-embeddings all` and \
              `inillucent setup-embeddings reranker`, and build with --features inillucent-cli/embed",
-            probe.said().lines().next().unwrap_or("")
+            field(&answer, "message").and_then(text_of).unwrap_or_default()
         ));
         return None;
     }

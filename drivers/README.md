@@ -547,6 +547,10 @@ and a later `embed()` loads the model again. The Node package calls it from the 
 the Python package registers it with `atexit` when the library has it. A binding for another
 language should do the same from its own exit hook.
 
+From 2.8.0 to 2.10.0 a process on macOS that embedded aborted the same way at exit even after this
+call, and with no session loaded, because the engine kept a reference to ONNX Runtime's environment
+that ONNX Runtime then freed too late. The engine no longer keeps that reference on macOS.
+
 ## Building the C library
 
 ```bash

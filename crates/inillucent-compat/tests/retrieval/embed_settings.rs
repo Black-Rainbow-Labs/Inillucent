@@ -3,7 +3,7 @@
 //! Invariant: a device that will not start is an error that names the command that installs the
 //! runtime, and never a quiet run on the processor; `embed_tokens` counts the tokens the embedding
 //! model's tokenizer produces before the model's 1,900 token limit is applied, without loading
-//! the model.
+//! the model; and a process that embedded exits with code 0 under every residency profile.
 //!
 //! Every case drives the built `inillucent` program with the settings in its environment,
 //! because the embedder is one static per process and a setting is read once, so two cases with
@@ -13,7 +13,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use inillucent_compat::cliproc::program;
+use inillucent_compat::cliproc::{document, field, program, text_of};
+use inillucent_scalar::json::node::Node;
 
 /// What one run of the program produced.
 struct Ran {
@@ -56,11 +57,18 @@ fn ask(binary: &PathBuf, sql: &str, variables: &[(&str, &str)]) -> Ran {
 fn embedder_or_skip() -> Option<PathBuf> {
     let binary = program("inillucent");
     let probe = ask(&binary, "SELECT length(embed('a word'))", &[]);
-    if !probe.ok {
+    // **Decided by whether the program answered, not by its exit code.** From 2.8.0 every process
+    // on a Mac that embedded printed the answer and then aborted at exit, and a probe that read the
+    // exit code skipped the whole suite there, including the cases that check the exit code. A
+    // program that printed nothing at all fails here, because that is a crash and not a missing model.
+    let answer = document(&probe.stdout);
+    if !matches!(field(&answer, "ok"), Some(Node::True)) {
         inillucent_compat::differential::skipping(&format!(
             "this build cannot answer embed(TEXT): {}. Run `inillucent setup-embeddings all` and \
              build with --features inillucent-cli/embed",
-            probe.said.lines().next().unwrap_or("")
+            field(&answer, "message")
+                .and_then(text_of)
+                .unwrap_or_default()
         ));
         return None;
     }
@@ -225,6 +233,41 @@ fn a_process_that_dropped_its_session_exits_with_code_zero_on_every_run() {
             Some(0),
             "run {run} of 30 ended with {:?}: {}",
             ran.code,
+            ran.said
+        );
+    }
+}
+
+/// A process that embedded exits with code 0 and has printed the answer, under every residency
+/// profile and under the default.
+///
+/// From 2.8.0 to 2.10.0 every such process on a Mac printed the answer and then aborted at exit
+/// with exit code 134 and `mutex lock failed: Invalid argument`, because `exit_hook` held a
+/// reference to ONNX Runtime's environment there, so ONNX Runtime's own static destructor freed it
+/// after a mutex it locks was gone. A script that reads the exit code saw every `embed()` as a
+/// crash. The abort happened on every run, so one run per profile is enough to see it.
+#[test]
+fn a_process_that_embedded_exits_with_code_zero_under_every_residency_profile() {
+    let Some(binary) = embedder_or_skip() else {
+        return;
+    };
+    for residency in ["", "idle", "resident", "on-demand"] {
+        let mut variables = Vec::new();
+        if !residency.is_empty() {
+            variables.push(("INILLUCENT_EMBED_RESIDENCY", residency));
+        }
+        let ran = ask(&binary, "SELECT length(embed('a word'))", &variables);
+        assert_eq!(
+            ran.code,
+            Some(0),
+            "residency {residency:?} ended with {:?}: {}",
+            ran.code,
+            ran.said
+        );
+        assert_eq!(
+            integer_of(&ran, 0),
+            3072,
+            "residency {residency:?}: {}",
             ran.said
         );
     }
