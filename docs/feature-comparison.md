@@ -420,6 +420,12 @@ it. An index over text with no NUL is not affected.
 when the scan reads an index on `s` under `BINARY`. The test is
 `inillucent-compat::ordering::a_binary_walk_does_not_answer_a_nocase_order`.
 
+**A grouped index walk answers only its own order.** `GROUP BY e ORDER BY e COLLATE BINARY` sorts
+the groups by bytes even when it groups by walking an index on a `NOCASE` column `e`. `WHERE a > 0
+GROUP BY b, a ORDER BY b` sorts by `b` even when it groups by walking an index on `(a, b)`. Until
+2026-11-17 both skipped the sort and returned the groups in the index's order. The test is
+`inillucent-compat::ordering::a_grouped_walk_answers_only_its_own_order`.
+
 ### Scalar functions
 
 | case | feature | result |

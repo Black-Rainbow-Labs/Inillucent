@@ -1004,6 +1004,137 @@ fn a_binary_walk_does_not_answer_a_nocase_order() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// **A grouped walk answers an `ORDER BY` only in the walk's own order.**
+///
+/// The case opposite to the one above. `GROUP BY e` over a covering index on a
+/// `NOCASE` column streams its groups in the index's order, which is `NOCASE`.
+/// The rule that decides whether the grouped rows still need sorting assumed
+/// every walk is in byte order, so it skipped the sort for
+/// `ORDER BY e COLLATE BINARY` and returned `_x A b`, where SQLite answers
+/// `A _x b`: `_` is 0x5F, after `A` in bytes and before `a` without case.
+/// `EXPLAIN QUERY PLAN` said `USE TEMP B-TREE FOR ORDER BY` the whole time,
+/// because it reports the planner's decision, which was right; the executor
+/// decides again whether the rows are already sorted, and that was wrong.
+///
+/// The same rule took the `GROUP BY` list for the walk's key order. `WHERE a >
+/// 0 GROUP BY b, a ORDER BY b` over an index on `(a, b)` walks by `a` first,
+/// and came back `y z y z a` against SQLite's `a y y z z`. Comparing each term
+/// with its group key's collation alone would have made the `NOCASE` form of
+/// that statement wrong in the same way, so it is here too.
+///
+/// The plans are read as well, because the bugs live only on the grouped walks
+/// of `t_e` and `m_ab`: a planner that stopped walking them would pass every
+/// row check.
+///
+/// The expected rows are SQLite 3.53.4's answers, written down so the test
+/// runs without the pinned oracle: the bug is in which rows come first, and a
+/// test that skips where the oracle is missing would not have caught it.
+#[test]
+fn a_grouped_walk_answers_only_its_own_order() {
+    let directory = inillucent_base::testing::ScratchDir::new(&format!(
+        "inillucent-ordering-grouped-walk-{}",
+        std::process::id()
+    ));
+    let handle =
+        Database::open(directory.join("ordering-grouped-walk.db")).expect("the file opens");
+    let connection = handle.session().expect("the connection opens");
+    connection
+        .execute_batch(
+            "CREATE TABLE t (a, e TEXT COLLATE NOCASE, f); \
+             INSERT INTO t VALUES (1, 'A', 1), (2, '_x', 2), (3, 'b', 3), (4, 'A', 4); \
+             CREATE INDEX t_e ON t (e); \
+             CREATE TABLE m (a INTEGER, e TEXT COLLATE NOCASE, b TEXT); \
+             INSERT INTO m VALUES (1, 'y', 'y'), (1, 'z', 'z'), (2, 'y', 'y'), (2, 'z', 'z'), \
+             (3, 'a', 'a'); \
+             CREATE INDEX m_ae ON m (a, e); \
+             CREATE INDEX m_ab ON m (a, b);",
+        )
+        .expect("the fixture builds");
+
+    let by_key: &[&str] = &[
+        "text:a|int:3",
+        "text:y|int:1",
+        "text:y|int:2",
+        "text:z|int:1",
+        "text:z|int:2",
+    ];
+    let cases: [(&str, &[&str]); 10] = [
+        (
+            "SELECT e FROM t GROUP BY e ORDER BY e COLLATE BINARY",
+            &["text:A", "text:_x", "text:b"],
+        ),
+        (
+            "SELECT e FROM t GROUP BY e ORDER BY 1 COLLATE BINARY",
+            &["text:A", "text:_x", "text:b"],
+        ),
+        (
+            "SELECT e, count(*) FROM t GROUP BY e ORDER BY e COLLATE BINARY",
+            &["text:A|int:2", "text:_x|int:1", "text:b|int:1"],
+        ),
+        (
+            "SELECT e FROM t GROUP BY e ORDER BY e COLLATE BINARY DESC",
+            &["text:b", "text:_x", "text:A"],
+        ),
+        // The column's own collation, which the walk does answer.
+        (
+            "SELECT e FROM t GROUP BY e ORDER BY e",
+            &["text:_x", "text:A", "text:b"],
+        ),
+        (
+            "SELECT e FROM t GROUP BY e ORDER BY e DESC",
+            &["text:b", "text:A", "text:_x"],
+        ),
+        // Group keys listed in another order than the index's.
+        (
+            "SELECT b, a FROM m WHERE a > 0 GROUP BY b, a ORDER BY b",
+            by_key,
+        ),
+        (
+            "SELECT e, a FROM m WHERE a > 0 GROUP BY e, a ORDER BY e",
+            by_key,
+        ),
+        (
+            "SELECT e, a FROM m WHERE a > 0 GROUP BY e, a ORDER BY e COLLATE BINARY",
+            by_key,
+        ),
+        (
+            "SELECT m.b, m.a FROM m JOIN t ON t.a = m.a WHERE m.a > 0 \
+             GROUP BY m.b, m.a ORDER BY m.b",
+            by_key,
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (sql, expected) in cases {
+        match inillucent_rows(&connection, sql) {
+            Err(reason) => failures.push(format!("{sql}\n  inillucent failed: {reason}")),
+            Ok(ours) if ours != expected => failures.push(format!(
+                "{sql}\n  sqlite:     {expected:?}\n  inillucent: {ours:?}"
+            )),
+            Ok(_) => {}
+        }
+    }
+    for (sql, walk) in [
+        (
+            "SELECT e FROM t GROUP BY e ORDER BY e COLLATE BINARY",
+            "SCAN t USING COVERING INDEX t_e",
+        ),
+        (
+            "SELECT b, a FROM m WHERE a > 0 GROUP BY b, a ORDER BY b",
+            "SEARCH m USING COVERING INDEX m_ab",
+        ),
+    ] {
+        let plan = inillucent_rows(&connection, &format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("the plan is explained")
+            .join("\n");
+        if !plan.contains(walk) || plan.contains("FOR GROUP BY") {
+            failures.push(format!(
+                "{sql}\n  is expected to group by walking the index, as SQLite does:\n{plan}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Describes where two orders first differ, rather than printing both.
 ///
 /// A hundred and twenty rows of hex on each side is a message nobody reads.
