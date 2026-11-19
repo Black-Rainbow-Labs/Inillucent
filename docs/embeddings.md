@@ -557,8 +557,9 @@ the processor, and runs slower than the plain processor build.
 
 Run the same command again after a stop and it continues where it stopped.
 
-`synth-embed` sorts texts by length before it groups them into batches. Every text in a batch is
-padded to the length of the longest one, and the corpus runs from 6 to 6,227 characters a chunk.
+`synth-embed` sorts texts by length before it groups them into batches. On a card every text in a
+batch is padded to the length of the longest one, and the corpus runs from 6 to 6,227 characters a
+chunk.
 
 With several devices, each device gets its own session. Each group of batches is split across the
 devices by total text length, longest first, to whichever device has the least work. A slower card
@@ -590,7 +591,8 @@ which is 11.1 GB in one allocation. A corpus run failed 45% of the way through f
 
 So `synth-embed` splits every text into tokens first, sorts by token count, and groups texts so that
 *texts in the batch × longest text in tokens, squared* stays under `--max-batch-cells`. A single text
-over the limit still runs on its own, so no chunk is dropped.
+over the limit still runs on its own, so no chunk is dropped. On the processor a group also holds
+only texts with the same token count, for the reason in [Embedding a whole table](#embedding-a-whole-table).
 
 `--max-batch-cells` defaults to 24,000,000. The limit counts cells, and the memory per cell depends
 on the model's number of attention heads. ONNX Runtime needs roughly `cells × heads × 4 bytes × 2.4`.
@@ -678,6 +680,16 @@ corpus is small enough that opening the second session costs half a second of th
 vectors from the processor run equal the ones `embed()` wrote in `sync` in every byte. The worst
 cosine similarity between a vector from the card and the same row from the processor was 0.9999995.
 A batch of 32 was slower than a batch of 16 on the card, at 758 rows a second.
+
+**Why the processor matches `embed()`.** On the processor a batch holds only texts with the same
+number of tokens. The processor rows above were measured before that rule, when a shorter text in a
+batch was padded to the longest one. A padded text comes out the same to within rounding, but not
+always in the same bytes, and on Windows it happened to match. On an Apple M4 Pro with ONNX Runtime
+1.22.0 it did not: of 295 passages checked from the 2,661 in
+`examples/rag-agent/cli-example/greek-philosophy.rdb`, 114 differed from `embed()` in their last
+bits. With batches of one token count none differed, and the 2,661 passages took 339 s and 295 s
+in two runs, against 358 s and 319 s with padding. A card still pads, because its speed comes from
+full batches.
 
 The study's 558,429 chunks took 22 minutes on a card. `embed()` in SQL at 11 rows a second would take
 14 hours.

@@ -80,9 +80,9 @@ sha256 = "641c0bafaaaa7821837056b1f26a50d8211e10693074d87df99ab9868754bf9e"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/models.rs"
-ticket = "task-2367"
-reason = "Test modules only: each test that made a folder in the system temporary directory now makes it through inillucent_base::testing::ScratchDir, which removes the folder when the test ends. No code outside #[cfg(test)] changed."
-sha256 = "45a784d369d918eeb45810cd6188c8c3fb47eaa47bee8495eed09618f679742d"
+ticket = "fix-bulk-embed-equality"
+reason = "Test only: the padding leak test builds its padded batch with embed_padded_batch, because on the processor embed_documents no longer pads."
+sha256 = "be2a0894213785e69ac918c65b148215df3fb3f8728f6458bf2fbf5dd68a3dc8"
 
 [[amendment]]
 path = "crates/inillucent-bench/src/queryset.rs"
@@ -194,9 +194,9 @@ sha256 = "3f8c9918845848bba6c58be46c3b9c47a97f72ad4847bdfb707c1091cae10ccb"
 
 [[amendment]]
 path = "crates/inillucent-core/src/embed_onnx.rs"
-ticket = "ort-secure-execution"
-reason = "A setuid or setgid process loads no ONNX Runtime: secure_execution.rs asks the loader's own secure mode flag (getauxval(AT_SECURE), issetugid), and embed_onnx refuses before ort is touched, because ORT_DYLIB_PATH, INILLUCENT_HOME and HOME would let the caller choose the library. An ordinary process chooses its runtime exactly as before; no search, ranking or index code changed."
-sha256 = "6b901661aa06d3af4c2e8ec6a6f0a11748f1d2b7e6d07ce90f42556e0c762bb2"
+ticket = "fix-bulk-embed-equality"
+reason = "On the processor a batch holds texts of one token count only, so nothing is padded and a vector from inillucent embed equals embed() byte for byte; a card still pads. run_batch becomes the public, hidden embed_padded_batch so the attention mask tests still pad."
+sha256 = "c6fc6cb8a981f2432c6d4033a0046fce4dd259e1a3dcf6e40f85fb2aa5eb4092"
 
 [[amendment]]
 path = "crates/inillucent-core/src/exit_hook.rs"
@@ -266,9 +266,9 @@ sha256 = "022f1fe51faf8019de7517920c0d00798c2121dd873b2f9a18f7b8dbec44e7c4"
 
 [[amendment]]
 path = "crates/inillucent-core/src/rerank_onnx.rs"
-ticket = "task-2158"
-reason = "task-2158: new file. A cross encoder reranker run in process, with tests against the study Python scores."
-sha256 = "76bcdcd2c409c80813dab9404864af9906eb43c70860745f8405440640e71a85"
+ticket = "fix-bulk-embed-equality"
+reason = "Passes the new same_length argument of plan_batches as false, with a comment: the reranker keeps padding."
+sha256 = "0df3999b89e27af6deb588f1ca8d50c0833e933cef30f77d08cabeb17d2b0be4"
 
 [[amendment]]
 path = "crates/inillucent-core/src/residency.rs"

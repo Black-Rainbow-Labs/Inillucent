@@ -484,7 +484,9 @@ mod arms {
 
     /// Padding a short text up to the longest in its batch must not reach the
     /// pooled vector. This is the one that `snowflake-arctic-embed-m-v2.0` failed
-    /// before its tokenizer's own padding was disarmed on load.
+    /// before its tokenizer's own padding was disarmed on load. On the processor
+    /// `embed_documents` no longer pads, so the padded batch is built with
+    /// `embed_padded_batch`.
     #[test]
     fn no_arm_lets_a_long_text_leak_into_a_short_one_in_the_same_batch() {
         let models = installed();
@@ -496,8 +498,8 @@ mod arms {
             let e = open(model);
             let short = "offer".to_string();
             let long = "offer eligibility rules and redemption windows ".repeat(40);
-            let together = e.embed_documents(&[short.clone(), long]).unwrap();
-            let alone = e.embed_documents(&[short]).unwrap();
+            let together = e.embed_padded_batch(&[short.clone(), long]).unwrap();
+            let alone = e.embed_padded_batch(&[short]).unwrap();
             let agreement = dot(&together[0], &alone[0]);
             assert!(
                 agreement > 0.9999,

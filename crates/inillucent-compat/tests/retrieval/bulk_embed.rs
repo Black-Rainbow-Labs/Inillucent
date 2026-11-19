@@ -212,8 +212,9 @@ fn embed(binary: &PathBuf, database: &Path, extra: &[&str]) -> Ran {
 
 /// A vector the command wrote is the vector `embed()` returns for the same text, byte for byte.
 ///
-/// The batch the command runs pads short texts to the longest in it, and `embed()` runs one text
-/// at a time, so this is also the check that padding does not move a vector.
+/// `embed()` runs one text at a time and the command runs 16. On the processor a batch holds texts
+/// of one token count, so nothing is padded. When a batch padded its shorter texts to the longest,
+/// 20 of these 40 vectors differed from `embed()` in their low bits on an Apple M4 Pro.
 #[test]
 fn a_bulk_vector_equals_embed_byte_for_byte_on_the_processor() {
     let Some(binary) = embedder_or_skip() else {
