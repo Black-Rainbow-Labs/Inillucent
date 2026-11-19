@@ -1074,13 +1074,28 @@ mod tests {
         );
         assert!(!partial_path(&wrong).exists());
 
-        // GitHub: an absolute cross-host redirect to a signed URL.
-        let body = get(
-            "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.22.0/VERSION_NUMBER",
-            4096,
+        // GitHub: a release asset, which github.com answers with an absolute
+        // cross-host redirect to a signed URL on release-assets.githubusercontent.com,
+        // the same route the runtime archives take. The asset is this project's
+        // own SHA256SUMS from a tagged release, because a file in somebody else's
+        // repository can disappear: the onnxruntime VERSION_NUMBER file this test
+        // used before started answering 404 in November 2026 and turned every
+        // tests run red. Tagged releases here are never deleted; only the rolling
+        // `nightly` release is replaced.
+        let sums = into.join("SHA256SUMS");
+        let fetched = download(
+            "https://github.com/Black-Rainbow-Labs/Inillucent/releases/download/v2.1.5/SHA256SUMS",
+            &sums,
+            Some("762b963094b3bbc2c57227a2ad1af8db8d515f64eef4f5b987cd1e02c916d65c"),
+            &mut Silent,
         )
-        .expect("a small GitHub file fetches");
-        assert_eq!(String::from_utf8_lossy(&body).trim(), "1.22.0");
+        .expect("a GitHub release asset fetches across the redirect");
+        assert_eq!(fetched.bytes, 916, "the file is the size the release lists");
+        let body = std::fs::read_to_string(&sums).expect("the fetched file reads");
+        assert!(
+            body.contains("inillucent-2.1.5-x86_64-pc-windows-msvc.zip"),
+            "{body}"
+        );
     }
 
     /// Serves `body` over plain HTTP on a loopback port, to any number of
