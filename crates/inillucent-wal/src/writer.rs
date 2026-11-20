@@ -1692,6 +1692,63 @@ pub fn tail_on_disk(
     }
 }
 
+/// Reports whether a whole record of this log starts at `lsn` in one segment on disk.
+///
+/// **A segment that is longer than its records is not proof that another process appended.** A
+/// writer that dies in the middle of an append leaves the start of a record after the last whole
+/// one. A writable open cuts those bytes off, and a read only connection may not, so the segment
+/// stays longer than where that connection's replay ended for as long as no writer opens it. A
+/// read only connection that compared the two lengths alone took the cut short bytes for a commit
+/// on every statement: `PRAGMA data_version` rose each time and each statement replayed the whole
+/// log again. Another process's commit puts a record at the position the replay ended, with that
+/// position as its LSN, so this decodes what is there. The cut short bytes of a record do not
+/// decode, and zeroes do not either.
+///
+/// At most [`crate::MAX_RECORD_BYTES`] are read, because no record is longer.
+///
+/// @param vfs - the file system the segments live on
+/// @param base - the database file the segments are named after
+/// @param uuid - the database's identity; a segment that disagrees answers no
+/// @param sequence - the segment to look in
+/// @param lsn - the stream position the record would start at
+pub fn a_record_starts_at(
+    vfs: &dyn Vfs,
+    base: &DbPath,
+    uuid: u128,
+    sequence: u64,
+    lsn: u64,
+) -> DbResult<bool> {
+    let name = base.as_path().to_string_lossy().to_string();
+    let directory = base.as_path().parent().map(std::path::Path::to_path_buf);
+    let path = segment_path(&name, directory.as_deref(), sequence);
+    let file = vfs
+        .open(&path, OpenOptions::of_kind(FileKind::Wal).read_only())
+        .map_err(inillucent_vfs::VfsError::into_db_error)?;
+    let size = file
+        .file_size()
+        .map_err(inillucent_vfs::VfsError::into_db_error)?;
+    let mut head = vec![0u8; segment::HEADER_BYTES];
+    if size < segment::HEADER_BYTES as u64 || file.read_exact_at(0, &mut head).is_err() {
+        return Ok(false);
+    }
+    let Ok(header) = SegmentHeader::decode(&head) else {
+        return Ok(false);
+    };
+    if header.uuid != uuid || lsn < header.first_lsn {
+        return Ok(false);
+    }
+    let offset =
+        (segment::HEADER_BYTES as u64).saturating_add(lsn.saturating_sub(header.first_lsn));
+    let length = size
+        .saturating_sub(offset)
+        .min(crate::MAX_RECORD_BYTES as u64);
+    let mut bytes = vec![0u8; length as usize];
+    if file.read_exact_at(offset, &mut bytes).is_err() {
+        return Ok(false);
+    }
+    Ok(matches!(Record::decode(&bytes), Ok(Some(record)) if record.lsn == lsn))
+}
+
 /// How many segments below the sequence asked for [`hold_segments_from`] also opens.
 const HOLD_BEHIND: u64 = 2;
 

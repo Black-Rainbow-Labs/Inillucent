@@ -8,7 +8,35 @@ the shell, the MCP server, the migration tool, the C ABI library, and the Go,
 npm, PyPI and Composer wrappers are all one number. `tools/doc-facts/check.mjs`
 fails the build when any copy of it disagrees.
 
-## Unreleased
+## 2.10.2, 19 November 2026
+
+**A read only connection no longer treats a log that ends in a cut short record as a new commit.**
+A writer that stops in the middle of an append leaves the start of a record after the last whole
+one. A writable open cuts those bytes off, and a read only connection may not. From 2.10.1 a read
+only connection compared the length of the log on disk with where its replay ended, so on such a
+log every statement looked like a commit by another process: `PRAGMA data_version` rose on each
+one, and each one replayed the whole log again. The connection now reads the bytes where its
+replay ended and counts a commit only when a whole record of the log starts there.
+
+**A `GROUP BY` read through an index sorts for an `ORDER BY` in another collation or key order.**
+When the rows were grouped by walking an index, the executor took the groups to be sorted for any
+`ORDER BY` over the group keys. A walk of a `NOCASE` index answered
+`GROUP BY e ORDER BY e COLLATE BINARY` in `NOCASE` order. The sort is now skipped only when the
+`ORDER BY` names the group keys in the walk's own order and collation.
+
+**Two dependencies move up.** `windows-sys` goes from 0.59 to 0.61 and `tokenizers` from 0.21 to
+0.23. Nothing a program sees changes.
+
+**`inillucent embed` on the processor writes the same bytes as `embed()` again.** On an Apple M4 Pro,
+114 of 295 vectors the command wrote at the default batch size differed from `embed(prefix || text)`
+in their last bits, though [Embeddings](docs/embeddings.md#embedding-a-whole-table) promised they
+were equal byte for byte. The command padded the shorter texts in a batch to the longest one, and
+on that processor a padded text rounds differently from the same text alone. On the processor a
+batch now holds only texts with the same number of tokens, so nothing is padded. The 2,661 passages
+of the example corpus took 339 s and 295 s that way, against 358 s and 319 s before. A graphics
+card still pads. The test that checks the promise had only run on the Windows development machine.
+
+## 2.10.1, 19 November 2026
 
 **`inillucent setup-embeddings runtime` installs ONNX Runtime from NuGet.** Every URL in the
 `github.com/microsoft/onnxruntime` repository, release downloads included, now answers 404, so the
@@ -37,14 +65,22 @@ abort as a machine with no model and skipped, so none of them failed on a Mac. T
 when the program printed a refusal, and a new case checks the exit code under every residency
 profile.
 
-**`inillucent embed` on the processor writes the same bytes as `embed()` again.** On an Apple M4 Pro,
-114 of 295 vectors the command wrote at the default batch size differed from `embed(prefix || text)`
-in their last bits, though [Embeddings](docs/embeddings.md#embedding-a-whole-table) promised they
-were equal byte for byte. The command padded the shorter texts in a batch to the longest one, and
-on that processor a padded text rounds differently from the same text alone. On the processor a
-batch now holds only texts with the same number of tokens, so nothing is padded. The 2,661 passages
-of the example corpus took 339 s and 295 s that way, against 358 s and 319 s before. A graphics
-card still pads. The test that checks the promise had only run on the Windows development machine.
+**Fixes contributed through pull requests.**
+
+- In safe mode, `.trace FILE` in the shell opens no file, as in the reference.
+- On macOS, the TLS loader opens libssl with the dynamic loader flags libc defines for that
+  system. Before, every migration over verified TLS on a Mac was refused, even with
+  Homebrew's OpenSSL installed.
+- A refused TLS load says why each candidate library was passed over, and keeps looking past a
+  library that opens without the functions it needs.
+- A correlated subquery in a `LEFT JOIN`'s `ON` runs when the right table is read through an
+  index.
+- The buffer of an index join is bounded at 8 MiB, and joins of more than eight tables are ordered by
+  cost. A join of 19 small tables written out of order had grown past 3 GB.
+- A setuid or setgid process loads no ONNX Runtime.
+- A read only shell writes nothing to the database, and a read only connection reads the commits
+  of a writer that stays open. A read only look at a database with a log used to replay the log
+  into the file.
 
 ## 2.10.0, 1 November 2026
 

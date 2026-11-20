@@ -146,3 +146,99 @@ fn a_read_only_connection_reads_what_a_live_writer_left_in_the_log() {
     drop(input);
     writer.wait().expect("the writer exits");
 }
+
+/// Returns the log segment with the highest sequence beside a database file.
+///
+/// @param path - the database file
+fn last_segment(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| format!("{}-wal.", name.to_string_lossy()))
+        .expect("the database has a file name");
+    let directory = path.parent().expect("the database has a directory");
+    let mut segments: Vec<PathBuf> = std::fs::read_dir(directory)
+        .expect("the directory lists")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .is_some_and(|file| file.to_string_lossy().starts_with(&name))
+        })
+        .collect();
+    segments.sort();
+    segments.pop().expect("the database has a log segment")
+}
+
+/// A log whose last record was cut short, read by a read only connection that stays open.
+///
+/// A writer that dies in the middle of an append leaves bytes after the last whole record. A
+/// writable open cuts them off, and a read only open cannot. The read only connection asks the
+/// segment's length on disk whether another process appended, and the cut short bytes make that
+/// length differ from where its replay ended, so every statement looked like a commit by another
+/// process: `PRAGMA data_version` rose on each one and each one replayed the whole log again.
+#[test]
+fn a_read_only_connection_on_a_log_cut_short_sees_no_commit_that_did_not_happen() {
+    let path = area("cut-short").join("case.rdb");
+    shell(
+        &path,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v); \
+         INSERT INTO t SELECT value, 1 FROM generate_series(1, 2000);\n",
+    );
+    let segment = last_segment(&path);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .expect("the segment opens for appending");
+    file.write_all(&[0xA5; 300])
+        .expect("the cut short bytes are written");
+    drop(file);
+    let options = OpenOptions {
+        read_only: true,
+        create: false,
+        ..OpenOptions::default()
+    };
+    let database = Database::open_with(&path, options).expect("the file opens read only");
+    let reader = database.session();
+    assert_eq!(integer(&reader, "SELECT sum(v) FROM t"), 2000);
+    let before = integer(&reader, "PRAGMA data_version");
+    for _ in 0..3 {
+        assert_eq!(integer(&reader, "SELECT sum(v) FROM t"), 2000);
+    }
+    assert_eq!(
+        integer(&reader, "PRAGMA data_version"),
+        before,
+        "no other process committed, so data_version stays where it was"
+    );
+    // A writer that stays open cuts the bytes off, appends its commit where they were and does
+    // not fold, so the commit is only in the log and the reader has to find it there.
+    let mut writer = Command::new(program("inillucent-shell"))
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the writer starts");
+    let mut input = writer.stdin.take().expect("the writer's input");
+    let mut output = BufReader::new(writer.stdout.take().expect("the writer's output"));
+    input
+        .write_all(b"UPDATE t SET v = v + 1 WHERE id <= 100;\nSELECT 'committed';\n")
+        .and_then(|()| input.flush())
+        .expect("the update is sent");
+    let mut line = String::new();
+    while line.trim() != "committed" {
+        line.clear();
+        let read = output.read_line(&mut line).expect("the writer answers");
+        assert!(read > 0, "the writer ended before it committed");
+    }
+    assert_eq!(
+        integer(&reader, "SELECT sum(v) FROM t"),
+        2100,
+        "the read only connection missed the commit of a writer that is still open"
+    );
+    assert!(
+        integer(&reader, "PRAGMA data_version") > before,
+        "another process committed, so data_version moved"
+    );
+    drop(input);
+    writer.wait().expect("the writer exits");
+}

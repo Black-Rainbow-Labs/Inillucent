@@ -865,18 +865,26 @@ impl ImportedDatabase {
     /// the writable path. Only a read only connection pays for it, and the scratch log's end and
     /// sequence are where the replay of the real log ended, so they compare with what the files
     /// say. `durability::process_journal_handoff`'s read only reader holds it.
+    ///
+    /// **A segment longer than where the replay ended is asked what follows.** A writer that died
+    /// mid append leaves the start of a record there, and a read only connection cannot cut it
+    /// off, so the lengths alone answered "moved" on every statement and each one replayed the
+    /// whole log. A commit by another process puts a whole record at that position, so
+    /// `inillucent_wal::a_record_starts_at` decodes it; see
+    /// `durability::read_only_connection::a_read_only_connection_on_a_log_cut_short_sees_no_commit_that_did_not_happen`.
     fn the_log_on_disk_moved(&self) -> DbResult<bool> {
         let db_path = DbPath::new(self.storage.path.to_string_lossy().as_ref());
-        let on_disk = inillucent_wal::tail_on_disk(
-            self.storage.vfs.as_ref(),
-            &db_path,
-            self.storage.database.uuid(),
-            self.storage.wal.sequence(),
-        )?;
-        Ok(on_disk.is_some_and(|tail| {
-            tail.sequence != self.storage.wal.sequence()
-                || tail.next_lsn != self.storage.wal.written_end()
-        }))
+        let uuid = self.storage.database.uuid();
+        let sequence = self.storage.wal.sequence();
+        let end = self.storage.wal.written_end();
+        let vfs = self.storage.vfs.as_ref();
+        let on_disk = inillucent_wal::tail_on_disk(vfs, &db_path, uuid, sequence)?;
+        Ok(match on_disk {
+            None => false,
+            Some(tail) if tail.sequence != sequence || tail.next_lsn < end => true,
+            Some(tail) if tail.next_lsn == end => false,
+            Some(_) => inillucent_wal::a_record_starts_at(vfs, &db_path, uuid, sequence, end)?,
+        })
     }
 
     /// Puts back the pages a process that died holding the file left in it,
